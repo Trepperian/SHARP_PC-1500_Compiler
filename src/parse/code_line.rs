@@ -44,6 +44,7 @@ impl CodeLine {
     }
 
     pub fn write_bytes(&self, bytes: &mut Vec<u8>, preserve_source_wording: bool) {
+        // Line number in big-endian (PC-1500 format)
         bytes.extend_from_slice(self.number.to_be_bytes().as_slice());
         // Add placeholder bytes for line size
         let line_size_pos = bytes.len();

@@ -8,6 +8,10 @@ impl BinaryNumber {
         BinaryNumber { value }
     }
 
+    pub fn as_u16(&self) -> u16 {
+        self.value
+    }
+
     pub fn write_bytes(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(format!("&{:X}", self.value).as_bytes());
     }

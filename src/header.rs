@@ -25,10 +25,10 @@ impl Header {
             magic_number: HEADER_MAGIC_BYTE,
             file_type: *BASIC_MAGIC_STR,
             program_name: name_bytes,
-            start_address: STANDARD_START_ADDRESS.to_be_bytes(),
+            start_address: STANDARD_START_ADDRESS.to_le_bytes(),
             // Page 28 of CE158 manual, this is the number of payload bytes - 1
-            capacity: (length - 1).to_be_bytes(),
-            entry_address: STANDARD_ENTRY_POINT.to_be_bytes(),
+            capacity: (length - 1).to_le_bytes(),
+            entry_address: STANDARD_ENTRY_POINT.to_le_bytes(),
         }
     }
 
