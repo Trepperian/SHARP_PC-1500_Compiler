@@ -1,12 +1,13 @@
 [package]
 name = "dull"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 clap = { version = "*", features = ["derive"] }
 codespan = "*"
 codespan-reporting = "*"
+rand = "0.8"
 
 [dev-dependencies]
 walkdir = "2"

@@ -268,7 +268,7 @@ pub fn print_error(error: &CompileError, filename: &str, source: &str) {
 
     if let Err(e) = term::emit(&mut writer.lock(), &config, &file, &diagnostic) {
         eprintln!("Error printing diagnostic: {e}");
-    }
+    };
 }
 
 /// Convert a codespan::Span to a Range<usize> for codespan-reporting

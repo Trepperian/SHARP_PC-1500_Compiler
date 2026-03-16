@@ -362,11 +362,11 @@ impl Iterator for Lexer<'_> {
                         self.advance();
 
                         // Handle optional + or - after E
-                        if let Some(&next_ch) = self.peek()
-                            && (next_ch == '+' || next_ch == '-')
-                        {
-                            number_str.push(next_ch);
-                            self.advance();
+                        if let Some(&next_ch) = self.peek() {
+                            if next_ch == '+' || next_ch == '-' {
+                                number_str.push(next_ch);
+                                self.advance();
+                            }
                         }
                     } else {
                         break;

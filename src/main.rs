@@ -3,12 +3,15 @@ mod header;
 mod lex;
 mod parse;
 mod semantic_analysis;
+mod codegen;
 
 use crate::error::{CompileError, print_error};
 use crate::header::Header;
 use crate::lex::{Lexer, RemarkLexOption, SpannedToken};
 use crate::parse::Parser;
 use crate::semantic_analysis::analyze_program;
+use crate::codegen::StackCodeGenerator;
+use crate::codegen::interpreter::StackMachineInterpreter;
 use clap::Parser as ClapParser;
 use std::{fs, path::PathBuf};
 
@@ -46,6 +49,22 @@ struct Args {
     /// Run semantic analysis on the parsed AST (implies --parse)
     #[arg(short, long)]
     analyze: bool,
+
+    /// Generate stack-based intermediate code (código intermedio de pila)
+    #[arg(short = 'g', long, conflicts_with = "native_code")]
+    stack_code: bool,
+
+    /// Execute the generated stack code (requires --stack-code)
+    #[arg(short = 'e', long, requires = "stack_code")]
+    execute: bool,
+
+    /// Show verbose execution trace
+    #[arg(short = 'v', long, requires = "execute")]
+    verbose: bool,
+
+    /// Generate native LH5801 machine code from stack instructions
+    #[arg(long, conflicts_with = "stack_code")]
+    native_code: bool,
 
     /// Compile without header (only program bytes)
     #[arg(long)]
@@ -175,6 +194,160 @@ fn main() {
             }
         }
         println!();
+    } else if args.stack_code {
+        // Generate stack-based intermediate code
+        let mut parser = Parser::new(tokens.into_iter());
+
+        let (program, parse_errors) = parser.parse_with_error_recovery();
+
+        // Report any parse errors but continue if we got some lines
+        for parse_error in &parse_errors {
+            let compile_error = CompileError::from(parse_error.clone());
+            print_error(&compile_error, &filename, &input);
+        }
+
+        if !parse_errors.is_empty() {
+            eprintln!(
+                "\nWarning: {} parse error(s) occurred. Continuing with {} successfully parsed line(s).",
+                parse_errors.len(),
+                program.num_lines()
+            );
+            std::process::exit(1);
+        }
+
+        // Generate stack code
+        let mut codegen = StackCodeGenerator::new();
+        let instructions = codegen.generate(&program);
+
+        // Convert to text
+        let stack_code = codegen.to_string();
+
+        // Write to output file
+        let output_path = args.output.unwrap_or_else(|| PathBuf::from("a.p"));
+        if let Err(e) = fs::write(&output_path, &stack_code) {
+            eprintln!("Error writing output file {}: {}", output_path.display(), e);
+            std::process::exit(1);
+        }
+
+        println!("Código intermedio de pila generado: {}", output_path.display());
+        println!("\nTotal de instrucciones: {}", instructions.len());
+        
+        if !args.execute {
+            println!("\nPrimeras 30 instrucciones:");
+            for (i, instr) in instructions.iter().take(30).enumerate() {
+                println!("{:4}: {}", i + 1, instr.to_string());
+            }
+        }
+        
+        // Ejecutar el código si se especifica --execute
+        if args.execute {
+            println!("\n{}", "=".repeat(60));
+            println!("EJECUTANDO EL CÓDIGO GENERADO");
+            println!("{}", "=".repeat(60));
+            
+            let mut interpreter = StackMachineInterpreter::new(instructions);
+            interpreter.set_verbose(args.verbose);
+            interpreter.ejecuta();
+            
+            println!("\n{}", "=".repeat(60));
+            println!("Para ejecutar nuevamente use: cargo run {} --stack-code --execute", filename);
+        } else {
+            println!("\nPara ejecutar el código use: cargo run {} --stack-code --execute", filename);
+        }
+    } else if args.native_code {
+        // Generate native LH5801 machine code as binary file (.lh5)
+        use crate::codegen::lh5801_backend::Lh5801Backend;
+        use crate::codegen::lh5_format;
+        
+        let mut parser = Parser::new(tokens.into_iter());
+        let (program, parse_errors) = parser.parse_with_error_recovery();
+
+        // Report any parse errors but continue if we got some lines
+        for parse_error in &parse_errors {
+            let compile_error = CompileError::from(parse_error.clone());
+            print_error(&compile_error, &filename, &input);
+        }
+
+        if !parse_errors.is_empty() {
+            eprintln!(
+                "\nWarning: {} parse error(s) occurred. Continuing with {} successfully parsed line(s).",
+                parse_errors.len(),
+                program.num_lines()
+            );
+            std::process::exit(1);
+        }
+
+        // First generate stack code
+        let mut codegen = StackCodeGenerator::new();
+        let instructions = codegen.generate(&program);
+
+        println!("Generadas {} instrucciones de pila", instructions.len());
+
+        // Then compile to LH5801 machine code
+        let mut backend = Lh5801Backend::new();
+        let machine_code = backend.generate(&instructions);
+        let load_address = backend.get_start_address();
+
+        println!("Generados {} bytes de código máquina LH5801", machine_code.len());
+        println!("Dirección de carga: 0x{:04X}", load_address);
+
+        // Write binary LH5 file (load address + machine code)
+        let output_path = args.output.unwrap_or_else(|| PathBuf::from("a.lh5"));
+        
+        if let Err(e) = lh5_format::write_lh5_file(&output_path, load_address, &machine_code) {
+            eprintln!("Error writing output file {}: {}", output_path.display(), e);
+            std::process::exit(1);
+        }
+
+        let file_size = 4 + machine_code.len(); // header (4 bytes) + code
+        println!("\nArchivo binario LH5 generado:");
+        println!("  Archivo: {}", output_path.display());
+        println!("  Tamaño total: {} bytes", file_size);
+        println!("    - Encabezado: 4 bytes");
+        println!("    - Código máquina: {} bytes", machine_code.len());
+        
+        println!("\nEstructura del archivo:");
+        println!("  Offset 0x0000-0x0001: Dirección de carga = 0x{:04X} (little-endian)", load_address);
+        println!("  Offset 0x0002-0x0003: Longitud código = {} bytes (little-endian)", machine_code.len());
+        println!("  Offset 0x0004-0x{:04X}: Código máquina LH5801", file_size - 1);
+        
+        println!("\nMemoria requerida:");
+        println!("  Código: 0x{:04X}-0x{:04X} ({} bytes)", 
+                 load_address, 
+                 load_address as usize + machine_code.len() - 1,
+                 machine_code.len());
+        println!("  Stack: 0x5800-0x5FEF (752 bytes)");
+        println!("  Stack pointer: 0x5FF0 (inicializado a 0x5FF0)");
+        
+        // Show first bytes of machine code
+        println!("\nPrimeros 32 bytes del código máquina (hex):");
+        for (i, &byte) in machine_code.iter().take(32).enumerate() {
+            if i % 16 == 0 && i > 0 {
+                println!();
+            }
+            print!("{:02X} ", byte);
+        }
+        println!();
+        
+        println!("\n{}", "=".repeat(70));
+        println!("INSTRUCCIONES PARA EL EMULADOR:");
+        println!("{}", "=".repeat(70));
+        println!("Este archivo debe cargarse con el siguiente código en el emulador:");
+        println!();
+        println!("fn load_lh5_file(&mut self, path: &Path) -> Result<(), Error> {{");
+        println!("    let (load_address, machine_code) = lh5_format::read_lh5_file(path)?;");
+        println!("    ");
+        println!("    // Cargar código en memoria");
+        println!("    let start = load_address as usize;");
+        println!("    let end = start + machine_code.len();");
+        println!("    self.memory[start..end].copy_from_slice(&machine_code);");
+        println!("    ");
+        println!("    // Configurar PC para ejecutar");
+        println!("    self.cpu.pc = load_address;");
+        println!("    ");
+        println!("    Ok(())");
+        println!("}}");
+        println!("{}", "=".repeat(70));
     } else {
         // Default: compile the tokens into an AST and compile to bytes
         let mut parser = Parser::new(tokens.into_iter());
@@ -195,7 +368,6 @@ fn main() {
             );
             std::process::exit(1);
         }
-
         // Generate program bytes
         let mut program_bytes = Vec::new();
         program.write_bytes(&mut program_bytes, args.preserve_source_wording);

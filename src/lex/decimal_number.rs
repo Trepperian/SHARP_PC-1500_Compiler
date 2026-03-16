@@ -12,6 +12,10 @@ impl DecimalNumber {
         Self { double }
     }
 
+    pub fn as_f64(&self) -> f64 {
+        self.double
+    }
+
     // If the decimal number is a whole number, convert it to an integer
     pub fn as_integer(&self) -> Option<i64> {
         if self.double.fract() == 0.0 {

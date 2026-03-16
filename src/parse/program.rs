@@ -19,9 +19,6 @@ impl Program {
             // Carriage return at the end of every line
             bytes.push(b'\r');
         }
-
-        // 0xFF at the end of the program
-        bytes.push(0xFF);
     }
 
     pub fn add_line(&mut self, line: CodeLine) {
