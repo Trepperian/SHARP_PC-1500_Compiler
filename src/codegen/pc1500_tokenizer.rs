@@ -9,6 +9,7 @@
 ///   - Strings: 0x22 + ASCII + 0x22
 ///   - Comandos: Tokens 2 bytes 0xF0xx o 0xF1xx
 ///   - Números/Variables: ASCII directo
+///   - POKE múltiple: POKE addr,v1,v2,v3,... (addr inicial + valores consecutivos)
 ///   - Operadores: ASCII (: = + - * ( ))
 /// - Fin de línea: 0x0D
 ///
@@ -21,38 +22,37 @@ use std::collections::HashMap;
 /// Tokens BASIC del PC-1500
 #[derive(Debug, Clone, Copy)]
 pub enum BasicToken {
-    // Comandos básicos (0xF0xx)
-    Print = 0xF09F,
-    Input = 0xF0A0,
-    Let = 0xF09D,
-    Rem = 0xF09E,
-    Dim = 0xF088,
+    // Comandos básicos
+    Print = 0xF097,
+    Input = 0xF091,
+    Let = 0xF198,
+    Rem = 0xF1AB,
+    Dim = 0xF18B,
     Clear = 0xF187,
-    Wait = 0xF093,
-    
-    // Control de flujo (0xF1xx)
+    Wait = 0xF1B3,
+
+    // Control de flujo
     If = 0xF196,
-    Then = 0xF197,
-    Else = 0xF198,
+    Then = 0xF1AE,
     For = 0xF1A5,
-    To = 0xF1A6,
-    Step = 0xF1A7,
+    To = 0xF1B1,
+    Step = 0xF1AD,
     Next = 0xF19A,
-    Goto = 0xF181,
-    Gosub = 0xF183,
-    Return = 0xF185,
+    Goto = 0xF192,
+    Gosub = 0xF194,
+    Return = 0xF199,
     End = 0xF18E,
-    
+
     // Gráficos
-    Line = 0xF182,
-    Gcursor = 0xF08F,
-    Gprint = 0xF090,
-    Point = 0xF091,
-    
+    Line = 0xF0B7,
+    Gcursor = 0xF093,
+    Gprint = 0xF09F,
+    Point = 0xF168,
+
     // Memoria y sistema
-    Poke = 0xF094,
-    Peek = 0xF095,
-    Call = 0xF096,
+    Poke = 0xF1A1,
+    Peek = 0xF16F,
+    Call = 0xF18A,
 }
 
 impl BasicToken {
@@ -158,35 +158,33 @@ impl Pc1500Tokenizer {
         self.add_line(line_num, &content);
     }
     
-    /// Añadir línea con múltiples POKEs separados por ':'
-    /// Formato: POKE addr1,val1:POKE addr2,val2:POKE addr3,val3
+    /// Añadir línea con POKE múltiple (sintaxis nativa PC-1500)
+    /// Formato: POKE addr,val1,val2,val3,...
+    /// La calculadora almacena val1 en addr, val2 en addr+1, etc.
     pub fn add_multi_poke_line(&mut self, line_num: u16, pokes: &[(u16, u8)]) {
+        if pokes.is_empty() {
+            return;
+        }
+
         let mut content = Vec::new();
-        
-        for (i, &(address, value)) in pokes.iter().enumerate() {
-            // Token POKE
-            content.extend_from_slice(&BasicToken::Poke.to_bytes());
-            
-            // Espacio
-            content.push(b' ');
-            
-            // Dirección en ASCII
-            let addr_str = format!("{}", address);
-            content.extend_from_slice(addr_str.as_bytes());
-            
-            // Coma
+
+        // Token POKE
+        content.extend_from_slice(&BasicToken::Poke.to_bytes());
+
+        // Espacio
+        content.push(b' ');
+
+        // Solo la dirección inicial
+        let addr_str = format!("{}", pokes[0].0);
+        content.extend_from_slice(addr_str.as_bytes());
+
+        // Todos los valores consecutivos separados por comas
+        for &(_, value) in pokes.iter() {
             content.push(b',');
-            
-            // Valor en ASCII
             let val_str = format!("{}", value);
             content.extend_from_slice(val_str.as_bytes());
-            
-            // Separador ':' entre POKEs (excepto el último)
-            if i < pokes.len() - 1 {
-                content.push(b':');
-            }
         }
-        
+
         self.add_line(line_num, &content);
     }
     
@@ -208,10 +206,10 @@ impl Pc1500Tokenizer {
     }
     
     /// Generar programa loader para código máquina LH5801
-    /// 
+    ///
     /// Crea un programa BASIC tokenizado que:
     /// 1. Hace CLEAR para limpiar memoria
-    /// 2. Usa POKE para cargar el código máquina (múltiples POKEs por línea)
+    /// 2. Usa POKE addr,v1,v2,... para cargar el código máquina
     /// 3. Ejecuta el código con CALL
     pub fn generate_loader(&mut self, machine_code: &[u8], load_address: u16) {
         const POKES_PER_LINE: usize = 16; // Agrupar 16 POKEs por línea para minimizar tamaño
@@ -327,8 +325,8 @@ mod tests {
         
         let output = tokenizer.finalize();
         
-        // Verificar que contiene el token POKE (0xF0, 0x94)
-        assert!(output.contains(&0xF0));
-        assert!(output.iter().position(|&x| x == 0xF0).map(|i| output[i+1]) == Some(0x94));
+        // Verificar que contiene el token POKE (0xF1, 0xA1)
+        assert!(output.contains(&0xF1));
+        assert!(output.iter().position(|&x| x == 0xF1).map(|i| output[i+1]) == Some(0xA1));
     }
 }

@@ -182,7 +182,7 @@ mod tests {
         let (load_addr, read_code) = read_lh5_file(&temp_file).unwrap();
         
         assert_eq!(load_addr, 0x3800);
-        assert_eq!(read_code, machine_code);
+        assert_eq!(read_code, machine_code);    
         
         let _ = std::fs::remove_file(&temp_file);
     }

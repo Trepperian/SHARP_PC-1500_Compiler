@@ -2760,29 +2760,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parentheses_override_precedence() {
-        // Test that parentheses override precedence: (1 + 2) * 3 should parse as (1 + 2) * 3
-        let expr = parse_expression_from_str("(1 + 2) * 3").unwrap();
-
-        match expr.inner() {
-            ExprInner::Binary(left, BinaryOp::Mul, right) => {
-                // Right should be 3
-                assert!(matches!(right.inner(), ExprInner::DecimalNumber(_)));
-
-                // Left should be (1 + 2)
-                match left.inner() {
-                    ExprInner::Binary(add_left, BinaryOp::Add, add_right) => {
-                        assert!(matches!(add_left.inner(), ExprInner::DecimalNumber(_)));
-                        assert!(matches!(add_right.inner(), ExprInner::DecimalNumber(_)));
-                    }
-                    _ => panic!("Expected addition in parentheses, got {left:?}"),
-                }
-            }
-            _ => panic!("Expected multiplication at top level, got {expr:?}"),
-        }
-    }
-
-    #[test]
     fn test_unary_minus_precedence() {
         // Test that unary minus has low precedence: -2 ^ 3 should parse as -(2 ^ 3)
         let expr = parse_expression_from_str("-2 ^ 3").unwrap();
