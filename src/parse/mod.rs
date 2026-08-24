@@ -1393,8 +1393,33 @@ where
             let start_span = self.current_span();
             let condition = self.expect_expression()?;
             let then_kw = self.next_if_token_eq(&Token::Keyword(Keyword::Then)); // optional
-            if let Some(then_stmt) = self.parse_statement(true)? {
-                let full_span = start_span.merge(then_stmt.span);
+            if let Some(first_stmt) = self.parse_statement(false)? {
+                // En BASIC clásico (incluido este dialecto Sharp PC-1500),
+                // un IF sin bloque explícito hace TODAS las sentencias
+                // separadas por ':' hasta el final de la línea
+                // condicionales, no solo la primera — p.ej. `IF cond
+                // stmt1:stmt2:stmt3` equivale a `IF cond THEN
+                // (stmt1:stmt2:stmt3)`, no a `(IF cond THEN stmt1):stmt2:
+                // stmt3`. El bucle de `parse_code_line_with_recovery` que
+                // llama a este método no sabe distinguir esto (trata cada
+                // sentencia separada por ':' como independiente), así que
+                // hay que consumir aquí mismo el resto de la línea.
+                let mut then_statements = vec![first_stmt];
+                while self.next_if_token_eq(&Token::Symbol(Symbol::Colon)).is_some() {
+                    match self.parse_statement(false)? {
+                        Some(next_stmt) => then_statements.push(next_stmt),
+                        None => break,
+                    }
+                }
+
+                let last_span = then_statements.last().expect("then_statements no puede estar vacío").span;
+                let full_span = start_span.merge(last_span);
+
+                let then_stmt = if then_statements.len() == 1 {
+                    then_statements.into_iter().next().expect("comprobado len == 1")
+                } else {
+                    Statement::new(StatementInner::Multi(then_statements), full_span)
+                };
                 let is_goto_stmt = matches!(then_stmt.inner, StatementInner::Goto { .. });
 
                 Ok(Some(Statement::new(

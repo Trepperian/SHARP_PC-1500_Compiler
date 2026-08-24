@@ -11,3 +11,5 @@ rand = "0.8"
 
 [dev-dependencies]
 walkdir = "2"
+tempfile = "3"
+ceres-core = { path = "../PC-1500-Emulator/ceres-core" }

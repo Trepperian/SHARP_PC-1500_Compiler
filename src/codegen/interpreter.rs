@@ -88,9 +88,13 @@ pub struct StackMachineInterpreter {
     
     /// Almacenamiento DATA (para READ/RESTORE)
     data_storage: Vec<Value>,
-    
+
     /// Puntero DATA (para READ)
     data_pointer: usize,
+
+    /// Número de línea de cada DATA -> índice de su primer valor, para
+    /// resolver `RESTORE <línea>` (ver `StackInstruction::DataLineTable`).
+    data_line_table: HashMap<u16, usize>,
 }
 
 impl StackMachineInterpreter {
@@ -104,29 +108,25 @@ impl StackMachineInterpreter {
             }
         }
         
-        // Pre-procesar DATA (StoreData)
-        // Los DATA statements deben cargarse ANTES de ejecutar el programa
+        // Pre-procesar DATA: los valores ya vienen recogidos como un único
+        // StackInstruction::DataPool/DataLineTable (ver
+        // StackCodeGenerator::collect_data_pool) — DATA no es código
+        // ejecutable en BASIC real, así que ya no se generan StoreData
+        // inline en el punto donde aparece cada DATA.
         let mut data_storage = Vec::new();
-        let mut temp_stack = Vec::new();
+        let mut data_line_table = HashMap::new();
         for instr in &instructions {
             match instr {
-                StackInstruction::ApilaInt(n) => temp_stack.push(Value::Int(*n)),
-                StackInstruction::ApilaReal(r) => temp_stack.push(Value::Real(*r)),
-                StackInstruction::ApilaCadena(s) => temp_stack.push(Value::String(s.clone())),
-                StackInstruction::StoreData => {
-                    if let Some(value) = temp_stack.pop() {
-                        data_storage.push(value);
-                    }
+                StackInstruction::DataPool(items) => {
+                    data_storage = items.iter().cloned().map(Value::String).collect();
                 }
-                _ => {
-                    // Limpiar temp_stack si hay otra instrucción
-                    if !matches!(instr, StackInstruction::Comment(_)) {
-                        temp_stack.clear();
-                    }
+                StackInstruction::DataLineTable(table) => {
+                    data_line_table = table.iter().cloned().collect();
                 }
+                _ => {}
             }
         }
-        
+
         Self {
             instructions,
             stack: Vec::new(),
@@ -137,6 +137,7 @@ impl StackMachineInterpreter {
             running: true,
             verbose: false,
             data_storage,
+            data_line_table,
             data_pointer: 0,
         }
     }
@@ -293,7 +294,9 @@ impl StackMachineInterpreter {
             StackInstruction::PowInt => {
                 let b = self.stack.pop().expect("Stack underflow").as_int();
                 let a = self.stack.pop().expect("Stack underflow").as_int();
-                self.stack.push(Value::Int(a.pow(b as u32)));
+                // Exponente negativo -> 0 iteraciones -> 1, igual que el
+                // backend nativo (ver PowInt en lh5801_backend.rs).
+                self.stack.push(Value::Int(a.pow(b.max(0) as u32)));
             }
             
             StackInstruction::Negativo => {
@@ -349,16 +352,16 @@ impl StackMachineInterpreter {
             // OPERACIONES LÓGICAS
             // ================================================================
             
-            StackInstruction::AndInt => {
+            StackInstruction::AndInt(_) => {
                 let b = self.stack.pop().expect("Stack underflow").as_int();
                 let a = self.stack.pop().expect("Stack underflow").as_int();
-                self.stack.push(Value::Bool(a != 0 && b != 0));
+                self.stack.push(Value::Int(a & b));
             }
-            
-            StackInstruction::OrInt => {
+
+            StackInstruction::OrInt(_) => {
                 let b = self.stack.pop().expect("Stack underflow").as_int();
                 let a = self.stack.pop().expect("Stack underflow").as_int();
-                self.stack.push(Value::Bool(a != 0 || b != 0));
+                self.stack.push(Value::Int(a | b));
             }
             
             StackInstruction::Not => {
@@ -437,7 +440,7 @@ impl StackMachineInterpreter {
                 }
             }
             
-            StackInstruction::SystemOut => {
+            StackInstruction::SystemOutInt | StackInstruction::SystemOutString => {
                 let value = self.stack.pop().expect("Stack underflow en SystemOut");
                 print!("{}", value);
             }
@@ -490,7 +493,7 @@ impl StackMachineInterpreter {
                 self.stack.push(Value::Real(value.tan()));
             }
             
-            StackInstruction::CallRnd => {
+            StackInstruction::CallRnd(_) => {
                 let max = self.stack.pop().expect("Stack underflow").as_int();
                 let random = (rand::random::<f64>() * max as f64) as i64;
                 self.stack.push(Value::Int(random));
@@ -509,7 +512,7 @@ impl StackMachineInterpreter {
                 }
             }
             
-            StackInstruction::CallChr => {
+            StackInstruction::CallChr(_) => {
                 let code = self.stack.pop().expect("Stack underflow").as_int();
                 let ch = char::from_u32(code as u32).unwrap_or('?');
                 self.stack.push(Value::String(ch.to_string()));
@@ -531,13 +534,11 @@ impl StackMachineInterpreter {
             // DATA/READ/RESTORE
             // ================================================================
             
-            StackInstruction::StoreData => {
-                // Almacenar valor en data_storage (para DATA statement)
-                let value = self.stack.pop().expect("Stack underflow en StoreData");
-                self.data_storage.push(value);
+            StackInstruction::DataPool(_) | StackInstruction::DataLineTable(_) => {
+                // Ya procesados en new() antes de empezar a ejecutar.
             }
-            
-            StackInstruction::ReadData => {
+
+            StackInstruction::ReadData(_) => {
                 // Leer valor de data_storage y apilar
                 if self.data_pointer < self.data_storage.len() {
                     let value = self.data_storage[self.data_pointer].clone();
@@ -548,17 +549,16 @@ impl StackMachineInterpreter {
                     self.running = false;
                 }
             }
-            
-            StackInstruction::RestoreData => {
-                // RESTORE - resetear puntero DATA
-                // Si hay un valor en la pila, es el índice al que saltar
-                if !self.stack.is_empty() {
-                    let index = self.stack.pop().expect("Stack underflow").as_int();
-                    self.data_pointer = index as usize;
+
+            StackInstruction::RestoreData(_) => {
+                // Pop número de línea: 0 = reiniciar al principio, si no,
+                // buscar en data_line_table el índice de esa línea.
+                let line = self.stack.pop().expect("Stack underflow en RestoreData").as_int();
+                self.data_pointer = if line == 0 {
+                    0
                 } else {
-                    // RESTORE sin argumento - volver al inicio
-                    self.data_pointer = 0;
-                }
+                    *self.data_line_table.get(&(line as u16)).unwrap_or(&0)
+                };
             }
             
             // ================================================================

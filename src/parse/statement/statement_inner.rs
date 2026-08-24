@@ -136,6 +136,15 @@ pub enum StatementInner {
         expr: Expr,
     },
     Degree,
+    /// Varias sentencias separadas por `:` que forman, en conjunto, el
+    /// consecuente de un `IF` sin bloque explícito (p.ej. `IF cond
+    /// stmt1:stmt2:stmt3`) — en BASIC clásico (incluido el dialecto
+    /// Sharp PC-1500 de todo este corpus), TODAS las sentencias hasta el
+    /// final de la línea son condicionales, no solo la primera. Solo se
+    /// construye desde `Parser::parse_if_stmt`; en cualquier otro
+    /// contexto una lista de sentencias de una línea sigue viviendo como
+    /// `Vec<Statement>` plano en `CodeLine`.
+    Multi(Vec<Statement>),
 }
 
 impl StatementInner {
@@ -495,6 +504,14 @@ impl StatementInner {
             StatementInner::Degree => {
                 bytes.extend_from_slice(Keyword::Degree.internal_code().to_be_bytes().as_slice());
             }
+            StatementInner::Multi(statements) => {
+                for (i, statement) in statements.iter().enumerate() {
+                    statement.write_bytes(bytes, preserve_source_wording);
+                    if i < statements.len() - 1 {
+                        bytes.push(b':');
+                    }
+                }
+            }
         }
     }
 
@@ -751,6 +768,11 @@ impl StatementInner {
             StatementInner::Degree => {
                 format!("DEGREE")
             }
+            StatementInner::Multi(statements) => statements
+                .iter()
+                .map(|statement| statement.show(preserve_source_wording))
+                .collect::<Vec<_>>()
+                .join(":"),
         }
     }
 }

@@ -256,7 +256,6 @@ fn main() {
         }
     } else if args.native_code {
         // Generate native LH5801 machine code as binary file (.lh5)
-        use crate::codegen::lh5801_backend::Lh5801Backend;
         use crate::codegen::lh5_format;
         
         let mut parser = Parser::new(tokens.into_iter());
@@ -277,16 +276,14 @@ fn main() {
             std::process::exit(1);
         }
 
-        // First generate stack code
-        let mut codegen = StackCodeGenerator::new();
-        let instructions = codegen.generate(&program);
-
-        println!("Generadas {} instrucciones de pila", instructions.len());
-
-        // Then compile to LH5801 machine code
-        let mut backend = Lh5801Backend::new();
-        let machine_code = backend.generate(&instructions);
-        let load_address = backend.get_start_address();
+        // Compilar a código máquina LH5801 en dos pasadas: la primera mide
+        // el tamaño real del código, la segunda ya coloca el área de
+        // variables justo después (ver `compile_native_two_pass`) — evita
+        // que un programa grande corrompa su propio código con escrituras
+        // de variables, como llegó a pasar con bathyscaph.bas.
+        use crate::codegen::compile_native_two_pass;
+        let (load_address, machine_code, _variable_addresses) =
+            compile_native_two_pass(&program, 0x4100, 0x57FF);
 
         println!("Generados {} bytes de código máquina LH5801", machine_code.len());
         println!("Dirección de carga: 0x{:04X}", load_address);
@@ -316,8 +313,7 @@ fn main() {
                  load_address, 
                  load_address as usize + machine_code.len() - 1,
                  machine_code.len());
-        println!("  Stack: 0x5800-0x5FEF (752 bytes)");
-        println!("  Stack pointer: 0x5FF0 (inicializado a 0x5FF0)");
+        println!("  Pila (registro S): crece hacia abajo desde 0x57FF");
         
         // Show first bytes of machine code
         println!("\nPrimeros 32 bytes del código máquina (hex):");

@@ -360,6 +360,11 @@ impl SemanticAnalyzer {
                 }
             }
             StatementInner::Degree => {}
+            StatementInner::Multi(statements) => {
+                for statement in statements {
+                    self.analyze_statement(statement)?;
+                }
+            }
         }
         Ok(())
     }
