@@ -88,6 +88,28 @@ pub struct Lh5801Backend {
     /// backend (p.ej. el "done" compartido de `ReadData`/`RestoreData`),
     /// distinto del que usa `StackCodeGenerator` a nivel de IR.
     local_label_counter: usize,
+
+    /// Nombres de las subrutinas compartidas (a nivel de BACKEND, no de
+    /// `StackInstruction` — para lógica que hoy vive en un único `match
+    /// arm` grande pero se repite entera en cada punto de llamada, p.ej.
+    /// `Int2Real`) que este programa concreto ha usado alguna vez. Cada
+    /// nombre presente aquí hace que `emit_shared_subroutines` (llamada
+    /// una sola vez, tras generar todas las instrucciones) emita esa
+    /// rutina EXACTAMENTE una vez, en vez de una copia completa por cada
+    /// aparición — mismo motivo y patrón que `sqr_used` en
+    /// `StackCodeGenerator`, aquí generalizado a un conjunto en vez de un
+    /// booleano por rutina para no repetir el mismo campo N veces.
+    used_shared_routines: std::collections::HashSet<&'static str>,
+
+    /// Parámetros (`max_len`, `buf`, `right_scratch`) de la ÚLTIMA
+    /// instrucción `ConcatString` procesada — `StackCodeGenerator`
+    /// (`mod.rs`) solo tiene un punto de emisión para esta instrucción,
+    /// con `buf`/`right_scratch` memoizados (`get_or_create_array_address`)
+    /// y `max_len` una constante global (`DEFAULT_STRING_MAX_LEN`), así
+    /// que son IDÉNTICOS en todas las apariciones dentro de un mismo
+    /// programa — permite compartir la rutina horneando estos valores
+    /// directamente en su cuerpo en vez de pasarlos por registro.
+    concat_string_params: Option<(u8, u16, u16)>,
 }
 
 /// Tipo de referencia a etiqueta
@@ -160,6 +182,8 @@ impl Lh5801Backend {
             data_line_table: Vec::new(),
             line_table: Vec::new(),
             local_label_counter: 0,
+            used_shared_routines: std::collections::HashSet::new(),
+            concat_string_params: None,
         }
     }
 
@@ -177,6 +201,348 @@ impl Lh5801Backend {
             data_line_table: Vec::new(),
             line_table: Vec::new(),
             local_label_counter: 0,
+            used_shared_routines: std::collections::HashSet::new(),
+            concat_string_params: None,
+        }
+    }
+
+    /// Marca la subrutina compartida `name` como usada (para que
+    /// `emit_shared_subroutines` la emita una vez al final) y emite el
+    /// `SJP` (llamada real, empuja la dirección de retorno en la pila
+    /// hardware) a su etiqueta — mismo idioma que `StackInstruction::Call`
+    /// a nivel de IR, aquí reutilizable desde dentro de cualquier `match
+    /// arm` de instrucción.
+    fn emit_call_shared(&mut self, name: &'static str) {
+        self.used_shared_routines.insert(name);
+        self.emit_byte(0xBE); // SJP
+        self.add_label_ref(format!("__SHARED_{name}"), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+    }
+
+    /// Emite el CUERPO de cada subrutina compartida realmente usada por
+    /// este programa, una sola vez cada una, después de todas las
+    /// instrucciones normales — nunca se cae en ellas por flujo normal
+    /// (el epílogo ya hizo `HALT` antes), solo se alcanzan vía el `SJP`
+    /// que emitió `emit_call_shared` en cada punto de llamada real.
+    /// Termina cada una en `RTN` (`0x9A`), igual que cualquier subrutina
+    /// invocada por `SJP`.
+    fn emit_shared_subroutines(&mut self) {
+        if self.used_shared_routines.contains("INT2REAL") {
+            self.define_label("__SHARED_INT2REAL".to_string());
+            self.emit_int_a_to_bcd_arx();
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("MULINT") {
+            // a = UH, b = UL (ya cargados por el punto de llamada, ver
+            // `StackInstruction::MulInt`) -> resultado en A. Algoritmo de
+            // suma repetida (resultado=0; while(b>0){resultado+=a;b--}),
+            // idéntico al que había inline antes de compartirse. La suma
+            // acumulada vive en XL, separada del registro A que el
+            // bucle usa para decrementar UL (b) en cada iteración — ver
+            // el historial de este bug ya arreglado (confirmado contra
+            // la ROM real en test_oracle_array_1d_constant_size_on_real_rom).
+            // Ni un solo PSH/POP a la pila hardware aquí dentro: el
+            // punto de llamada ya se encarga de operandos y resultado,
+            // precisamente porque el `SJP`/`RTN` que envuelven esta
+            // rutina usan esa misma pila para la dirección de retorno.
+            self.define_label("__SHARED_MULINT".to_string());
+
+            self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+            self.emit_byte(0x0A); // STA XL
+
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            // BZS +N: salta el cuerpo del bucle completo (N = bytes desde
+            // aquí hasta después del BZR de abajo, inclusive). Calculado,
+            // no hardcodeado — un desajuste aquí ya causó una regresión
+            // real (el offset original, copiado del código sin compartir,
+            // medía desde DESPUÉS del propio BZR, no solo el cuerpo del
+            // bucle; un `debug_assert` con el valor equivocado lo detectó
+            // al momento contra la ROM real).
+            let skip_fixup_pos = self.code.len();
+            self.emit_byte(0x8B); self.emit_byte(0x00); // BZS (offset provisional)
+
+            let loop_start = self.code.len();
+            self.emit_byte(0x04); // LDA XL
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xA2); // ADC UH
+            self.emit_byte(0x0A); // STA XL
+
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xDF); // DEC A
+            self.emit_byte(0x2A); // STA UL
+
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            let back_jump_pos = self.code.len();
+            self.emit_byte(0x99); self.emit_byte(0x00); // BZR (offset provisional)
+
+            // BZR -N: N = bytes desde loop_start hasta aquí, INCLUYENDO
+            // los 2 bytes del propio BZR (el offset se resta de P
+            // DESPUÉS de haber leído ambos bytes de la instrucción).
+            let back_offset = (self.code.len() - loop_start) as u8;
+            self.code[back_jump_pos + 1] = back_offset;
+            // BZS +N: N = bytes desde justo después del BZS hasta justo
+            // después del BZR (para caer exactamente donde cae el propio
+            // bucle al salir por el camino normal).
+            let skip_offset = (self.code.len() - (skip_fixup_pos + 2)) as u8;
+            self.code[skip_fixup_pos + 1] = skip_offset;
+
+            self.emit_byte(0x04); // LDA XL (resultado, se queda en A: el punto de llamada lo empuja)
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("SYSTEMOUTINT") {
+            // PRINT de un entero de 8 bits CON SIGNO: imprime sus
+            // dígitos decimales ('-' primero si es negativo). Cuerpo
+            // idéntico al que había inline antes de compartirse — sin
+            // resultado que devolver (efecto secundario puro), así que
+            // el punto de llamada solo necesita el `pop` inicial antes
+            // del `SJP`, nada después.
+            self.define_label("__SHARED_SYSTEMOUTINT".to_string());
+
+            self.emit_byte(0x2A); // STA UL (copia del valor original)
+
+            self.emit_byte(0xB9); self.emit_byte(0x80); // ANI A,#0x80 (bit de signo)
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            let is_negative = self.new_local_label("PRINTINT_NEG");
+            let after_sign = self.new_local_label("PRINTINT_AFTER_SIGN");
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si signo==0, saltar el JMP)
+            self.emit_byte(0xBA); // JMP is_negative (si signo!=0)
+            self.add_label_ref(is_negative.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            // Positivo: A = valor original sin modificar.
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xBA); // JMP after_sign
+            self.add_label_ref(after_sign.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            // Negativo: imprimir '-', luego A = 0 - UL (magnitud
+            // positiva, mismo patrón que Negativo).
+            self.define_label(is_negative);
+            self.emit_byte(0xB5); self.emit_byte(0x2D); // LDI A,#'-'
+            self.emit_call_char_out();
+            self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+            self.emit_byte(0xFB); // SEC
+            self.emit_byte(0x20); // SBC UL
+
+            self.define_label(after_sign);
+            self.emit_extract_hundreds_tens_units(); // UH=centenas, UL=decenas, XL=unidades
+
+            let case_hundreds = self.new_local_label("PRINTINT_HUNDREDS");
+            let case_tens = self.new_local_label("PRINTINT_TENS");
+            let finish = self.new_local_label("PRINTINT_FINISH");
+
+            self.emit_byte(0xA4); // LDA UH (centenas)
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si centenas==0, saltar el JMP)
+            self.emit_byte(0xBA); // JMP case_hundreds (si centenas!=0)
+            self.add_label_ref(case_hundreds.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0x24); // LDA UL (decenas)
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si decenas==0, saltar el JMP)
+            self.emit_byte(0xBA); // JMP case_tens (si decenas!=0)
+            self.add_label_ref(case_tens.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            // Solo unidades (incluye el caso 0).
+            self.emit_byte(0x04); // LDA XL
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+            self.emit_byte(0xBA); // JMP finish
+            self.add_label_ref(finish.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            // 3 dígitos.
+            self.define_label(case_hundreds);
+            self.emit_byte(0xA4); // LDA UH
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+            self.emit_byte(0x04); // LDA XL
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+            self.emit_byte(0xBA); // JMP finish
+            self.add_label_ref(finish.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            // 2 dígitos.
+            self.define_label(case_tens);
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+            self.emit_byte(0x04); // LDA XL
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+            // (cae en finish)
+
+            self.define_label(finish);
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("SYSTEMOUTSTRING") {
+            // Y ya apunta a la cadena (dejado por el punto de llamada).
+            // Recorre hasta el primer NUL, CHAR_OUT cada byte. PSH/POP Y
+            // alrededor de cada CHAR_OUT: preservación defensiva (rutina
+            // ROM cuya preservación de registros no está documentada),
+            // balanceada dentro de esta misma rutina — no interfiere con
+            // el `SJP`/`RTN` que la envuelven.
+            self.define_label("__SHARED_SYSTEMOUTSTRING".to_string());
+
+            let loop_label = self.new_local_label("PRINTSTR_LOOP");
+            let done_label = self.new_local_label("PRINTSTR_DONE");
+
+            self.define_label(loop_label.clone());
+            self.emit_byte(0x15); // LDA (Y)
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si char!=0, saltar el JMP)
+            self.emit_byte(0xBA); // JMP done (si char==0)
+            self.add_label_ref(done_label.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0x0A); // STA XL (guardar el carácter)
+            self.emit_byte(0xFD); self.emit_byte(0x98); // PSH Y
+            self.emit_byte(0x04); // LDA XL
+            self.emit_call_char_out();
+            self.emit_byte(0xFD); self.emit_byte(0x1A); // POP Y
+
+            self.emit_byte(0x54); // Y++
+            self.emit_byte(0xBA); // JMP loop
+            self.add_label_ref(loop_label, RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(done_label);
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("STRCOPY") {
+            // X=origen, Y=destino, UL=contador (ya cargados por el punto
+            // de llamada). Copia hasta UL bytes, parando en el primer
+            // NUL (que sí se copia).
+            self.define_label("__SHARED_STRCOPY".to_string());
+
+            let loop_label = self.new_local_label("STRCOPY_LOOP");
+            let done_label = self.new_local_label("STRCOPY_DONE");
+
+            self.define_label(loop_label.clone());
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3: si UL!=0, saltar el JMP
+            self.emit_byte(0xBA); // JMP done
+            self.add_label_ref(done_label.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0x05); // LDA (X)
+            self.emit_byte(0x1E); // STA (Y)
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3: si no era NUL, saltar el JMP
+            self.emit_byte(0xBA); // JMP done (era NUL: parar)
+            self.add_label_ref(done_label.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0x44); // X++
+            self.emit_byte(0x54); // Y++
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xDF); // DEC A
+            self.emit_byte(0x2A); // STA UL
+            self.emit_byte(0xBA); // JMP loop
+            self.add_label_ref(loop_label, RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(done_label);
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("BEEP") {
+            // XL/XH=duración, UL=frecuencia, YL=repeticiones (ya
+            // cargados por el punto de llamada).
+            self.define_label("__SHARED_BEEP".to_string());
+
+            let loop_label = self.new_local_label("BEEP_LOOP");
+            let done_label = self.new_local_label("BEEP_DONE");
+
+            self.define_label(loop_label.clone());
+            self.emit_byte(0x14); // LDA YL
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si YL!=0, saltar el JMP)
+            self.emit_byte(0xBA); // JMP done_label (si YL==0)
+            self.add_label_ref(done_label.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            if let Some(addr) = self.rom_routines.address("BEEP") {
+                self.emit_call_rom(addr);
+            } else {
+                eprintln!("WARNING: Rutina ROM BEEP no encontrada");
+            }
+
+            self.emit_byte(0x14); // LDA YL
+            self.emit_byte(0xDF); // DEC A
+            self.emit_byte(0x1A); // STA YL
+            self.emit_byte(0xBA); // JMP loop_label
+            self.add_label_ref(loop_label, RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(done_label);
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("STRCMP") {
+            // X=puntero a, Y=puntero b (ya cargados por el punto de
+            // llamada). Compara contenido byte a byte hasta el primer
+            // NUL o la primera diferencia. Convenio fijo: A=1 si
+            // iguales, A=0 si no (`emit_string_compare` invierte esto
+            // para DistintoCadena, en vez de duplicar toda la
+            // comparación con el convenio opuesto).
+            self.define_label("__SHARED_STRCMP".to_string());
+            self.emit_string_compare_body();
+        }
+
+        if self.used_shared_routines.contains("CONCATSTRING") {
+            // X=puntero izquierdo, `right_scratch`=puntero derecho (ya
+            // guardados por el punto de llamada). `buf`/`right_scratch`/
+            // `max_len` son constantes de este programa (ver el
+            // comentario de `concat_string_params`), horneadas aquí
+            // directamente. Reutiliza el mismo helper de copia terminada
+            // en NUL que LEFT$/RIGHT$/MID$
+            // (`emit_copy_string_x_to_y_terminated`), dos veces seguidas
+            // — Y queda apuntando exactamente al NUL que acaba de
+            // escribir tras la primera copia, así que la segunda arranca
+            // ahí sin volver a escanear.
+            let (max_len_u8, buf, right_scratch) = self
+                .concat_string_params
+                .expect("concat_string_params debe estar poblado si CONCATSTRING está en used_shared_routines");
+            self.define_label("__SHARED_CONCATSTRING".to_string());
+
+            self.emit_byte(0xB5); self.emit_byte((buf >> 8) as u8);
+            self.emit_byte(0x18); // YH
+            self.emit_byte(0xB5); self.emit_byte((buf & 0xFF) as u8);
+            self.emit_byte(0x1A); // YL
+            self.emit_byte(0xB5); self.emit_byte(max_len_u8);
+            self.emit_byte(0x2A); // UL
+
+            self.emit_copy_string_x_to_y_terminated();
+
+            self.emit_byte(0xA5); self.emit_word(right_scratch); // LDA right_scratch (alto)
+            self.emit_byte(0x08); // XH
+            self.emit_byte(0xA5); self.emit_word(right_scratch + 1); // LDA right_scratch+1 (bajo)
+            self.emit_byte(0x0A); // XL
+
+            self.emit_byte(0xB5); self.emit_byte(max_len_u8);
+            self.emit_byte(0x2A); // UL
+
+            self.emit_copy_string_x_to_y_terminated();
+            self.emit_byte(0x9A); // RTN
         }
     }
 
@@ -230,7 +596,11 @@ impl Lh5801Backend {
         
         // Epílogo: halt
         self.emit_halt();
-        
+
+        // Subrutinas compartidas (solo las que este programa usó de
+        // verdad) — después del HALT, nunca alcanzadas por flujo normal.
+        self.emit_shared_subroutines();
+
         // Segunda pasada: resolver referencias a etiquetas
         self.resolve_labels();
 
@@ -1377,10 +1747,6 @@ impl Lh5801Backend {
     /// (`push_one_if_not_equal=true`) — comparten el mismo bucle, solo
     /// cambia qué desenlace empuja 1 y cuál empuja 0.
     fn emit_string_compare(&mut self, push_one_if_not_equal: bool) {
-        let loop_label = self.new_local_label("STRCMP_LOOP");
-        let not_equal_label = self.new_local_label("STRCMP_NE");
-        let done_label = self.new_local_label("STRCMP_DONE");
-
         // Pop puntero b (16 bits) a Y
         self.emit_pop_a();
         self.emit_byte(0x1A); // STA YL
@@ -1392,6 +1758,23 @@ impl Lh5801Backend {
         self.emit_byte(0x0A); // STA XL
         self.emit_pop_a();
         self.emit_byte(0x08); // STA XH
+
+        // La rutina compartida siempre calcula el convenio de
+        // IgualCadena (A=1 si iguales, A=0 si no) — DistintoCadena
+        // simplemente invierte el resultado aquí, en el punto de
+        // llamada, en vez de duplicar la comparación entera con el
+        // convenio opuesto.
+        self.emit_call_shared("STRCMP");
+        if push_one_if_not_equal {
+            self.emit_byte(0xBD); self.emit_byte(0x01); // EOR A,#1 (invertir 0<->1)
+        }
+        self.emit_push_a();
+    }
+
+    fn emit_string_compare_body(&mut self) {
+        let loop_label = self.new_local_label("STRCMP_LOOP");
+        let not_equal_label = self.new_local_label("STRCMP_NE");
+        let done_label = self.new_local_label("STRCMP_DONE");
 
         self.define_label(loop_label.clone());
 
@@ -1428,20 +1811,20 @@ impl Lh5801Backend {
         self.add_label_ref(loop_label, RefType::Absolute16);
         self.emit_label_placeholder(RefType::Absolute16);
 
-        // Desenlaces: cargar 0/1 según corresponda y saltar al final común.
+        // Desenlaces: cargar 0/1 (convenio fijo IgualCadena: 1=iguales,
+        // 0=distintas — DistintoCadena invierte esto en el punto de
+        // llamada, ver `emit_string_compare`) y saltar al final común.
         self.define_label(not_equal_label);
-        self.emit_byte(0xB5); // LDI A,#(1 si push_one_if_not_equal, si no 0)
-        self.emit_byte(u8::from(push_one_if_not_equal));
+        self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0 (distintas)
         self.emit_byte(0xBA); // JMP done
         self.add_label_ref(done_label.clone(), RefType::Absolute16);
         self.emit_label_placeholder(RefType::Absolute16);
 
         self.define_label(equal_done_label);
-        self.emit_byte(0xB5); // LDI A,#(0 si push_one_if_not_equal, si no 1)
-        self.emit_byte(u8::from(!push_one_if_not_equal));
+        self.emit_byte(0xB5); self.emit_byte(0x01); // LDI A,#1 (iguales)
 
         self.define_label(done_label);
-        self.emit_push_a();
+        self.emit_byte(0x9A); // RTN
     }
 
     /// Emitir código para una instrucción de pila
@@ -1683,66 +2066,23 @@ impl Lh5801Backend {
             StackInstruction::DesapilaIndStringCopy(max_len) => {
                 // Pop puntero origen (X) y dirección destino (Y), copia
                 // hasta max_len bytes byte a byte, parando en el primer
-                // NUL (el NUL sí se copia, el resto del buffer se deja
-                // como estuviera — memoria nueva empieza a 0, así que en
-                // la práctica queda como relleno NUL igualmente salvo que
-                // el mismo slot ya tuviera una cadena más larga antes).
-                // max_len se acota a 255 (contador de 1 byte, igual que
-                // el resto de este backend).
-                let loop_label = self.new_local_label("STRCOPY_LOOP");
-                let done_label = self.new_local_label("STRCOPY_DONE");
-
-                // Pop puntero origen (16 bits) a X
+                // NUL. `max_len` VARÍA por punto de llamada (cada array/
+                // variable de cadena tiene su propio ancho), así que no
+                // puede hornearse dentro de la rutina compartida — se
+                // pasa vía `UL`, cargado aquí (constante de compilación,
+                // 3 bytes) antes del `SJP`, en vez de duplicar el bucle
+                // de copia entero (~35 bytes) en cada punto de llamada.
                 self.emit_pop_a();
                 self.emit_byte(0x0A); // STA XL
                 self.emit_pop_a();
                 self.emit_byte(0x08); // STA XH
-
-                // Pop dirección destino (16 bits) a Y
                 self.emit_pop_a();
                 self.emit_byte(0x1A); // STA YL
                 self.emit_pop_a();
                 self.emit_byte(0x18); // STA YH
-
-                // UL = contador de bytes restantes
-                self.emit_byte(0xB5); // LDI A,#max_len
-                self.emit_byte((*max_len).min(255) as u8);
+                self.emit_byte(0xB5); self.emit_byte((*max_len).min(255) as u8); // LDI A,#max_len
                 self.emit_byte(0x2A); // STA UL
-
-                self.define_label(loop_label.clone());
-
-                // Si no quedan bytes por copiar, terminar.
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xB7); // CPI A,#0
-                self.emit_byte(0x00);
-                self.emit_byte(0x89); // BZR +3: si UL != 0, saltar el JMP
-                self.emit_byte(0x03);
-                self.emit_byte(0xBA); // JMP done
-                self.add_label_ref(done_label.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // Copiar un byte; si era NUL, parar aquí (ya copiado).
-                self.emit_byte(0x05); // LDA (X)
-                self.emit_byte(0x1E); // STA (Y)
-                self.emit_byte(0xB7); // CPI A,#0
-                self.emit_byte(0x00);
-                self.emit_byte(0x89); // BZR +3: si el byte no era NUL, saltar el JMP
-                self.emit_byte(0x03);
-                self.emit_byte(0xBA); // JMP done (byte era NUL: parar)
-                self.add_label_ref(done_label.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // Avanzar punteros y decrementar contador.
-                self.emit_byte(0x44); // X++
-                self.emit_byte(0x54); // Y++
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xDF); // DEC A
-                self.emit_byte(0x2A); // STA UL
-                self.emit_byte(0xBA); // JMP loop
-                self.add_label_ref(loop_label, RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.define_label(done_label);
+                self.emit_call_shared("STRCOPY");
             }
 
             // ===== ARITMÉTICA REAL (BCD, vía ARX/ARY de la ROM) =====
@@ -1846,8 +2186,16 @@ impl Lh5801Backend {
                 // equivalente en formato "número decimal" real de 8
                 // bytes directamente en ARX (ver
                 // `emit_int_a_to_bcd_arx`), para apilarlo.
+                //
+                // Subrutina compartida, no inline: `Int2Real` es, con
+                // diferencia, la instrucción con más impacto agregado de
+                // tamaño de TODO el corpus de 39 programas (~50KB de los
+                // ~750KB medidos, 281 apariciones a 180 bytes cada una)
+                // — mismo motivo que el arreglo de `GPRINT`, aquí
+                // aplicado a una instrucción de coste FIJO (no escala con
+                // contenido) pero repetida con mucha frecuencia.
                 self.emit_pop_a();
-                self.emit_int_a_to_bcd_arx();
+                self.emit_call_shared("INT2REAL");
                 self.emit_push_8_from(system_memory::ARX);
             }
 
@@ -1930,60 +2278,28 @@ impl Lh5801Backend {
             }
 
             StackInstruction::MulInt => {
-                // Multiplicación usando bucle simple
-                // Pop b, Pop a, Push (a * b)
-                // Algoritmo: resultado = 0; while(b > 0) { resultado += a; b--; }
-                //
-                // La suma acumulada vive en XL, separada del registro A que
-                // el bucle usa para decrementar UL (b) en cada iteración —
-                // la versión anterior reutilizaba A para ambas cosas y el
-                // "LDA UL; DEC A" de cada vuelta pisaba la suma que
-                // "ADC UH" acababa de calcular, así que el valor final
-                // empujado no era el producto real, sino resto del último
-                // decremento de UL. Confirmado ejecutando contra la ROM
-                // real (ver test_oracle_array_1d_constant_size_on_real_rom,
-                // que multiplica índice*tamaño_elemento).
-
-                // 1. Pop b a UL
+                // Multiplicación: pop b, pop a, push (a*b). Segunda
+                // instrucción con más impacto agregado de tamaño de todo
+                // el corpus (~46.6KB de los ~750KB medidos, 1666
+                // apariciones a 28 bytes cada una) — buena candidata para
+                // compartir. IMPORTANTE: los `pop` de los operandos deben
+                // quedarse AQUÍ, antes del `SJP` — el propio `SJP` empuja
+                // la dirección de retorno en la MISMA pila hardware (`S`)
+                // justo después, así que si la rutina compartida hiciera
+                // sus propios `pop` estaría leyendo bytes de esa
+                // dirección de retorno, no los operandos (confirmado con
+                // un "Illegal opcode" real al ejecutar contra la ROM:
+                // un salto a memoria basura tras corromper `S`). Por el
+                // mismo motivo, el resultado se empuja AQUÍ, después de
+                // que el `SJP`/`RTN` ya hayan hecho su propio ida y
+                // vuelta — dentro de la rutina compartida el resultado
+                // solo puede viajar en un REGISTRO (aquí, A), nunca por
+                // la pila hardware.
                 self.emit_pop_a();
                 self.emit_byte(0x2A); // UL = A (b en UL)
-
-                // 2. Pop a a UH
                 self.emit_pop_a();
                 self.emit_byte(0x28); // UH = A (a en UH)
-
-                // 3. Inicializar suma acumulada (XL) a 0
-                self.emit_byte(0xB5); // LDI A, #0
-                self.emit_byte(0x00);
-                self.emit_byte(0x0A); // STA XL
-
-                // 4. Si b == 0, saltar directamente al final (XL ya es 0)
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xB7); // CPI A, #0
-                self.emit_byte(0x00);
-                self.emit_byte(0x8B); // BZS +11 (Branch Zero Set): salta el cuerpo del bucle (11 bytes)
-                self.emit_byte(0x0B);
-
-                // Bucle (11 bytes, empieza aquí):
-                // XL += UH (suma acumulada += a)
-                self.emit_byte(0x04); // LDA XL
-                self.emit_byte(0xF9); // REC
-                self.emit_byte(0xA2); // ADC UH
-                self.emit_byte(0x0A); // STA XL
-
-                // UL-- (b--)
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xDF); // DEC A
-                self.emit_byte(0x2A); // STA UL
-
-                // if (UL != 0) goto inicio del bucle
-                self.emit_byte(0xB7); // CPI A, #0
-                self.emit_byte(0x00);
-                self.emit_byte(0x99); // BZR -11 (Branch si Z=0, hacia atrás)
-                self.emit_byte(0x0B);
-
-                // 5. Cargar suma acumulada y empujar resultado
-                self.emit_byte(0x04); // LDA XL
+                self.emit_call_shared("MULINT");
                 self.emit_push_a();
             }
             
@@ -2492,133 +2808,30 @@ impl Lh5801Backend {
                 // truco de signo que ABS()/STEP descendente (bit7 vía
                 // AND) y misma extracción de dígitos que CallStr, pero
                 // imprimiendo cada dígito directamente en vez de
-                // escribirlo en un buffer.
+                // escribirlo en un buffer. Sin resultado que empujar de
+                // vuelta (es un PRINT, efecto secundario puro) — el pop
+                // del valor de entrada se queda aquí, antes del `SJP`
+                // (ver el comentario largo de `MulInt` sobre por qué:
+                // la rutina compartida no puede tocar la pila hardware
+                // directamente, la comparte con la dirección de retorno
+                // del propio `SJP`/`RTN`).
                 self.emit_pop_a();
-                self.emit_byte(0x2A); // STA UL (copia del valor original)
-
-                self.emit_byte(0xB9); self.emit_byte(0x80); // ANI A,#0x80 (bit de signo)
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                let is_negative = self.new_local_label("PRINTINT_NEG");
-                let after_sign = self.new_local_label("PRINTINT_AFTER_SIGN");
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si signo==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP is_negative (si signo!=0)
-                self.add_label_ref(is_negative.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // Positivo: A = valor original sin modificar.
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xBA); // JMP after_sign
-                self.add_label_ref(after_sign.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // Negativo: imprimir '-', luego A = 0 - UL (magnitud
-                // positiva, mismo patrón que Negativo).
-                self.define_label(is_negative);
-                self.emit_byte(0xB5); self.emit_byte(0x2D); // LDI A,#'-'
-                self.emit_call_char_out();
-                self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
-                self.emit_byte(0xFB); // SEC
-                self.emit_byte(0x20); // SBC UL
-
-                self.define_label(after_sign);
-                self.emit_extract_hundreds_tens_units(); // UH=centenas, UL=decenas, XL=unidades
-
-                let case_hundreds = self.new_local_label("PRINTINT_HUNDREDS");
-                let case_tens = self.new_local_label("PRINTINT_TENS");
-                let finish = self.new_local_label("PRINTINT_FINISH");
-
-                self.emit_byte(0xA4); // LDA UH (centenas)
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si centenas==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP case_hundreds (si centenas!=0)
-                self.add_label_ref(case_hundreds.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.emit_byte(0x24); // LDA UL (decenas)
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si decenas==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP case_tens (si decenas!=0)
-                self.add_label_ref(case_tens.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // Solo unidades (incluye el caso 0).
-                self.emit_byte(0x04); // LDA XL
-                self.emit_byte(0xF9); // REC
-                self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
-                self.emit_call_char_out();
-                self.emit_byte(0xBA); // JMP finish
-                self.add_label_ref(finish.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // 3 dígitos.
-                self.define_label(case_hundreds);
-                self.emit_byte(0xA4); // LDA UH
-                self.emit_byte(0xF9); // REC
-                self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
-                self.emit_call_char_out();
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xF9); // REC
-                self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
-                self.emit_call_char_out();
-                self.emit_byte(0x04); // LDA XL
-                self.emit_byte(0xF9); // REC
-                self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
-                self.emit_call_char_out();
-                self.emit_byte(0xBA); // JMP finish
-                self.add_label_ref(finish.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // 2 dígitos.
-                self.define_label(case_tens);
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xF9); // REC
-                self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
-                self.emit_call_char_out();
-                self.emit_byte(0x04); // LDA XL
-                self.emit_byte(0xF9); // REC
-                self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
-                self.emit_call_char_out();
-                // (cae en finish)
-
-                self.define_label(finish);
+                self.emit_call_shared("SYSTEMOUTINT");
             }
 
             StackInstruction::SystemOutString => {
                 // PRINT de una cadena: pop puntero (Y), recorrer hasta el
-                // primer NUL, CHAR_OUT cada byte. Y/U se preservan
-                // defensivamente alrededor de cada llamada a CHAR_OUT
-                // (rutina cuya preservación de registros no está
-                // documentada, a diferencia de BEEP/TIME_DELAY) para que
-                // el puntero de recorrido sobreviva sin importar lo que
-                // CHAR_OUT haga internamente.
+                // primer NUL, CHAR_OUT cada byte. Instrucción más
+                // frecuente del corpus tras `Int2Real`/`MulInt` (748
+                // apariciones, ~21.7KB agregados) — buena candidata para
+                // compartir. El pop del puntero se queda aquí, antes del
+                // `SJP` (mismo motivo que `MulInt`/`SystemOutInt`); sin
+                // resultado que devolver.
                 self.emit_pop_a();
                 self.emit_byte(0x1A); // STA YL
                 self.emit_pop_a();
                 self.emit_byte(0x18); // STA YH
-
-                let loop_label = self.new_local_label("PRINTSTR_LOOP");
-                let done_label = self.new_local_label("PRINTSTR_DONE");
-
-                self.define_label(loop_label.clone());
-                self.emit_byte(0x15); // LDA (Y)
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si char!=0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP done (si char==0)
-                self.add_label_ref(done_label.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.emit_byte(0x0A); // STA XL (guardar el carácter, PSH/POP Y no toca A pero sí podría tocar XL indirectamente en CHAR_OUT)
-                self.emit_byte(0xFD); self.emit_byte(0x98); // PSH Y
-                self.emit_byte(0x04); // LDA XL
-                self.emit_call_char_out();
-                self.emit_byte(0xFD); self.emit_byte(0x1A); // POP Y
-
-                self.emit_byte(0x54); // Y++
-                self.emit_byte(0xBA); // JMP loop
-                self.add_label_ref(loop_label, RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.define_label(done_label);
+                self.emit_call_shared("SYSTEMOUTSTRING");
             }
 
             StackInstruction::PrintUsingReal(digits_before, digits_after, asterisk_fill, forced_sign, buf) => {
@@ -2851,42 +3064,89 @@ impl Lh5801Backend {
                 // columnas reales es `len/2`. Pop puntero (16 bits) a Y,
                 // recorrer con LIN Y (carga y auto-incrementa) dos
                 // caracteres por columna.
+                //
+                // Bucle REAL en tiempo de ejecución, no desenrollado en
+                // compilación: la primera versión emitía el cuerpo (~15
+                // bytes) una vez por CADA columna, en cada punto de
+                // llamada — con cadenas largas (p.ej. 41 caracteres = 20
+                // columnas) esto por sí solo llegó a suponer más de la
+                // mitad del tamaño total generado de monstres&merveilles.bas
+                // (78KB). Mismo patrón que el bug ya arreglado en `SQR`
+                // (Newton desenrollado por punto de llamada), aquí
+                // escalando con la longitud de la cadena en vez de con
+                // el número de llamadas. El contador de vueltas (`ARX+1`,
+                // scratch transitorio — mismo argumento de seguridad ya
+                // documentado para `ARX` en este mismo bloque: GPRINT
+                // nunca corre a la vez que aritmética real) se inicializa
+                // al número de columnas (constante de compilación) y se
+                // decrementa una vez por vuelta con el mismo idioma de
+                // bucle con etiquetas locales ya usado y verificado en
+                // `emit_print_real_natural` — no la instrucción nativa
+                // `LOP` (0x88), que no tenía ningún uso previo verificado
+                // en este backend y cuya codificación exacta del salto
+                // relativo no se quería arriesgar sin poder probarla.
                 self.emit_pop_a();
                 self.emit_byte(0x1A); // YL
                 self.emit_pop_a();
                 self.emit_byte(0x18); // YH
 
+                let columns = *len / 2;
+                if columns == 0 {
+                    // Cadena vacía o de 1 carácter (sin pareja): ninguna
+                    // columna que imprimir, igual que el `for` original
+                    // con 0 iteraciones.
+                    return;
+                }
+
                 let gprint_out = self.rom_routines.address("GPRINT_OUT");
                 let mtrx_inc = self.rom_routines.address("MTRX_INC");
+                let counter = system_memory::ARX + 1;
 
-                for _ in 0..(*len / 2) {
-                    // Carácter alto -> nibble alto (desplazado 4 bits),
-                    // guardado en ARX como scratch transitorio (seguro:
-                    // GPRINT nunca se ejecuta a la vez que aritmética
-                    // real, que es lo único que usa ARX).
-                    self.emit_byte(0x55); // LIN Y (LDA (Y); Y++)
-                    self.emit_hex_digit_to_nibble();
-                    self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); // SHL x4
-                    self.emit_byte(0xAE); // STA addr (nibble alto)
-                    self.emit_word(system_memory::ARX);
+                self.emit_byte(0xB5); self.emit_byte(columns as u8); // LDI A,#columns
+                self.emit_byte(0xAE); self.emit_word(counter); // STA counter
 
-                    // Carácter bajo -> nibble bajo, combinado con el alto.
-                    self.emit_byte(0x55); // LIN Y (LDA (Y); Y++)
-                    self.emit_hex_digit_to_nibble();
-                    self.emit_byte(0xAB); // OR addr (combinar con el nibble alto)
-                    self.emit_word(system_memory::ARX);
+                let loop_start = self.new_local_label("GPRINTSTR_LOOP");
+                let loop_done = self.new_local_label("GPRINTSTR_DONE");
+                self.define_label(loop_start.clone());
 
-                    if let Some(addr) = gprint_out {
-                        self.emit_call_rom(addr);
-                    } else {
-                        eprintln!("WARNING: Rutina ROM GPRINT_OUT no encontrada");
-                    }
-                    if let Some(addr) = mtrx_inc {
-                        self.emit_call_rom(addr);
-                    } else {
-                        eprintln!("WARNING: Rutina ROM MTRX_INC no encontrada");
-                    }
+                // Carácter alto -> nibble alto (desplazado 4 bits),
+                // guardado en ARX como scratch transitorio.
+                self.emit_byte(0x55); // LIN Y (LDA (Y); Y++)
+                self.emit_hex_digit_to_nibble();
+                self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); // SHL x4
+                self.emit_byte(0xAE); // STA addr (nibble alto)
+                self.emit_word(system_memory::ARX);
+
+                // Carácter bajo -> nibble bajo, combinado con el alto.
+                self.emit_byte(0x55); // LIN Y (LDA (Y); Y++)
+                self.emit_hex_digit_to_nibble();
+                self.emit_byte(0xAB); // OR addr (combinar con el nibble alto)
+                self.emit_word(system_memory::ARX);
+
+                if let Some(addr) = gprint_out {
+                    self.emit_call_rom(addr);
+                } else {
+                    eprintln!("WARNING: Rutina ROM GPRINT_OUT no encontrada");
                 }
+                if let Some(addr) = mtrx_inc {
+                    self.emit_call_rom(addr);
+                } else {
+                    eprintln!("WARNING: Rutina ROM MTRX_INC no encontrada");
+                }
+
+                // counter--; si counter!=0, volver a loop_start.
+                self.emit_byte(0xA5); self.emit_word(counter); // LDA counter
+                self.emit_byte(0xDF); // DEC A
+                self.emit_byte(0xAE); self.emit_word(counter); // STA counter
+                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+                self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si counter!=0, saltar el JMP)
+                self.emit_byte(0xBA); // JMP loop_done (si counter==0)
+                self.add_label_ref(loop_done.clone(), RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+                self.emit_byte(0xBA); // JMP loop_start (si counter!=0)
+                self.add_label_ref(loop_start, RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+                self.define_label(loop_done);
             }
 
             StackInstruction::GCursor => {
@@ -2912,43 +3172,17 @@ impl Lh5801Backend {
                 // duración. BEEP preserva Y/X/U (PSH/POP interno), así
                 // que repetir la llamada `repeticiones` veces no necesita
                 // recargar UL/X entre vueltas — solo el contador (YL, no
-                // usado por BEEP) cambia.
+                // usado por BEEP) cambia. Los 3 `pop` se quedan aquí,
+                // antes del `SJP` (sin resultado que devolver).
                 self.emit_pop_a();
                 self.emit_byte(0x0A); // STA XL (duración, byte bajo)
                 self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
                 self.emit_byte(0x08); // STA XH (duración, byte alto a 0)
-
                 self.emit_pop_a();
                 self.emit_byte(0x2A); // STA UL (frecuencia/tono)
-
                 self.emit_pop_a();
                 self.emit_byte(0x1A); // STA YL (contador de repeticiones)
-
-                let loop_label = self.new_local_label("BEEP_LOOP");
-                let done_label = self.new_local_label("BEEP_DONE");
-
-                self.define_label(loop_label.clone());
-                self.emit_byte(0x14); // LDA YL
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si YL!=0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP done_label (si YL==0)
-                self.add_label_ref(done_label.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                if let Some(addr) = self.rom_routines.address("BEEP") {
-                    self.emit_call_rom(addr);
-                } else {
-                    eprintln!("WARNING: Rutina ROM BEEP no encontrada");
-                }
-
-                self.emit_byte(0x14); // LDA YL
-                self.emit_byte(0xDF); // DEC A
-                self.emit_byte(0x1A); // STA YL
-                self.emit_byte(0xBA); // JMP loop_label
-                self.add_label_ref(loop_label, RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.define_label(done_label);
+                self.emit_call_shared("BEEP");
             }
 
             StackInstruction::Random(seed_addr) => {
@@ -3659,17 +3893,25 @@ impl Lh5801Backend {
             }
 
             StackInstruction::ConcatString(max_len, buf, right_scratch) => {
-                // `A$+B$`: reutiliza el mismo helper de copia terminada en
-                // NUL que LEFT$/RIGHT$/MID$ (`emit_copy_string_x_to_y_terminated`),
-                // dos veces seguidas — una por cada lado. Ese helper deja Y
-                // apuntando exactamente al NUL que acaba de escribir (tanto
-                // si copió hasta un NUL real como si agotó el presupuesto),
-                // así que la segunda copia puede arrancar justo ahí sin
-                // tener que volver a escanear la longitud del lado
-                // izquierdo.
+                // `A$+B$`. `StackCodeGenerator` (`mod.rs`) solo tiene un
+                // punto de emisión para esta instrucción con `buf`/
+                // `right_scratch`/`max_len` siempre idénticos dentro de
+                // un mismo programa (ver el comentario de
+                // `concat_string_params`) — la rutina compartida los
+                // hornea directamente, así que cada punto de llamada solo
+                // necesita los `pop` de los dos punteros de entrada
+                // (antes del `SJP`) y el `push` del puntero resultado
+                // (después).
                 let max_len_u8 = (*max_len).min(255) as u8;
                 let buf = *buf as u16;
                 let right_scratch = *right_scratch as u16;
+                if let Some(prev) = self.concat_string_params {
+                    debug_assert_eq!(
+                        prev, (max_len_u8, buf, right_scratch),
+                        "ConcatString con parámetros distintos en el mismo programa: la rutina compartida asume que son siempre iguales"
+                    );
+                }
+                self.concat_string_params = Some((max_len_u8, buf, right_scratch));
 
                 // El puntero derecho está en el TOPE de la pila (se apiló
                 // después que el izquierdo), pero hace falta copiar el
@@ -3686,28 +3928,7 @@ impl Lh5801Backend {
                 self.emit_pop_a();
                 self.emit_byte(0x08); // XH
 
-                // Y = buf, UL = presupuesto para el lado izquierdo.
-                self.emit_byte(0xB5); self.emit_byte((buf >> 8) as u8);
-                self.emit_byte(0x18); // YH
-                self.emit_byte(0xB5); self.emit_byte((buf & 0xFF) as u8);
-                self.emit_byte(0x1A); // YL
-                self.emit_byte(0xB5); self.emit_byte(max_len_u8);
-                self.emit_byte(0x2A); // UL
-
-                self.emit_copy_string_x_to_y_terminated();
-
-                // X = puntero derecho (recuperado del scratch).
-                self.emit_byte(0xA5); self.emit_word(right_scratch); // LDA right_scratch (alto)
-                self.emit_byte(0x08); // XH
-                self.emit_byte(0xA5); self.emit_word(right_scratch + 1); // LDA right_scratch+1 (bajo)
-                self.emit_byte(0x0A); // XL
-
-                // UL = presupuesto para el lado derecho (Y ya está donde
-                // hace falta, justo en el NUL que dejó la copia anterior).
-                self.emit_byte(0xB5); self.emit_byte(max_len_u8);
-                self.emit_byte(0x2A); // UL
-
-                self.emit_copy_string_x_to_y_terminated();
+                self.emit_call_shared("CONCATSTRING");
 
                 // Push puntero al resultado (buf, alto luego bajo).
                 self.emit_byte(0xB5); self.emit_byte((buf >> 8) as u8);
@@ -5074,6 +5295,46 @@ mod tests {
         // A$(0)="3C" (array de ancho fijo, 2 caracteres = 1 par hex):
         // igual, 1 sola columna con el valor decodificado 0x3C.
         assert_eq!(recon_high(0x7600), 0x3C, "GPRINT A$(0)=\"3C\" columna 78: 1 columna, valor decodificado 0x3C");
+    }
+
+    /// `GPrintString` con VARIAS columnas (el test de arriba solo cubre
+    /// 1 columna, insuficiente para verificar un bucle real): confirma
+    /// que el bucle de tiempo de ejecución añadido para no desenrollar
+    /// en compilación (ver el comentario largo de `GPrintString` en el
+    /// backend — antes ~50% del tamaño generado de monstres&merveilles.bas
+    /// venía de aquí) recorre TODAS las columnas, con el valor correcto
+    /// en cada una, en el orden correcto, sin desincronizar la pila
+    /// hardware entre vueltas.
+    #[test]
+    fn test_oracle_gprint_string_multiple_columns_loops_correctly_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // 5 columnas (10 caracteres hex): valores distintos y fáciles de
+        // reconocer en cada una, para detectar tanto un recuento de
+        // vueltas incorrecto como un valor mal decodificado en alguna
+        // vuelta concreta.
+        let source = "10 GCURSOR 0\n20 GPRINT \"12345678AB\"\n30 END\n";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S debe volver a stack_top tras las 5 vueltas del bucle: S={:#06X}",
+            pc1500.cpu().s()
+        );
+
+        let recon = |adr: u32| -> u8 {
+            (pc1500.read_byte(adr) & 0x0F) | ((pc1500.read_byte(adr + 1) & 0x0F) << 4)
+        };
+        assert_eq!(recon(0x7600), 0x12, "columna 0: primer par \"12\"");
+        assert_eq!(recon(0x7602), 0x34, "columna 1: segundo par \"34\"");
+        assert_eq!(recon(0x7604), 0x56, "columna 2: tercer par \"56\"");
+        assert_eq!(recon(0x7606), 0x78, "columna 3: cuarto par \"78\"");
+        assert_eq!(recon(0x7608), 0xAB, "columna 4: quinto par \"AB\", última vuelta del bucle");
+        // Ninguna columna más allá de la 4ª debe tocarse.
+        assert_eq!(recon(0x760A), 0xFF, "columna 5 no debe tocarse (0xFF = memoria de vídeo sin inicializar, sin CLS)");
     }
 
     /// `POINT(x)` debe leer exactamente lo que `GPRINT` escribió — el
@@ -6538,10 +6799,21 @@ mod tests {
     /// el timing exacto de la prueba dependa de la disposición de la
     /// cueva (determinista por nuestro LFSR mock, pero frágil de fijar a
     /// mano). El tramo de frames usado se calibró empíricamente contra
-    /// este mismo oráculo: a los 13 `step_frame()` la fase de dibujo ya
+    /// este mismo oráculo: a los 11 `step_frame()` la fase de dibujo ya
     /// ha terminado (`H` todavía en su valor sin inicializar, 0) pero el
-    /// bucle de juego aún no ha arrancado; 1-2 frames más bastan para
-    /// verlo en marcha con `H` respondiendo ya a la tecla.
+    /// bucle de juego aún no ha arrancado; unos pocos frames más bastan
+    /// para verlo en marcha con `H` respondiendo ya a la tecla.
+    ///
+    /// El nº EXACTO de frames hasta que el bucle arranca (y el valor
+    /// exacto de `P` en ese instante) depende de cuántos ciclos de CPU
+    /// consume la fase de dibujo — y por tanto es sensible a cualquier
+    /// optimización de tamaño/velocidad del código generado (como el
+    /// bucle real de `GPrintString`, antes desenrollado en compilación:
+    /// el mismo número de `step_frame()` ya no capturaba `P==2` de
+    /// antes, saltaba directo a `P==3` con la versión más rápida). Por
+    /// eso se comprueba `P > 0` en vez de un valor exacto — sigue
+    /// verificando "el bucle de juego ha arrancado de verdad", sin
+    /// depender de en qué ciclo preciso cae ese frame.
     #[test]
     fn test_oracle_bathyscaph_end_to_end_gameplay_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native_with_addresses, load, ORACLE_LOAD_ADDR};
@@ -6565,9 +6837,13 @@ mod tests {
             "la cueva (14 segmentos DATA vía RESTORE+READ+GPRINT) debe haber tocado bien más de 100 bytes del buffer de pantalla, tocó {touched_bytes}"
         );
 
-        // Un frame más: el bucle de juego arranca (P=2) y H se inicializa a 3.
-        pc1500.step_frame();
-        assert_eq!(pc1500.read_byte(p_addr), 2, "el bucle de juego debe haber arrancado en P=2");
+        // Unos pocos frames más: el bucle de juego arranca (P>0) y H se
+        // inicializa a 3. Ver el comentario de la función sobre por qué
+        // `P` se comprueba como `>0`, no un valor exacto.
+        for _ in 0..3 {
+            pc1500.step_frame();
+        }
+        assert!(pc1500.read_byte(p_addr) > 0, "el bucle de juego debe haber arrancado (P>0)");
         assert_eq!(pc1500.read_byte(h_addr), 3, "H debe estar inicializada a 3 (línea 41: TIME=0,H=3,G=8)");
 
         // --- Control real del jugador: Up debe BAJAR H ---
@@ -7272,5 +7548,85 @@ mod tests {
                 s
             );
         }
+    }
+
+    /// Regresión de la tanda de optimizaciones de tamaño de 2026-08-27:
+    /// convertir `Int2Real`, `MulInt`, `SystemOutInt`, `SystemOutString`,
+    /// `DesapilaIndStringCopy`, `Beep`, `IgualCadena`/`DistintoCadena` y
+    /// `ConcatString` de lógica repetida en cada punto de llamada a
+    /// subrutinas compartidas (`SJP`/`RTN`) introdujo una clase de bug
+    /// nueva no cubierta por los tests existentes de una sola llamada:
+    /// cada instrucción compartida hace sus propios `pop`/`push` de
+    /// operandos ANTES/DESPUÉS del `SJP`, nunca dentro de la rutina (el
+    /// `SJP` ya usa la misma pila hardware para la dirección de retorno
+    /// — un `pop` dentro de la rutina leería esa dirección, no el
+    /// operando real; confirmado con un "Illegal opcode" real durante el
+    /// desarrollo de `MulInt`). Este test llama a CADA rutina compartida
+    /// dos veces con valores DISTINTOS en el mismo programa, para
+    /// verificar que compartir de verdad funciona (no solo que la
+    /// primera llamada, que coincidiría con cualquier test de una sola
+    /// instancia, da el resultado correcto).
+    #[test]
+    fn test_oracle_shared_subroutines_work_correctly_across_multiple_call_sites_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Dos llamadas a CADA rutina compartida, con valores distintos,
+        // usando solo patrones ya verificados en otros tests de este
+        // mismo archivo (evita el bug preexistente y no relacionado de
+        // `IF ... THEN <asignación>`, ver `gen_on_error_goto`/comentarios
+        // de otros tests): `IF cond THEN <línea>` con `GOTO` explícito
+        // para las cadenas, `@(dirección)=valor` para las flags.
+        let source = "\
+10 A=6:B=7:C=A*B\n\
+20 D=9:E=8:F=D*E\n\
+30 I$=\"HI\":J$=\"HI\":IF I$=J$ THEN 60\n\
+40 @(21700)=0:GOTO 70\n\
+60 @(21700)=1\n\
+70 L$=\"HI\":M$=\"BYE\":IF L$<>M$ THEN 100\n\
+80 @(21701)=0:GOTO 110\n\
+100 @(21701)=1\n\
+110 O$=\"AB\"+\"CD\"\n\
+120 P$=\"EF\"+\"GH\"\n\
+130 CLS :CURSOR 0:PRINT C:PRINT \"X\":PRINT F:PRINT \"Y\"\n\
+140 BEEP 1,5,1:BEEP 1,5,1\n\
+150 END\n\
+";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S debe volver a stack_top tras múltiples llamadas a cada rutina compartida: S={:#06X}",
+            pc1500.cpu().s()
+        );
+
+        let read_str = |addr: u32| -> String {
+            let mut s = String::new();
+            let mut a = addr;
+            loop {
+                let b = pc1500.read_byte(a);
+                if b == 0 || s.len() > 10 {
+                    break;
+                }
+                s.push(b as char);
+                a += 1;
+            }
+            s
+        };
+
+        let c_addr = *addrs.get("C").unwrap() as u32;
+        let f_addr = *addrs.get("F").unwrap() as u32;
+        assert_eq!(pc1500.read_byte(c_addr), 42, "primera MulInt compartida: 6*7=42");
+        assert_eq!(pc1500.read_byte(f_addr), 72, "segunda MulInt compartida: 9*8=72");
+
+        // 21700 = 0x54C4, 21701 = 0x54C5
+        assert_eq!(pc1500.read_byte(0x54C4), 1, "primera IgualCadena compartida: \"HI\"==\"HI\"");
+        assert_eq!(pc1500.read_byte(0x54C5), 1, "segunda (DistintoCadena, mismo STRCMP compartido invertido): \"HI\"<>\"BYE\"");
+
+        let o_addr = *addrs.get("O$").unwrap() as u32;
+        let p_addr = *addrs.get("P$").unwrap() as u32;
+        assert_eq!(read_str(o_addr), "ABCD", "primera ConcatString compartida");
+        assert_eq!(read_str(p_addr), "EFGH", "segunda ConcatString compartida");
     }
 }
