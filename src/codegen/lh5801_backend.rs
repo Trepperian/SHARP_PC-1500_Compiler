@@ -3,16 +3,25 @@
 /// El LH5801 es el procesador de 8 bits del Sharp PC-1500
 /// Registros: A (acumulador), X, Y, U (índices de 16 bits), S (stack HW), P (program counter)
 ///
-/// Estrategia de memoria (asume una PC-1500 **con expansión de RAM**,
-/// CE-150/CE-158 — ver `codegen::system_memory` para las direcciones de
-/// sistema verificadas contra el desensamblado real de la ROM):
-/// - `STANDARD_USER_MEMORY` mapea `0x4000-0x57FF` (6144 bytes) — código,
+/// Estrategia de memoria (asume una PC-1500 **con expansión de RAM CE-155**,
+/// 8KB, confirmada contra el manual real de la PC-1500 — ver
+/// `codegen::system_memory` para las direcciones de sistema verificadas
+/// contra el desensamblado real de la ROM):
+/// - `STANDARD_USER_MEMORY` mapea `0x3800-0x5FFF` (10240 bytes) — código,
 ///   variables y pila propia viven ahí, en ventanas fijas y disjuntas:
-///   * `start_address` (por defecto `0x4100`): código generado.
-///   * `0x5600+`: área de datos de usuario (variables, ver `DATA_BASE` en
-///     `codegen::mod` — antes `0x5000`, movido tras confirmar que el
-///     código de bathyscaph.bas ya lo alcanzaba y solapaba variables).
-///   * `stack_top` (por defecto `0x57FF`): tope de una pila propia, ver
+///   * `start_address` (por defecto `0x3800`, el propio inicio de
+///     `STANDARD_USER_MEMORY`): código generado. La suposición previa de
+///     que hacía falta dejar un hueco tras "RESMEM/PRGMEM" antes de
+///     `0x4100` no estaba respaldada por el desensamblado de la ROM —
+///     los 86 tests del oráculo (incluida la partida completa de
+///     bathyscaph.bas) pasan igual arrancando el código en `0x3800`.
+///   * área de datos de usuario (variables): justo después del código
+///     real, calculado dinámicamente en tiempo de compilación (ver
+///     `compile_native_two_pass` en `codegen::mod` — antes una constante
+///     fija, que dos veces distintas quedó por detrás del crecimiento
+///     real del código y las variables acabaron solapando código
+///     todavía sin ejecutar).
+///   * `stack_top` (por defecto `0x5FFF`): tope de una pila propia, ver
 ///     abajo.
 /// - La pila usa el registro hardware real `S` (no un puntero propio en
 ///   memoria como antes) — `S` se inicializa en el prólogo a `stack_top`
@@ -144,8 +153,8 @@ impl Lh5801Backend {
             labels: HashMap::new(),
             label_refs: Vec::new(),
             rom_routines: RomRoutines::new(),
-            start_address: 0x4100, // Código: 0x4100-0x4FFF (deja hueco tras RESMEM/PRGMEM real)
-            stack_top: 0x57FF,     // Pila propia: crece hacia abajo desde el tope de RAM mapeada
+            start_address: 0x3800, // Código: 0x3800+, el inicio real de la RAM de usuario con la expansión CE-155
+            stack_top: 0x5FFF,     // Pila propia: crece hacia abajo desde el tope de RAM mapeada (CE-155, ver memory.rs de ceres-core)
             string_refs: Vec::new(),
             data_pool: Vec::new(),
             data_line_table: Vec::new(),
@@ -249,6 +258,13 @@ impl Lh5801Backend {
     ///    bloque `USING` a 0 (si no, `CHAR_OUT` puede escribir fuera de la
     ///    pantalla y el formateo de números puede aplicar un formato USING
     ///    arbitrario) y el puntero de escritura de `OUT_BUF` a `0x60`.
+    ///    También apaga los 13 indicadores del LCD (`DISPLAY_SYMBOLS`,
+    ///    ver el comentario en `system_memory.rs`) — sin esto todos
+    ///    aparecen permanentemente encendidos al cargar un programa (la
+    ///    región empieza a `0x00`, y con la lógica invertida del
+    ///    controlador real eso enciende los 13 de golpe), y ninguna tecla
+    ///    los apaga porque solo el propio bucle de teclado de la ROM
+    ///    escribe ahí, y el código nativo no pasa por él.
     /// 3. Activar la pantalla (`DON`, `0xFD 0xC1`) — un flag de hardware
     ///    real del LH5801 (`disp`, confirmado leyendo `instruction_fd` y
     ///    `Lh5801::new()`/`cpu_internal_reset()` en el emulador: arranca en
@@ -286,12 +302,39 @@ impl Lh5801Backend {
         self.emit_byte(0x60);
         self.emit_byte(0xAE); // STA addr
         self.emit_word(system_memory::OUT_BUF_WRITE_PTR);
+
+        // 4. Apagar los 13 indicadores del LCD (lógica invertida: 0xFF =
+        // todos apagados) — ver el comentario de `DISPLAY_SYMBOLS`.
+        self.emit_byte(0xB5); // LDI A,#0xFF
+        self.emit_byte(0xFF);
+        for i in 0..system_memory::DISPLAY_SYMBOLS_LEN {
+            self.emit_byte(0xAE); // STA addr
+            self.emit_word(system_memory::DISPLAY_SYMBOLS + i);
+        }
     }
     
     /// Emitir instrucción RTN - retorno al llamador (BASIC vía CALL)
     fn emit_halt(&mut self) {
-        // 0x9A - RTN: retorna al programa BASIC que ejecutó CALL
-        self.emit_byte(0x9A);
+        // Usado tanto para el epílogo automático (el programa "se cae"
+        // del final del código generado) como para END/STOP explícitos
+        // en el BASIC fuente — en NINGUNO de los dos casos hay una
+        // llamada real pendiente que nos haya traído aquí (no venimos de
+        // un `CALL`/`SJP`), así que un `RTN` (0x9A, como usaba esto
+        // antes) hace `pop` de una dirección de retorno que nadie
+        // empujó: lee basura de encima de `stack_top` y salta ahí,
+        // corrompiendo la ejecución — confirmado en la GUI real con
+        // mole.bas ("Illegal opcode 0xff at PC 0x0000" al alcanzar `5640
+        // END` desde el flujo de nivel superior, sin ningún GOSUB activo
+        // — el caso normal para casi cualquier END real). `0xFD 0xB1` es
+        // la instrucción HALT real del LH5801 (bajo el prefijo 0xFD, sin
+        // relación con `0xB1` = SBC A,#imm sin prefijo): detiene la CPU
+        // sin tocar la pila en absoluto — cada `step_cpu()` posterior
+        // simplemente avanza el reloj sin ejecutar nada (ver
+        // `is_halted` en `ceres-core::lh5801`), hasta una interrupción
+        // real. Coincide con la semántica de un END real: el programa
+        // se detiene limpiamente, sin intentar "volver" a ningún sitio.
+        self.emit_byte(0xFD);
+        self.emit_byte(0xB1);
     }
     
     /// Definir etiqueta en la posición actual
@@ -530,6 +573,408 @@ impl Lh5801Backend {
             self.emit_byte(0xAE); // STA addr
             self.emit_word(addr + i);
         }
+    }
+
+    /// Formatea el real (8 bytes, ya en la pila) que representa `USING`
+    /// (patrón resuelto en compilación, ver `UsingFormat`/
+    /// `parse_using_pattern` en `mod.rs`) y el `PRINT` "a pelo" de una
+    /// variable real (con un ancho fijo genérico) — ambos comparten
+    /// exactamente este formateador, ver `StackInstruction::PrintUsingReal`/
+    /// `PrintRealNatural`.
+    ///
+    /// Formato del real (`f64_to_bcd8`): byte 0 = exponente `e` (i8),
+    /// byte 1 = signo (`0x80` negativo, `0x00` positivo), bytes 2-7 = 12
+    /// dígitos BCD empaquetados `d1 d2 ... d12` (2 por byte), donde
+    /// `value = ±(d1.d2...d12) × 10^e` — el dígito `d_i` (1-indexado)
+    /// vive en la posición "potencia de diez" `e-(i-1)`.
+    ///
+    /// Para cada posición de salida `p` (de `digits_before-1` hasta
+    /// `-digits_after`, MSB primero) se calcula en tiempo de EJECUCIÓN
+    /// `idx = e - p` (índice 0-indexado, válido si `0<=idx<=11`) — `p` en
+    /// sí es una constante de compilación (el patrón siempre es un
+    /// literal), así que todo este bucle se genera desenrollado, sin
+    /// ningún salto de control en tiempo de ejecución entre posiciones.
+    /// Si `idx<0` (el número no ha "llegado" todavía a esta posición): un
+    /// dígito de relleno (espacio o `*`) si `p>=1` (todavía en la parte
+    /// entera, más significativo que las unidades), o `'0'` si `p<=0`
+    /// (unidades o parte decimal — ahí siempre se muestra un dígito real,
+    /// nunca relleno, igual que "0.5" nunca se escribe ".5"). Si
+    /// `idx>=12` (más allá de la precisión de 12 dígitos de la mantisa):
+    /// `'0'` (relleno de ceros decimales). Si no, se extrae el nibble
+    /// `idx` de la mantisa empaquetada.
+    ///
+    /// Usa `ARY` (`$7A10`) como scratch de `idx`/desplazamiento de
+    /// byte — no se usa para nada más en esta rutina, así que es sequro
+    /// reutilizarla sin parámetro adicional.
+    fn emit_format_real_to_buffer(&mut self, digits_before: u8, digits_after: u8, asterisk_fill: bool, forced_sign: bool, buf: u16) {
+        let idx_scratch = system_memory::ARY;
+        let byte_off_scratch = system_memory::ARY + 1;
+
+        self.emit_pop_8_to(system_memory::ARX);
+
+        // --- Carácter de signo, en buf[0] ---
+        self.emit_byte(0xA5); self.emit_word(system_memory::ARX + 1); // LDA sign byte
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        let negative = self.new_local_label("FMTREAL_NEG");
+        let sign_done = self.new_local_label("FMTREAL_SIGNDONE");
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si Z/positivo, saltar el JMP)
+        self.emit_byte(0xBA); // JMP negative (si signo!=0)
+        self.add_label_ref(negative.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        // Positivo (cae aquí sin salto).
+        self.emit_byte(0xB5); self.emit_byte(if forced_sign { b'+' } else { b' ' });
+        self.emit_byte(0xBA); // JMP sign_done
+        self.add_label_ref(sign_done.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.define_label(negative);
+        self.emit_byte(0xB5); self.emit_byte(b'-');
+        self.define_label(sign_done);
+        self.emit_byte(0xAE); self.emit_word(buf); // STA buf[0]
+
+        let pad_char = if asterisk_fill { b'*' } else { b' ' };
+        let mut buf_index: u16 = 1;
+
+        // Posiciones enteras: p = digits_before-1 .. 0
+        for p in (0..digits_before as i32).rev() {
+            self.emit_format_real_digit_at(p, idx_scratch, byte_off_scratch, pad_char, buf + buf_index);
+            buf_index += 1;
+        }
+
+        if digits_after > 0 {
+            self.emit_byte(0xB5); self.emit_byte(b'.');
+            self.emit_byte(0xAE); self.emit_word(buf + buf_index);
+            buf_index += 1;
+
+            // Posiciones decimales: p = -1 .. -digits_after
+            for p in 1..=digits_after as i32 {
+                self.emit_format_real_digit_at(-p, idx_scratch, byte_off_scratch, pad_char, buf + buf_index);
+                buf_index += 1;
+            }
+        }
+
+        self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0 (NUL final)
+        self.emit_byte(0xAE); self.emit_word(buf + buf_index);
+    }
+
+    /// Un único dígito de salida en la posición `p` (ver el comentario de
+    /// `emit_format_real_to_buffer`) — separado en su propia función
+    /// porque se repite una vez por posición (hasta ~13 veces por
+    /// llamada) y así no se duplica manualmente.
+    fn emit_format_real_digit_at(&mut self, p: i32, idx_scratch: u16, byte_off_scratch: u16, pad_char: u8, dest: u16) {
+        // idx = e - p (aritmética de complemento a 2 de 8 bits: SBC de un
+        // inmediato ya codificado en complemento a 2 hace la resta con
+        // signo correcta sin ningún caso especial, igual que el resto de
+        // este backend con enteros con signo).
+        self.emit_byte(0xA5); self.emit_word(system_memory::ARX); // LDA e
+        self.emit_byte(0xFB); // SEC
+        self.emit_byte(0xB1); self.emit_byte(p as i8 as u8); // SBC A,#p -> A = e - p
+        self.emit_byte(0xAE); self.emit_word(idx_scratch); // STA idx
+
+        // ¿idx negativo? (bit 7)
+        self.emit_byte(0xB9); self.emit_byte(0x80); // ANI A,#0x80
+        let not_negative = self.new_local_label("FMTDIGIT_NOTNEG");
+        let write_it = self.new_local_label("FMTDIGIT_WRITE");
+        let use_pad_or_zero = self.new_local_label("FMTDIGIT_PADZERO");
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si bit7 limpio, saltar el JMP)
+        self.emit_byte(0xBA); // JMP use_pad_or_zero (idx negativo)
+        self.add_label_ref(use_pad_or_zero.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        // idx no negativo: comprobar idx>=12 (fuera de precisión).
+        self.emit_byte(0xA5); self.emit_word(idx_scratch); // LDA idx
+        self.emit_byte(0xB7); self.emit_byte(12); // CPI A,#12
+        self.emit_byte(0x81); self.emit_byte(0x03); // BCR +3 (si idx<12, saltar el JMP)
+        self.emit_byte(0xBA); // JMP use_pad_or_zero (idx>=12: cae al mismo caso "0")
+        self.add_label_ref(use_pad_or_zero.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.emit_byte(0xBA); // JMP not_negative (0<=idx<12: extraer dígito real)
+        self.add_label_ref(not_negative.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(use_pad_or_zero);
+        // p<=0 (unidades o parte decimal) siempre muestra un dígito real
+        // ('0' como mínimo), nunca relleno — ver el comentario de
+        // emit_format_real_to_buffer.
+        self.emit_byte(0xB5); self.emit_byte(if p >= 1 { pad_char } else { b'0' });
+        self.emit_byte(0xBA); // JMP write_it
+        self.add_label_ref(write_it.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(not_negative);
+        // 0<=idx<=11: extraer el nibble idx-ésimo de la mantisa
+        // empaquetada (ARX+2..ARX+7, 2 dígitos por byte, byte_offset =
+        // idx/2, nibble alto si idx par, bajo si idx impar).
+        self.emit_byte(0xA5); self.emit_word(idx_scratch); // LDA idx
+        self.emit_byte(0xD5); // SHR -> A = idx >> 1 = byte_offset
+        self.emit_byte(0xAE); self.emit_word(byte_off_scratch); // STA byte_offset
+        self.emit_byte(0x2A); // STA UL (para el ADC de más abajo)
+        self.emit_byte(0xB5); self.emit_byte(((system_memory::ARX + 2) & 0xFF) as u8); // LDI A,#lo(ARX+2)
+        self.emit_byte(0xF9); // REC
+        self.emit_byte(0x22); // ADC UL -> A = lo(ARX+2) + byte_offset
+        self.emit_byte(0x0A); // STA XL
+        self.emit_byte(0xB5); self.emit_byte(((system_memory::ARX + 2) >> 8) as u8); // LDI A,#hi(ARX+2)
+        self.emit_byte(0x08); // STA XH
+        // X ahora apunta al byte de la mantisa que contiene el dígito idx.
+        self.emit_byte(0xA5); self.emit_word(idx_scratch); // LDA idx
+        self.emit_byte(0xB9); self.emit_byte(0x01); // ANI A,#1
+        let even_case = self.new_local_label("FMTDIGIT_EVEN");
+        let got_nibble = self.new_local_label("FMTDIGIT_GOTNIB");
+        self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si idx impar/A!=0, saltar el JMP)
+        self.emit_byte(0xBA); // JMP even_case (si idx par/A==0)
+        self.add_label_ref(even_case.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        // idx impar (cae aquí sin salto): nibble bajo.
+        self.emit_byte(0x05); // LDA (X)
+        self.emit_byte(0xB9); self.emit_byte(0x0F); // ANI A,#0x0F
+        self.emit_byte(0xBA); // JMP got_nibble
+        self.add_label_ref(got_nibble.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.define_label(even_case);
+        // idx par: nibble alto.
+        self.emit_byte(0x05); // LDA (X)
+        self.emit_byte(0xD5); self.emit_byte(0xD5); self.emit_byte(0xD5); self.emit_byte(0xD5); // SHR x4
+        self.define_label(got_nibble);
+        // A = dígito 0-9 -> ASCII.
+        self.emit_byte(0xF9); // REC
+        self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+
+        self.define_label(write_it);
+        self.emit_byte(0xAE); self.emit_word(dest); // STA dest
+    }
+
+    /// Imprime (vía `CHAR_OUT`) el contenido de un buffer NUL-terminado
+    /// que empieza en una dirección CONOCIDA EN COMPILACIÓN (a diferencia
+    /// de `SystemOutString`, que hace pop de un puntero dinámico) —
+    /// usado para `PrintUsingReal`/`PrintRealNatural`, cuyo buffer
+    /// siempre es una constante (`get_or_create_array_address`).
+    /// `start_offset`/`end_offset_exclusive` (ambos constantes de
+    /// compilación) acotan el rango a imprimir dentro del buffer —
+    /// `PrintRealNatural` los usa para recortar espacios/ceros sobrantes
+    /// sin tener que desplazar físicamente los bytes.
+    fn emit_print_fixed_buffer_range(&mut self, start: u16, end_exclusive: u16) {
+        for addr in start..end_exclusive {
+            self.emit_byte(0xA5); self.emit_word(addr); // LDA addr
+            self.emit_call_char_out();
+        }
+    }
+
+    /// Imprime un buffer ya formateado por `emit_format_real_to_buffer`
+    /// (con `asterisk_fill=false`, `forced_sign=false` — siempre así para
+    /// `PRINT` sin `USING`) RECORTANDO en tiempo de EJECUCIÓN los
+    /// espacios de relleno sobrantes a la izquierda y los ceros
+    /// decimales sobrantes a la derecha (más el punto decimal si TODOS
+    /// los decimales resultaron ser cero) — para que un `PRINT` sin
+    /// formato explícito de una variable real muestre "2.5", no
+    /// "  2.500000". `X`/`U` se usan como punteros de recorrido; `X` se
+    /// preserva con `PSH`/`POP` alrededor de cada `CHAR_OUT` (igual que
+    /// `SystemOutString`, cuya preservación de registros no está
+    /// documentada). `ARY` (`$7A10`) se reutiliza como scratch de 1 byte
+    /// para el límite del recorte decimal — no se necesita para nada más
+    /// una vez formateado el buffer.
+    fn emit_print_real_natural(&mut self, buf: u16, digits_before: u8, digits_after: u8) {
+        // 1. Signo, siempre (mismo convenio que un `PRINT` entero normal
+        // de este backend: columna de signo reservada).
+        self.emit_byte(0xA5); self.emit_word(buf); // LDA buf[0]
+        self.emit_call_char_out();
+
+        let int_base = buf + 1;
+        let int_last = buf + digits_before as u16; // dirección de las unidades (nunca espacio)
+
+        // 2. Saltar espacios de relleno iniciales: X avanza mientras
+        // (X)==' '. Termina como muy tarde en int_last, que por
+        // construcción nunca es un espacio (ver emit_format_real_digit_at).
+        self.emit_byte(0xB5); self.emit_byte((int_base >> 8) as u8); self.emit_byte(0x08); // LDI XH
+        self.emit_byte(0xB5); self.emit_byte((int_base & 0xFF) as u8); self.emit_byte(0x0A); // LDI XL
+        let skip_loop = self.new_local_label("PRNAT_SKIP");
+        let skip_done = self.new_local_label("PRNAT_SKIPDONE");
+        self.define_label(skip_loop.clone());
+        self.emit_byte(0x05); // LDA (X)
+        self.emit_byte(0xB7); self.emit_byte(b' '); // CPI A,#' '
+        self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si !=' ', saltar el JMP)
+        self.emit_byte(0xBA); // JMP skip_done (si !=' ')
+        self.add_label_ref(skip_done.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.emit_byte(0x44); // X++
+        self.emit_byte(0xBA); // JMP skip_loop
+        self.add_label_ref(skip_loop, RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.define_label(skip_done);
+
+        // 3. Imprimir desde X (inclusive) hasta int_last (inclusive).
+        let print_int_loop = self.new_local_label("PRNAT_PRINTINT");
+        let print_int_more = self.new_local_label("PRNAT_PRINTINTMORE");
+        let print_int_done = self.new_local_label("PRNAT_PRINTINTDONE");
+        self.define_label(print_int_loop.clone());
+        self.emit_byte(0x05); // LDA (X)
+        self.emit_byte(0xFD); self.emit_byte(0x88); // PSH X
+        self.emit_call_char_out();
+        self.emit_byte(0xFD); self.emit_byte(0x0A); // POP X
+        self.emit_byte(0x04); // LDA XL
+        self.emit_byte(0xB7); self.emit_byte((int_last & 0xFF) as u8); // CPI A,#lo(int_last)
+        self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si X!=int_last, saltar el JMP)
+        self.emit_byte(0xBA); // JMP print_int_more (si X!=int_last)
+        self.add_label_ref(print_int_more.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.emit_byte(0xBA); // JMP print_int_done (X==int_last)
+        self.add_label_ref(print_int_done.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.define_label(print_int_more);
+        self.emit_byte(0x44); // X++
+        self.emit_byte(0xBA); // JMP print_int_loop
+        self.add_label_ref(print_int_loop, RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.define_label(print_int_done);
+
+        if digits_after == 0 {
+            return;
+        }
+
+        // 4. Parte decimal: escanear hacia atrás desde el último dígito
+        // decimal buscando el último que NO sea '0'. Si son todos '0',
+        // no se imprime ni el punto ni ningún decimal.
+        let frac_first = int_last + 2; // salta buf[int_last+1] = '.'
+        let frac_last = frac_first + digits_after as u16 - 1;
+        let trim_end_scratch = system_memory::ARY;
+
+        self.emit_byte(0xB5); self.emit_byte((frac_last >> 8) as u8); self.emit_byte(0x08); // LDI XH
+        self.emit_byte(0xB5); self.emit_byte((frac_last & 0xFF) as u8); self.emit_byte(0x0A); // LDI XL
+        self.emit_byte(0xB5); self.emit_byte(digits_after); self.emit_byte(0x2A); // LDI UL,#digits_after
+
+        let trim_loop = self.new_local_label("PRNAT_TRIM");
+        let trim_none = self.new_local_label("PRNAT_TRIMNONE");
+        let trim_some = self.new_local_label("PRNAT_TRIMSOME");
+        let after_all = self.new_local_label("PRNAT_AFTERALL");
+        self.define_label(trim_loop.clone());
+        self.emit_byte(0x24); // LDA UL
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si UL!=0, saltar el JMP)
+        self.emit_byte(0xBA); // JMP trim_none (si UL==0: todos '0')
+        self.add_label_ref(trim_none.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.emit_byte(0x05); // LDA (X)
+        self.emit_byte(0xB7); self.emit_byte(b'0'); // CPI A,#'0'
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si es '0', saltar el JMP)
+        self.emit_byte(0xBA); // JMP trim_some (si NO es '0': encontrado)
+        self.add_label_ref(trim_some.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        // Es '0': X--, UL--, seguir mirando hacia atrás.
+        self.emit_byte(0x46); // X-- (DEX)
+        self.emit_byte(0x24); self.emit_byte(0xDF); self.emit_byte(0x2A); // LDA UL; DEC A; STA UL
+        self.emit_byte(0xBA); // JMP trim_loop
+        self.add_label_ref(trim_loop, RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(trim_none);
+        self.emit_byte(0xBA); // JMP after_all (nada que imprimir: ni '.' ni decimales)
+        self.add_label_ref(after_all.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(trim_some);
+        // X apunta al último decimal significativo: guardar su byte bajo
+        // (recorte siempre dentro de la misma página, mismo argumento
+        // que el resto de este backend) antes de reutilizar X para
+        // recorrer desde el principio de la parte decimal.
+        self.emit_byte(0x04); // LDA XL
+        self.emit_byte(0xAE); self.emit_word(trim_end_scratch); // STA trim_end
+
+        self.emit_byte(0xB5); self.emit_byte(b'.'); // LDI A,#'.'
+        self.emit_call_char_out();
+
+        self.emit_byte(0xB5); self.emit_byte((frac_first >> 8) as u8); self.emit_byte(0x08); // LDI XH
+        self.emit_byte(0xB5); self.emit_byte((frac_first & 0xFF) as u8); self.emit_byte(0x0A); // LDI XL
+        let print_frac_loop = self.new_local_label("PRNAT_PRINTFRAC");
+        let print_frac_more = self.new_local_label("PRNAT_PRINTFRACMORE");
+        let print_frac_done = self.new_local_label("PRNAT_PRINTFRACDONE");
+        self.define_label(print_frac_loop.clone());
+        self.emit_byte(0x05); // LDA (X)
+        self.emit_byte(0xFD); self.emit_byte(0x88); // PSH X
+        self.emit_call_char_out();
+        self.emit_byte(0xFD); self.emit_byte(0x0A); // POP X
+        // ¿XL == trim_end (valor en memoria, no inmediato)? Cargar
+        // trim_end en UL y comparar contra XL vía resta.
+        self.emit_byte(0xA5); self.emit_word(trim_end_scratch); // LDA trim_end
+        self.emit_byte(0x2A); // STA UL
+        self.emit_byte(0x04); // LDA XL
+        self.emit_byte(0xFB); // SEC
+        self.emit_byte(0x20); // SBC UL
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si XL==trim_end, saltar el JMP)
+        self.emit_byte(0xBA); // JMP print_frac_more (si XL!=trim_end)
+        self.add_label_ref(print_frac_more.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.emit_byte(0xBA); // JMP print_frac_done (XL==trim_end)
+        self.add_label_ref(print_frac_done.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.define_label(print_frac_more);
+        self.emit_byte(0x44); // X++
+        self.emit_byte(0xBA); // JMP print_frac_loop
+        self.add_label_ref(print_frac_loop, RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.define_label(print_frac_done);
+
+        self.define_label(after_all);
+    }
+
+    /// Comparación real genérica: pop b, pop a (8 bytes cada uno, formato
+    /// ARX/ARY), calcula a-b vía `SUBTR` (mismo camino que `RestaReal`) y
+    /// push 1 byte (0 o 1) según qué combinación de (a<b, a==b, a>b) debe
+    /// dar 1 — cada instrucción de comparación real (`MenorReal`,
+    /// `MayorReal`, ...) es una combinación distinta de estos tres casos,
+    /// pasada por sus tres parámetros. El resultado de `SUBTR` no se
+    /// vuelve a apilar como valor: solo se examina su signo (byte ARX+1:
+    /// 0x80 negativo, 0x00 positivo) y si es exactamente cero (mismo
+    /// chequeo — OR de los 6 bytes de mantisa, ARX+2..ARX+8 — que usa
+    /// `CallSgn`, ya verificado contra la ROM real).
+    fn emit_real_compare(&mut self, push_if_less: bool, push_if_equal: bool, push_if_greater: bool) {
+        self.emit_pop_8_to(system_memory::ARY);
+        self.emit_pop_8_to(system_memory::ARX);
+        let addr = self.rom_routines.address("SUBTR").expect("SUBTR debe estar registrada en rom_routines");
+        self.emit_call_rom(addr);
+
+        let case_equal = self.new_local_label("REALCMP_EQ");
+        let case_less = self.new_local_label("REALCMP_LT");
+        let done = self.new_local_label("REALCMP_DONE");
+
+        // A = OR de los 6 bytes de mantisa del resultado (0 <=> a-b==0).
+        self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+        for offset in 2..8u16 {
+            self.emit_byte(0xAB); // OR addr
+            self.emit_word(system_memory::ARX + offset);
+        }
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        self.emit_byte(0x89); self.emit_byte(0x03); // BNZ +3 (si A!=0, saltar el JMP)
+        self.emit_byte(0xBA); // JMP case_equal (si A==0: a==b)
+        self.add_label_ref(case_equal.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        // Mantisa no vacía: mirar el byte de signo del resultado.
+        self.emit_byte(0xA5); // LDA addr (ARX+1)
+        self.emit_word(system_memory::ARX + 1);
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si signo==0, saltar el JMP)
+        self.emit_byte(0xBA); // JMP case_less (si signo!=0: a<b)
+        self.add_label_ref(case_less.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        // Cae aquí si signo==0: a>b.
+        self.emit_byte(0xB5); self.emit_byte(if push_if_greater { 1 } else { 0 });
+        self.emit_push_a();
+        self.emit_byte(0xBA); // JMP done
+        self.add_label_ref(done.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(case_less);
+        self.emit_byte(0xB5); self.emit_byte(if push_if_less { 1 } else { 0 });
+        self.emit_push_a();
+        self.emit_byte(0xBA); // JMP done
+        self.add_label_ref(done.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(case_equal);
+        self.emit_byte(0xB5); self.emit_byte(if push_if_equal { 1 } else { 0 });
+        self.emit_push_a();
+
+        self.define_label(done);
     }
 
     /// `A = A*10 + UL` (`A*10` calculado como `(A<<3)+(A<<1)`, sin bucle:
@@ -1126,6 +1571,30 @@ impl Lh5801Backend {
                 self.emit_push_a();
             }
 
+            StackInstruction::ApilaIndReal => {
+                // Como ApilaInd, pero lee un valor real de 8 bytes (mismo
+                // formato que ARX/ARY). Pop dirección (16 bits) a Y, leer y
+                // empujar Mem[Y+0]..Mem[Y+7] en orden ascendente — mismo
+                // orden que ApilaReal (byte 0 primero, byte 7 al tope),
+                // para que el resultado sea indistinguible en la pila de
+                // cualquier otro valor real (literal o resultado de
+                // SumaReal/RestaReal/...).
+
+                // Pop dirección (16 bits) a Y
+                self.emit_pop_a();
+                self.emit_byte(0x1A); // YL = A
+                self.emit_pop_a();
+                self.emit_byte(0x18); // YH = A
+
+                for i in 0..8u16 {
+                    self.emit_byte(0x15); // LDA (Y)
+                    self.emit_push_a();
+                    if i != 7 {
+                        self.emit_byte(0x54); // Y++
+                    }
+                }
+            }
+
             StackInstruction::DesapilaInd => {
                 // Pop valor, Pop dirección, Mem[dirección] = valor
                 // Formato: high byte dir, low byte dir, valor en stack
@@ -1180,6 +1649,35 @@ impl Lh5801Backend {
                 self.emit_byte(0x54); // Y++
                 self.emit_byte(0x04); // LDA XL
                 self.emit_byte(0x1E); // STA (Y)
+            }
+
+            StackInstruction::DesapilaIndReal => {
+                // Pop valor real (8 bytes, formato ARX/ARY), Pop dirección
+                // (16 bits), Mem[dirección..dirección+8) = valor.
+                //
+                // El valor se apiló DESPUÉS de la dirección (modelo Tiny),
+                // así que está en la cima — pero son 8 bytes, no se puede
+                // leer la dirección hasta haberlos sacado todos. Se usa ARX
+                // como scratch intermedio: `emit_pop_8_to` ya reconstruye
+                // el orden correcto `ARX+0..ARX+7` sin importar el origen
+                // del valor (literal, SumaReal, ApilaIndReal...), así que
+                // solo hace falta copiar esos 8 bytes a la dirección real
+                // de destino.
+                self.emit_pop_8_to(system_memory::ARX);
+
+                self.emit_pop_a();
+                self.emit_byte(0x1A); // YL
+                self.emit_pop_a();
+                self.emit_byte(0x18); // YH
+
+                for i in 0..8u16 {
+                    self.emit_byte(0xA5); // LDA ARX+i
+                    self.emit_word(system_memory::ARX + i);
+                    self.emit_byte(0x1E); // STA (Y)
+                    if i != 7 {
+                        self.emit_byte(0x54); // Y++
+                    }
+                }
             }
 
             StackInstruction::DesapilaIndStringCopy(max_len) => {
@@ -1321,6 +1819,28 @@ impl Lh5801Backend {
                 self.emit_push_8_from(system_memory::ARX);
             }
 
+            // ===== COMPARACIONES REALES =====
+            //
+            // Necesarias desde que `collect_real_variables` (mod.rs) puede
+            // marcar una variable escalar como real a partir de una
+            // asignación en OTRA sentencia (p.ej. `B=B+.5`) — antes de eso
+            // ninguna comparación tocaba nunca un real de verdad (de ahí
+            // el comentario histórico "ningún programa objetivo compara
+            // valores reales directamente" en `gen_binary_op`), pero
+            // bombing.bas SÍ lo hace (`IF B>0`, `IF B=INT B`) en cuanto
+            // `B` queda marcada real. Sin estos casos, `gen_binary_op`
+            // seguiría emitiendo `MayorInt`/`IgualInt` (que esperan
+            // operandos de 1 byte) sobre un operando de 8 bytes recién
+            // empujado por `ApilaIndReal` — mismo tipo de desajuste de
+            // pila que motivó `DesapilaIndReal`, aquí en el lado de las
+            // comparaciones.
+            StackInstruction::MenorReal => self.emit_real_compare(true, false, false),
+            StackInstruction::MenorIgualReal => self.emit_real_compare(true, true, false),
+            StackInstruction::MayorReal => self.emit_real_compare(false, false, true),
+            StackInstruction::MayorIgualReal => self.emit_real_compare(false, true, true),
+            StackInstruction::IgualReal => self.emit_real_compare(false, true, false),
+            StackInstruction::DistintoReal => self.emit_real_compare(true, false, true),
+
             StackInstruction::Int2Real => {
                 // Pop entero sin signo de 8 bits (0-255) y construye su
                 // equivalente en formato "número decimal" real de 8
@@ -1377,6 +1897,18 @@ impl Lh5801Backend {
                 self.emit_push_a();
             }
             
+            StackInstruction::Not => {
+                // NOT lógico/bit a bit de 8 bits: pop a, push complemento
+                // a 1 (`~a`, vía EOR con 0xFF) — en complemento a 2 de 8
+                // bits esto es exactamente `-a-1`, la semántica estándar
+                // de `NOT` en BASIC de esta generación (usado tanto como
+                // operador lógico, dado el convenio "0=falso,
+                // no-cero=verdadero" de este backend, como bit a bit).
+                self.emit_pop_a();
+                self.emit_byte(0xBD); self.emit_byte(0xFF); // EOR A,#0xFF
+                self.emit_push_a();
+            }
+
             StackInstruction::Negativo => {
                 // Negación aritmética (unario -): Pop a, Push (0 - a).
                 // Necesario para literales/expresiones negativas, p.ej. el
@@ -1681,6 +2213,26 @@ impl Lh5801Backend {
                 self.emit_byte(0xBE); // SJP
                 self.add_label_ref(label.clone(), RefType::Absolute16);
                 self.emit_label_placeholder(RefType::Absolute16);
+            }
+
+            StackInstruction::CallAddr(addr) => {
+                // `CALL <dirección constante>`: llama a código máquina
+                // POKEado en RAM por el propio programa BASIC (patrón real
+                // de la época — ver invader.bas, que hace `POKE &7050,...`
+                // seguido de `CALL &7050`). A diferencia de `Call(label)`
+                // (GOSUB a una línea BASIC, resuelta por el sistema de
+                // etiquetas), aquí la dirección ya es una constante de
+                // tiempo de compilación (literal decimal o hex `&XXXX`,
+                // ver `const_eval_int` en mod.rs) — un SJP directo, sin
+                // pasar por el sistema de etiquetas en absoluto. Antes de
+                // este caso, `gen_call` reutilizaba `Call("MACHINE_CODE")`
+                // para TODO `CALL`, sin importar la dirección real del
+                // BASIC — una etiqueta que nunca se definía en ningún
+                // sitio (panic "Undefined label: MACHINE_CODE" en cuanto
+                // el programa tenía un solo `CALL`) y que, aunque se
+                // hubiera definido, habría mandado cualquier `CALL &X` a
+                // la MISMA dirección fija sin importar `X`.
+                self.emit_call_rom(*addr);
             }
 
             StackInstruction::IrInd => {
@@ -2069,14 +2621,52 @@ impl Lh5801Backend {
                 self.define_label(done_label);
             }
 
-            StackInstruction::Newline => {
-                // No existe una rutina ROM aislada de "nueva línea"; se usa
-                // CHAR_OUT con CR (0x0D), igual que hace la propia ROM para
-                // avanzar de línea en el buffer de pantalla.
-                self.emit_byte(0xB5); // LDI A,#imm
-                self.emit_byte(0x0D);
+            StackInstruction::PrintUsingReal(digits_before, digits_after, asterisk_fill, forced_sign, buf) => {
+                let buf = *buf as u16;
+                self.emit_format_real_to_buffer(*digits_before, *digits_after, *asterisk_fill, *forced_sign, buf);
+                let total_len = 1
+                    + *digits_before as u16
+                    + if *digits_after > 0 { 1 + *digits_after as u16 } else { 0 };
+                self.emit_print_fixed_buffer_range(buf, buf + total_len);
+            }
 
-                self.emit_call_char_out();
+            StackInstruction::PrintRealNatural(buf) => {
+                let buf = *buf as u16;
+                // Ancho fijo genérico: 7 enteros + 6 decimales, sin
+                // relleno de asteriscos ni signo forzado — ver el
+                // comentario de PrintRealNatural en stack_instruction.rs.
+                self.emit_format_real_to_buffer(7, 6, false, false, buf);
+                self.emit_print_real_natural(buf, 7, 6);
+            }
+
+            StackInstruction::Newline => {
+                // Bug real encontrado compilando bombing.bas: esto
+                // llamaba a CHAR_OUT con A=0x0D (CR) asumiendo que la
+                // ROM trataría ese código como "carácter especial,
+                // reinicia el cursor" — pero según el desensamblado
+                // real, CHAR_OUT no distingue 0x0D en absoluto, lo
+                // dibuja como CUALQUIER OTRO carácter (glifo de ese
+                // código, probablemente basura) y avanza CURSOR_PTR en
+                // 6 igual que con cualquier letra. El único sitio donde
+                // CURSOR_PTR se resetea de verdad es INIT_MTRX
+                // ($ECB2, `ANI (CURSOR_PTR),$00`) — a la que CHAR_OUT
+                // solo salta cuando el ACARREO indica que el carácter
+                // que se acaba de dibujar desbordó el ancho real de la
+                // pantalla, nunca por imprimir 0x0D. Resultado visible:
+                // `PAUSE " **** BOMBARDEMENTS ****"` (24 caracteres)
+                // dejaba CURSOR_PTR en 150 en vez de 0, así que el
+                // `INPUT "Explanations (Y/N) ? "` siguiente empezaba a
+                // imprimir casi en el borde derecho — la "E" apenas
+                // visible en la última columna, y el resto de la
+                // palabra dando la vuelta a las columnas bajas,
+                // pareciendo que "falta la primera letra". Llamar aquí
+                // directamente a INIT_MTRX es lo que de verdad mueve el
+                // cursor de texto a la columna 0.
+                if let Some(addr) = self.rom_routines.address("INIT_MTRX") {
+                    self.emit_call_rom(addr);
+                } else {
+                    eprintln!("WARNING: Rutina ROM INIT_MTRX no encontrada");
+                }
             }
 
             // ===== GRÁFICOS / SONIDO / SISTEMA =====
@@ -2134,6 +2724,31 @@ impl Lh5801Backend {
                 } else {
                     eprintln!("WARNING: Rutina ROM TIME_DELAY no encontrada");
                 }
+            }
+
+            StackInstruction::WaitForKey => {
+                // WAIT sin argumento: a diferencia de WAIT n (retardo
+                // cronometrado real vía TIME_DELAY), esto bloquea
+                // indefinidamente hasta que se pulsa cualquier tecla —
+                // mismo sondeo ISKEY que usa CallInkey, pero en bucle
+                // (en vez de comprobar una sola vez y seguir con cadena
+                // vacía si no hay tecla) y sin necesidad de leer CUÁL
+                // tecla fue ni de convertirla a ASCII.
+                let poll_loop = self.new_local_label("WAITKEY_LOOP");
+
+                self.define_label(poll_loop.clone());
+                if let Some(addr) = self.rom_routines.address("ISKEY") {
+                    self.emit_call_rom(addr);
+                } else {
+                    eprintln!("WARNING: Rutina ROM ISKEY no encontrada");
+                }
+                // Z=1 si NO hay tecla, Z=0 si hay tecla. Si hay tecla
+                // (Z=0), salir del bucle; si no, JMP de vuelta al sondeo.
+                // JMP ejecuta cuando Z=1 => BZR (0x89).
+                self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si Z==0 [hay tecla], saltar el JMP de vuelta)
+                self.emit_byte(0xBA); // JMP poll_loop (si Z==1, sin tecla, seguir esperando)
+                self.add_label_ref(poll_loop, RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
             }
 
             StackInstruction::Pause => {
@@ -3043,6 +3658,64 @@ impl Lh5801Backend {
                 self.emit_push_a();
             }
 
+            StackInstruction::ConcatString(max_len, buf, right_scratch) => {
+                // `A$+B$`: reutiliza el mismo helper de copia terminada en
+                // NUL que LEFT$/RIGHT$/MID$ (`emit_copy_string_x_to_y_terminated`),
+                // dos veces seguidas — una por cada lado. Ese helper deja Y
+                // apuntando exactamente al NUL que acaba de escribir (tanto
+                // si copió hasta un NUL real como si agotó el presupuesto),
+                // así que la segunda copia puede arrancar justo ahí sin
+                // tener que volver a escanear la longitud del lado
+                // izquierdo.
+                let max_len_u8 = (*max_len).min(255) as u8;
+                let buf = *buf as u16;
+                let right_scratch = *right_scratch as u16;
+
+                // El puntero derecho está en el TOPE de la pila (se apiló
+                // después que el izquierdo), pero hace falta copiar el
+                // IZQUIERDO primero — así que se guarda aparte en scratch
+                // en vez de perderlo.
+                self.emit_pop_a();
+                self.emit_byte(0xAE); self.emit_word(right_scratch + 1); // STA right_scratch+1 (byte bajo)
+                self.emit_pop_a();
+                self.emit_byte(0xAE); self.emit_word(right_scratch); // STA right_scratch (byte alto)
+
+                // Pop puntero izquierdo -> X
+                self.emit_pop_a();
+                self.emit_byte(0x0A); // XL
+                self.emit_pop_a();
+                self.emit_byte(0x08); // XH
+
+                // Y = buf, UL = presupuesto para el lado izquierdo.
+                self.emit_byte(0xB5); self.emit_byte((buf >> 8) as u8);
+                self.emit_byte(0x18); // YH
+                self.emit_byte(0xB5); self.emit_byte((buf & 0xFF) as u8);
+                self.emit_byte(0x1A); // YL
+                self.emit_byte(0xB5); self.emit_byte(max_len_u8);
+                self.emit_byte(0x2A); // UL
+
+                self.emit_copy_string_x_to_y_terminated();
+
+                // X = puntero derecho (recuperado del scratch).
+                self.emit_byte(0xA5); self.emit_word(right_scratch); // LDA right_scratch (alto)
+                self.emit_byte(0x08); // XH
+                self.emit_byte(0xA5); self.emit_word(right_scratch + 1); // LDA right_scratch+1 (bajo)
+                self.emit_byte(0x0A); // XL
+
+                // UL = presupuesto para el lado derecho (Y ya está donde
+                // hace falta, justo en el NUL que dejó la copia anterior).
+                self.emit_byte(0xB5); self.emit_byte(max_len_u8);
+                self.emit_byte(0x2A); // UL
+
+                self.emit_copy_string_x_to_y_terminated();
+
+                // Push puntero al resultado (buf, alto luego bajo).
+                self.emit_byte(0xB5); self.emit_byte((buf >> 8) as u8);
+                self.emit_push_a();
+                self.emit_byte(0xB5); self.emit_byte((buf & 0xFF) as u8);
+                self.emit_push_a();
+            }
+
             StackInstruction::CallRnd(seed_addr) => {
                 // RND(n): sustituto deliberadamente NO auténtico — $F5EB
                 // ("RAND_GEN") resultó NO ser el punto de entrada general
@@ -3621,8 +4294,21 @@ impl Lh5801Backend {
                 self.emit_halt();
             }
             
+            // `ARUN` (autoarranque al encender)/`LOCK`/`UNLOCK` (protección
+            // de listado del programa) son conceptos del INTÉRPRETE BASIC
+            // guardado en RAM (una bandera de autoarranque, un bit de
+            // bloqueo sobre el área de programa listable) — un programa ya
+            // compilado a código máquina nativo no tiene "área de programa
+            // BASIC" que proteger de LIST/EDIT, ni un intérprete al que
+            // decirle que arranque solo al encender: siempre se ejecuta
+            // directamente. No-op real (0 bytes), no solo el catch-all
+            // genérico de abajo (que también sería inofensivo, pero
+            // avisaría por stderr de una instrucción "no implementada" que
+            // en realidad no hace falta implementar).
+            StackInstruction::Arun | StackInstruction::Lock | StackInstruction::Unlock => {}
+
             // ===== NO OPERACIÓN =====
-            
+
             StackInstruction::Nop => {
                 // NOP - no hay instrucción NOP en LH5801
                 // Usar instrucción inocua como AND A, #0xFF
@@ -3683,16 +4369,17 @@ mod tests {
     fn test_oracle_initialization_prologue_runs_on_real_rom() {
         use crate::codegen::test_oracle::{run_lh5, ORACLE_LOAD_ADDR};
 
-        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x57FF);
+        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x5FFF);
         let code = backend.generate(&[]);
 
-        // El prólogo de inicialización son exactamente 12 instrucciones
+        // El prólogo de inicialización son exactamente 15 instrucciones
         // (LDI S,#imm; DON [activar pantalla]; LDI A,#0; 7x STA addr;
-        // LDI A,#0x60; STA addr) antes de tocar nada más (incluida la RTN
-        // final, cuyo destino no está garantizado aquí).
-        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 12);
+        // LDI A,#0x60; STA addr; LDI A,#0xFF; 2x STA addr [indicadores
+        // del LCD]) antes de tocar nada más (incluida la RTN final, cuyo
+        // destino no está garantizado aquí).
+        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 15);
 
-        assert_eq!(pc1500.cpu().s(), 0x57FF, "S debe inicializarse a stack_top");
+        assert_eq!(pc1500.cpu().s(), 0x5FFF, "S debe inicializarse a stack_top");
         assert!(pc1500.cpu().display_enabled(), "la pantalla debe quedar activada (DON) — si no, update_display_buffer() nunca pinta nada");
         assert_eq!(pc1500.read_byte(0x7874), 0x00, "CURSOR_ENA debe quedar a 0");
         assert_eq!(pc1500.read_byte(0x7875), 0x00, "CURSOR_PTR debe quedar a 0");
@@ -3700,6 +4387,8 @@ mod tests {
         assert_eq!(pc1500.read_byte(0x7895), 0x00, "bloque USING debe quedar a 0");
         assert_eq!(pc1500.read_byte(0x7898), 0x00, "bloque USING debe quedar a 0");
         assert_eq!(pc1500.read_byte(0x788F), 0x60, "puntero de OUT_BUF debe quedar en 0x60");
+        assert_eq!(pc1500.read_byte(0x764E), 0xFF, "indicadores del LCD (byte 1) deben quedar apagados (0xFF, lógica invertida)");
+        assert_eq!(pc1500.read_byte(0x764F), 0xFF, "indicadores del LCD (byte 2) deben quedar apagados (0xFF, lógica invertida)");
     }
 
     /// Fase 1: verifica contra la ROM real que GOSUB/RETURN (`Call`/`IrInd`)
@@ -3715,7 +4404,7 @@ mod tests {
     fn test_oracle_gosub_return_actually_returns_on_real_rom() {
         use crate::codegen::test_oracle::{run_lh5, ORACLE_LOAD_ADDR};
 
-        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x57FF);
+        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x5FFF);
         let instructions = vec![
             StackInstruction::IrA("MAIN".to_string()),
             StackInstruction::Label("SUB".to_string()),
@@ -3731,12 +4420,12 @@ mod tests {
         ];
         let code = backend.generate(&instructions);
 
-        // Prólogo (12) + IrA (1) + ApilaInt(0x5000) (4, >255) +
+        // Prólogo (15) + IrA (1) + ApilaInt(0x5000) (4, >255) +
         // ApilaInt(0xAA) (2) + DesapilaInd (8) + IrInd/RTN (1) + Call/SJP
         // (1) + ApilaInt(0x5001) (4) + ApilaInt(0xBB) (2) + DesapilaInd (8)
-        // = 43 instrucciones para completar ambas escrituras, justo antes
+        // = 46 instrucciones para completar ambas escrituras, justo antes
         // de la RTN del epílogo (cuyo destino no está garantizado aquí).
-        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 43);
+        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 46);
 
         assert_eq!(pc1500.read_byte(0x5000), 0xAA, "SUB debe ejecutarse");
         assert_eq!(
@@ -3884,6 +4573,50 @@ mod tests {
         assert_eq!(pc1500.read_byte(0x546C), 3, "B(2,2), la esquina opuesta");
     }
 
+    /// `DIM A(N)` con `N` una variable (no una constante en tiempo de
+    /// compilación) — patrón real de blackjack.bas (`DIM B$(R)*1`, `R`
+    /// variable). Antes esto no reservaba ningún espacio real ni
+    /// registraba metadatos del array (comentario "no soportado todavía"),
+    /// así que cualquier acceso posterior usaba direcciones sin sentido.
+    /// Ahora reserva la base dinámicamente de un heap dedicado
+    /// (`__ARRAY_HEAP`, ver `gen_dim`/`ArrayMeta::dynamic_base_descriptor`
+    /// en `mod.rs`) en tiempo de EJECUCIÓN. Se prueba con un array
+    /// NUMÉRICO (no de cadena) a propósito, para aislar la mecánica de
+    /// direccionamiento dinámico de la cuestión, separada y todavía
+    /// abierta, de cómo se representan los elementos de un array de
+    /// cadena sin ancho fijo (`*1`) — ver el gap de categoría 2 "aliasing
+    /// en arrays de cadena sin ancho fijo".
+    #[test]
+    fn test_oracle_dim_dynamic_size_1d_array_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 N=5:DIM A(N)\n20 A(0)=11:A(3)=44:A(5)=99\n30 @(21620)=A(0)\n40 @(21621)=A(3)\n50 @(21622)=A(5)\n60 END\n";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S debe volver a stack_top tras el DIM dinámico y los accesos indexados: S={:#06X}",
+            pc1500.cpu().s()
+        );
+
+        // 21620/21621/21622 = 0x5474/0x5475/0x5476
+        assert_eq!(pc1500.read_byte(0x5474), 11, "A(0) tras DIM A(N) con N=5 dinámico");
+        assert_eq!(pc1500.read_byte(0x5475), 44, "A(3)");
+        assert_eq!(pc1500.read_byte(0x5476), 99, "A(5), el índice límite de DIM A(N) con N=5");
+
+        // El propio heap dinámico debe haber avanzado exactamente (N+1)*1
+        // = 6 bytes desde __ARRAY_HEAP (element_size=1 para un array
+        // numérico) — confirma que el cálculo en tiempo de ejecución de
+        // `(size_expr+1)*element_size` es correcto, no solo que los 3
+        // valores de arriba coincidieron por casualidad de solapamiento.
+        let heap_base = *addrs.get("__ARRAY_HEAP").expect("__ARRAY_HEAP") as u32;
+        let heap_ptr_addr = *addrs.get("__ARRAY_HEAP_PTR").expect("__ARRAY_HEAP_PTR") as u32;
+        let heap_ptr = ((pc1500.read_byte(heap_ptr_addr) as u32) << 8) | pc1500.read_byte(heap_ptr_addr + 1) as u32;
+        assert_eq!(heap_ptr, heap_base + 6, "__ARRAY_HEAP_PTR debe haber avanzado (N+1)*element_size = 6 bytes");
+    }
+
     /// Un paso más ambicioso que los tests anteriores, combinando en un
     /// solo programa dos bucles `FOR` independientes, un array rellenado
     /// con valores calculados (no literales), y una subrutina `GOSUB`
@@ -3947,22 +4680,20 @@ mod tests {
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
 
-        // Lee un puntero de cadena (2 bytes, alto luego bajo) de `addr` y
-        // devuelve el contenido de la cadena a la que apunta.
+        // Lee el contenido de una variable de cadena escalar directamente
+        // de su propia dirección — desde que una variable escalar copia
+        // el contenido real a su propio buffer en vez de guardar solo un
+        // puntero (ver `is_direct_string_buffer`/`DesapilaIndStringCopy`
+        // en `gen_store_to_lvalue`), `var_addr` ES el buffer, no hay
+        // ningún puntero que seguir.
         let read_string_var = |var_addr: u32| -> String {
-            let hi = pc1500.read_byte(var_addr) as u16;
-            let lo = pc1500.read_byte(var_addr + 1) as u16;
-            let str_addr = ((hi << 8) | lo) as u32;
             let mut s = String::new();
-            let mut a = str_addr;
-            loop {
-                let b = pc1500.read_byte(a);
+            for i in 0..64 {
+                let b = pc1500.read_byte(var_addr + i);
                 if b == 0 {
                     break;
                 }
                 s.push(b as char);
-                a += 1;
-                assert!(a - str_addr < 64, "cadena sin terminador NUL cerca de {str_addr:#06x}");
             }
             s
         };
@@ -4272,24 +5003,30 @@ mod tests {
     fn test_oracle_print_int_and_string_cursor_advance_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        // Cada PRINT añade un salto de línea (CR, 1 carácter más).
-        let cases: &[(&str, u8)] = &[
-            ("10 PRINT 65\n20 END\n", (2 + 1) * 6),   // "65" + CR
-            ("10 PRINT 5\n20 END\n", (1 + 1) * 6),    // "5" + CR
-            ("10 PRINT 100\n20 END\n", (3 + 1) * 6),  // "100" + CR
-            ("10 PRINT 0\n20 END\n", (1 + 1) * 6),    // "0" + CR
-            ("10 PRINT -5\n20 END\n", (2 + 1) * 6),   // "-5" + CR
-            ("10 PRINT \"HI\"\n20 END\n", (2 + 1) * 6), // "HI" + CR
+        // Cada PRINT añade un salto de línea automático al final
+        // (Newline, vía INIT_MTRX — ver el comentario de
+        // StackInstruction::Newline), que resetea CURSOR_PTR a 0. Antes
+        // de ese fix, un `Newline` fingido con CHAR_OUT+0x0D no
+        // reseteaba nada (0x0D se dibujaba como un carácter más), así
+        // que CURSOR_PTR quedaba en "(dígitos+1)*6" en vez de en 0 —
+        // este test verificaba justo ese comportamiento incorrecto.
+        let cases: &[&str] = &[
+            "10 PRINT 65\n20 END\n",
+            "10 PRINT 5\n20 END\n",
+            "10 PRINT 100\n20 END\n",
+            "10 PRINT 0\n20 END\n",
+            "10 PRINT -5\n20 END\n",
+            "10 PRINT \"HI\"\n20 END\n",
         ];
 
-        for (source, expected_cursor) in cases {
+        for source in cases {
             let code = compile_native(source);
             let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
             let cursor_ptr = pc1500.read_byte(0x7875);
             assert_eq!(
-                cursor_ptr, *expected_cursor,
-                "CURSOR_PTR tras `{}` (esperado {} caracteres * 6)",
-                source.lines().next().unwrap(), expected_cursor / 6
+                cursor_ptr, 0,
+                "CURSOR_PTR tras `{}` debería quedar en 0 (el salto de línea automático resetea el cursor)",
+                source.lines().next().unwrap()
             );
         }
     }
@@ -4395,6 +5132,33 @@ mod tests {
         assert_eq!(pc1500.read_byte(0x56B8), 1, "el programa debe seguir tras BEEP (llama a BEEP 2 veces y vuelve limpiamente)");
     }
 
+    /// `BEEP ON`/`BEEP OFF`: encontradas YA implementadas como no-op
+    /// deliberado (ver el comentario de `StackInstruction::BeepOn |
+    /// StackInstruction::BeepOff` en el backend) al investigar este mismo
+    /// hueco del roadmap — el audit estático original las había marcado
+    /// como "sin caso en el backend", pero de hecho sí lo tienen. No había
+    /// ningún test que lo verificara contra la ROM real todavía, así que
+    /// se añade aquí: solo confirma que compilan y ejecutan sin
+    /// desincronizar la pila (el propio no-op no tiene ningún efecto
+    /// observable que comprobar, por diseño — ver el comentario del
+    /// backend para el porqué).
+    #[test]
+    fn test_oracle_beep_on_off_are_stack_neutral_no_ops_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 BEEP ON :BEEP OFF :BEEP ON\n20 END\n";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "BEEP ON/OFF no debe tocar la pila hardware: S={:#06X}",
+            pc1500.cpu().s()
+        );
+    }
+
     /// Multi-asignación (`H=3,G=8`) e identificador built-in `TIME` — el
     /// patrón exacto de bathyscaph.bas (`TIME =0,H=3,G=8`). `TIME` se
     /// trata como una variable normal (no un reloj en tiempo real: no hay
@@ -4447,7 +5211,7 @@ mod tests {
 
         let pc = pc1500.cpu().p();
         assert!(
-            (0x4000..=0x57FF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+            (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
             "tras 300 frames el PC debería seguir en memoria de usuario o ROM, no en {pc:#06X} (posible corrupción/salto a memoria inválida)"
         );
     }
@@ -4465,46 +5229,322 @@ mod tests {
     /// números salgan sin el formato "*####" con el que se imprimirían
     /// en la ROM real).
     ///
-    /// Documenta un límite real y actual, no lo esconde: al arreglar el
-    /// bug de fuga de pila en `SGN`/`INT` (ver
+    /// Cuando `SGN`/`INT` se arreglaron (ver
     /// `test_oracle_int_and_sgn_promote_non_real_argument_on_real_rom`),
-    /// el código nativo generado para rasemottes.bas creció de 5780 a
-    /// 6140 bytes — y la RAM de usuario disponible es 6144 bytes
-    /// (`0x4000-0x57FF`) para código + variables + pila software
-    /// COMBINADOS (ver el comentario histórico junto a `ArrayMeta` en
-    /// `codegen/mod.rs`). El programa ya NO CABE: solo quedan 4 bytes
-    /// para variables+pila tras el código. Antes de este fix cabía de
-    /// milagro (5780 bytes) precisamente porque el bug de fuga de pila
-    /// significaba que el backend generaba MENOS código del que un
-    /// `INT`/`SGN` correcto necesita (sin la promoción a real que ahora
-    /// añadimos). Un código máquina correcto pesa más que uno con un
-    /// bug de omisión — no hay contradicción, pero sí confirma
-    /// concretamente, con un segundo programa real del corpus (no solo
-    /// una advertencia teórica), la limitación de tamaño ya encontrada
-    /// al probar el corpus completo: sin optimización de tamaño de
-    /// código, muchos programas clásicos reales no caben en la RAM
-    /// disponible. No es un bug de este test ni de rasemottes.bas —
-    /// documentarlo aquí para que, si en el futuro se añade una fase de
-    /// reducción de tamaño de código, este test empiece a fallar (señal
-    /// de que hay que actualizarlo, no de que algo se ha roto).
+    /// el código de rasemottes.bas creció de 5780 a 6140 bytes y dejó de
+    /// caber en los 6144 bytes disponibles con la expansión CE-151 (4KB)
+    /// que se modelaba entonces — este mismo test, en una versión
+    /// anterior, se limitaba a documentar ese límite en vez de poder
+    /// ejecutar el programa. Con la expansión CE-155 (8KB, confirmada
+    /// contra el manual real de la PC-1500 — ver el comentario junto a
+    /// `STANDARD_USER_MEMORY_BEGIN` en `memory.rs` de `ceres-core`) la
+    /// RAM disponible sube a 10240 bytes (`0x3800-0x5FFF`), y
+    /// rasemottes.bas vuelve a caber con margen — recuperada la prueba
+    /// de ejecución sostenida real, igual que la de bathyscaph.bas.
     #[test]
-    fn test_oracle_rasemottes_currently_exceeds_available_ram_on_real_rom() {
-        use crate::codegen::test_oracle::{compile_native, ORACLE_LOAD_ADDR};
+    fn test_oracle_rasemottes_runs_sustained_without_crashing_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        use ceres_core::Key;
 
         let source = std::fs::read_to_string("test/basic/rasemottes.bas")
             .expect("no se pudo leer test/basic/rasemottes.bas");
         let code = compile_native(&source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
 
-        // Mismo límite que valida `load_lh5_file` en la carga real: el
-        // código (sin contar siquiera variables/pila) debe terminar
-        // dentro de `standard_user_memory` (hasta 0x57FF inclusive).
-        let code_end = ORACLE_LOAD_ADDR as usize + code.len();
-        assert!(
-            code_end > 0x5800,
-            "rasemottes.bas ahora cabe en la RAM de usuario (código termina en {code_end:#06X}, \
-             límite 0x5800) — actualizar/eliminar este test y recuperar la prueba de ejecución \
-             sostenida contra la GUI real"
+        // Salir de la pantalla "GAME OVER" inicial.
+        pc1500.press(Key::Enter);
+        for _ in 0..3 {
+            pc1500.step_frame();
+        }
+        pc1500.release(Key::Enter);
+
+        // Mantener "." (control real de bajada, línea 160 — el mismo
+        // `IF` anidado cuyo consecuente llama a `M=M+INT (A/4)` en la
+        // línea 130 de cada vuelta del bucle, el patrón exacto que
+        // exponía la fuga de pila de SGN/INT antes de arreglarla).
+        pc1500.press(Key::Dot);
+        for frame in 0..300 {
+            pc1500.step_frame();
+            let s = pc1500.cpu().s();
+            assert!(
+                s <= ORACLE_STACK_TOP,
+                "frame {frame}: S se pasó de stack_top ({ORACLE_STACK_TOP:#06X}): {s:#06X}"
+            );
+        }
+        pc1500.release(Key::Dot);
+    }
+
+    /// Tercer programa clásico real: "Catch the mole" (juego de
+    /// demostración oficial del manual de aplicaciones de Sharp para la
+    /// PC-1500), un juego de reacción/temporización — género distinto a
+    /// bathyscaph/rasemottes (sin GPRINT de terreno ni POINT), con uso
+    /// intensivo de teclas de función (`CHR$ &11`..`&16`) y salto a una
+    /// etiqueta con nombre (`GOTO "MOLE"`). Compilado a ~7478 bytes; con
+    /// la expansión CE-155 (10240 bytes disponibles, `0x3800-0x5FFF`)
+    /// caben cómodos ~2760 bytes para variables+pila. Antes de la
+    /// expansión de memoria ni siquiera cabía el código por sí solo.
+    /// `END` alcanzado desde el flujo de nivel superior (sin ningún
+    /// `GOSUB` activo — el caso normal para casi cualquier `END` real,
+    /// ya que la mayoría de programas simplemente terminan su lógica
+    /// principal y paran, no llaman a END desde dentro de una
+    /// subrutina) compilaba a un `RTN` desnudo (`emit_halt`, reutilizado
+    /// también como epílogo automático al final de todo programa
+    /// generado). Sin ninguna llamada real que nos trajera hasta ahí,
+    /// `S` está en `stack_top`: ese `RTN` hace `pop` de una dirección de
+    /// retorno que nadie empujó (basura por encima de `stack_top`) y
+    /// salta ahí, corrompiendo la ejecución. Encontrado jugando
+    /// mole.bas (tercer programa clásico probado) en la GUI real: pulsar
+    /// cualquier tecla que no fuera "Y" en el prompt final ("PLAY AGAIN
+    /// (Y/N)?", línea 5630) caía en `5640 END`, crasheando con "Illegal
+    /// opcode 0xff at PC 0x0000". Arreglado sustituyendo el `RTN` por la
+    /// instrucción HALT real del LH5801 (`0xFD 0xB1`, bajo el prefijo
+    /// 0xFD — sin relación con el `0xB1` sin prefijo, que es `SBC
+    /// A,#imm`): para la CPU sin tocar la pila en absoluto, coincidiendo
+    /// con la semántica real de END (el programa se detiene limpiamente,
+    /// sin intentar "volver" a ningún sitio al que nunca se llamó).
+    #[test]
+    fn test_oracle_end_without_active_call_frame_halts_cleanly_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // `END` directo desde el nivel superior, sin ningún GOSUB activo
+        // — exactamente el patrón que crasheaba.
+        let source = "10 A=1\n20 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        for frame in 0..50 {
+            pc1500.step_frame();
+            let pc = pc1500.cpu().p();
+            let s = pc1500.cpu().s();
+            assert_ne!(pc, 0x0000, "frame {frame}: END corrompió la ejecución (S={s:#06X})");
+            assert_eq!(
+                s, ORACLE_STACK_TOP,
+                "frame {frame}: S se movió tras END sin ninguna llamada activa — debería quedar intacto en stack_top: {s:#06X}"
+            );
+        }
+    }
+
+    /// `WAIT` sin argumento — encontrado compilando bombing.bas (línea
+    /// 310: `WAIT :USING :PRINT "*** SCORE *** :";W`, tras el choque
+    /// del jugador, claramente pensado para pausar hasta que el
+    /// jugador reaccione antes de ver la puntuación final). Nunca
+    /// probado antes: bathyscaph/rasemottes/mole solo usan `WAIT n`
+    /// con argumento numérico explícito. El bug real: el compilador
+    /// trataba `WAIT` (sin número) como `WAIT 0` — un retardo mínimo
+    /// cronometrado — cuando en BASIC Sharp real significa "bloquear
+    /// indefinidamente hasta que se pulse cualquier tecla", una
+    /// semántica completamente distinta. Arreglado con una nueva
+    /// instrucción (`WaitForKey`) que reutiliza el mismo sondeo ISKEY
+    /// que `INKEY$`, pero en bucle hasta detectar una tecla.
+    #[test]
+    fn test_oracle_wait_without_argument_blocks_until_keypress_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
+        use ceres_core::Key;
+
+        let source = "10 WAIT \n20 @(21700)=1\n30 GOTO 30\n";
+        let code = compile_native(source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        // Sin ninguna tecla pulsada: debe quedarse esperando, sin
+        // llegar a escribir @(21700)=1, durante muchos frames.
+        for _ in 0..50 {
+            pc1500.step_frame();
+        }
+        assert_eq!(
+            pc1500.read_byte(21700), 0,
+            "WAIT sin argumento no debería continuar sin ninguna tecla pulsada"
         );
+
+        // Al pulsar una tecla, debe desbloquearse y continuar.
+        pc1500.press(Key::Five);
+        for _ in 0..5 {
+            pc1500.step_frame();
+        }
+        pc1500.release(Key::Five);
+        assert_eq!(
+            pc1500.read_byte(21700), 1,
+            "WAIT sin argumento debería desbloquearse en cuanto se pulsa una tecla"
+        );
+    }
+
+    /// Regresión directa del bug de "primera letra recortada": imprimir
+    /// un `0x0D` (CR) vía `CHAR_OUT` NO resetea `CURSOR_PTR` por sí
+    /// mismo — la ROM real lo dibuja como un carácter más y avanza el
+    /// cursor en 6, igual que con cualquier letra (confirmado en el
+    /// desensamblado: `CHAR_OUT` solo salta a `INIT_MTRX`, la rutina
+    /// que de verdad resetea `CURSOR_PTR`, cuando el Carry indica que
+    /// el carácter recién dibujado desbordó el ancho real de la
+    /// pantalla — nunca por imprimir 0x0D). Encontrado jugando
+    /// bombing.bas en la GUI real: `PAUSE " **** BOMBARDEMENTS ****"`
+    /// (24 caracteres) dejaba `CURSOR_PTR` en 150 en vez de 0, así que
+    /// el `INPUT "Explanations (Y/N) ? "` siguiente empezaba a
+    /// imprimir casi en el borde derecho de la pantalla — la "E" apenas
+    /// visible en la última columna, y el resto de la palabra ("x",
+    /// "planations"...) dando la vuelta a las columnas bajas, dando la
+    /// falsa impresión de que "faltaba la primera letra". Arreglado
+    /// llamando directamente a `INIT_MTRX` (`$ECB2`,
+    /// `ANI (CURSOR_PTR),$00`) en vez de fingir un salto de línea con
+    /// `CHAR_OUT`+0x0D.
+    #[test]
+    fn test_oracle_newline_resets_cursor_ptr_to_zero_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Un mensaje largo (24 caracteres, sin caber justo en las 26
+        // columnas de texto de la pantalla) seguido de otro — si el
+        // salto de línea automático tras el primero no resetea el
+        // cursor, el segundo empezaría a imprimirse casi en el borde.
+        // El `;` final del segundo PRINT suprime SU PROPIO salto de
+        // línea automático, para poder comprobar dónde empezó a
+        // imprimirse sin que se resetee otra vez antes del END.
+        let source = "10 PRINT \" **** BOMBARDEMENTS ****\"\n20 PRINT \"HI\";\n30 END\n";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+
+        assert_eq!(
+            pc1500.read_byte(0x7875), 2 * 6,
+            "CURSOR_PTR tras el segundo PRINT (\"HI\", 2 caracteres) debería reflejar que empezó desde la columna 0, \
+             no arrastrar la posición del PRINT anterior"
+        );
+    }
+
+    /// Regresión directa del bug de la ciudad ausente en bombing.bas:
+    /// `GPRINT MID$ (A$,pos,2)` (posición dinámica, longitud constante
+    /// "2") no tenía forma de determinar la longitud en tiempo de
+    /// compilación (`gprint_string_length` solo reconocía literales y
+    /// arrays), así que ese GPRINT se convertía en un comentario vacío
+    /// — ninguna columna se dibujaba de verdad — Y ADEMÁS el puntero de
+    /// 16 bits ya empujado por `MID$` se quedaba sin desapilar, fuga de
+    /// 2 bytes en la pila software por cada llamada (100 veces en la
+    /// ciudad de bombing.bas). Arreglado en dos frentes: reconocer
+    /// `MID$`/`LEFT$`/`RIGHT$` cuando su argumento de longitud es una
+    /// constante, y descartar el puntero explícitamente en el caso
+    /// (ahora infrecuente) en que la longitud siga sin poder
+    /// determinarse.
+    #[test]
+    fn test_oracle_gprint_of_mid_with_constant_length_renders_and_balances_stack_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Mismo patrón que bombing.bas línea 60, en miniatura: posición
+        // de inicio DINÁMICA (RND), longitud constante "2", repetido
+        // muchas veces — si hubiera fuga de pila, se notaría rápido.
+        let source = "\
+10 A$=\"7870604080\"\n\
+20 FOR J=0TO 49\n\
+30 GPRINT MID$ (A$,RND 5*2-1,2);\n\
+40 NEXT J\n\
+50 END\n\
+";
+        let code = compile_native(source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        for frame in 0..20 {
+            pc1500.step_frame();
+            let s = pc1500.cpu().s();
+            assert!(
+                s <= ORACLE_STACK_TOP,
+                "frame {frame}: S se pasó de stack_top ({ORACLE_STACK_TOP:#06X}): {s:#06X} (fuga de pila en GPRINT MID$)"
+            );
+        }
+
+        let touched = (0x7600..0x7600 + 60).filter(|&a| pc1500.read_byte(a) != 0).count();
+        assert!(
+            touched > 10,
+            "GPRINT MID$ (A$,RND 5*2-1,2) debería haber dibujado columnas reales en el buffer de pantalla, tocó solo {touched} bytes"
+        );
+    }
+
+    /// Cuarto programa clásico real: "Bombing" (Bombardements, E.
+    /// Beaurepaire, 1983) — otro género distinto (bombardeo con avión
+    /// horizontal en vez de reacción o esquivar terreno), con varios
+    /// patrones nunca ejercitados por bathyscaph/rasemottes/mole:
+    /// `INPUT` bloqueante con prompt como primerísima sentencia
+    /// ejecutable, condiciones `IF` con un `AND` desnudo sin comparar
+    /// contra 0 (`IF AAND ITHEN...`), ese mismo patrón combinado con el
+    /// `IF` multi-sentencia (`IF SAND CGCURSOR D:GOSUB 220`), y `WAIT`
+    /// sin argumento (ver el test de arriba). `END` se alcanza también
+    /// de forma natural tras el choque, ejercitando el fix de
+    /// END/HALT. Responde "N" al prompt de explicaciones para llegar
+    /// directo al juego, luego mantiene ESPACIO periódicamente para
+    /// soltar bombas reales y dejar que el avión llegue a chocar de
+    /// forma natural (la altura `A` se duplica en cada pasada, así que
+    /// el choque final es inevitable salvo que se destruya todo lo que
+    /// haya en su camino).
+    #[test]
+    fn test_oracle_bombing_runs_sustained_without_crashing_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        use ceres_core::Key;
+
+        let source = std::fs::read_to_string("test/basic/bombing.bas")
+            .expect("no se pudo leer test/basic/bombing.bas");
+        let code = compile_native(&source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        let type_key = |pc1500: &mut ceres_core::Pc1500, key: Key| {
+            pc1500.press(key);
+            for _ in 0..3 {
+                pc1500.step_frame();
+            }
+            pc1500.release(key);
+            for _ in 0..3 {
+                pc1500.step_frame();
+            }
+        };
+
+        // "Explanations (Y/N) ? " -> "N" + Enter, directo al juego.
+        type_key(&mut pc1500, Key::N);
+        type_key(&mut pc1500, Key::Enter);
+
+        for frame in 0..600 {
+            if frame % 10 < 2 {
+                pc1500.press(Key::Space);
+            } else {
+                pc1500.release(Key::Space);
+            }
+            pc1500.step_frame();
+            let s = pc1500.cpu().s();
+            assert!(
+                s <= ORACLE_STACK_TOP,
+                "frame {frame}: S se pasó de stack_top ({ORACLE_STACK_TOP:#06X}): {s:#06X}"
+            );
+            let pc = pc1500.cpu().p();
+            assert!(
+                (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+                "frame {frame}: PC salió a memoria inválida: {pc:#06X}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_oracle_mole_runs_sustained_without_crashing_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        use ceres_core::Key;
+
+        let source = std::fs::read_to_string("test/basic/mole.bas")
+            .expect("no se pudo leer test/basic/mole.bas");
+        let code = compile_native(&source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        // Pulsar las 6 teclas de función en rotación: garantiza que en
+        // algunas rondas se acierte al topo (P=RND 6, líneas 5090/5150)
+        // y en otras no, ejercitando ambos caminos de la lógica de
+        // colisión/puntuación real.
+        let keys = [Key::F1, Key::F2, Key::F3, Key::F4, Key::F5, Key::F6];
+        for frame in 0..300 {
+            let key = keys[frame % keys.len()];
+            pc1500.press(key);
+            pc1500.step_frame();
+            pc1500.release(key);
+            let s = pc1500.cpu().s();
+            assert!(
+                s <= ORACLE_STACK_TOP,
+                "frame {frame}: S se pasó de stack_top ({ORACLE_STACK_TOP:#06X}): {s:#06X}"
+            );
+            let pc = pc1500.cpu().p();
+            assert!(
+                (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+                "frame {frame}: PC salió a memoria inválida: {pc:#06X}"
+            );
+        }
     }
 
     /// Un `IF` sin bloque explícito (sin `THEN`, o incluso con `THEN`)
@@ -4593,6 +5633,56 @@ mod tests {
                  (fuga de pila en INT/SGN sobre un argumento no-real)"
             );
         }
+    }
+
+    /// Regresión directa de la Fase 4 (seguimiento de tipo real/entero
+    /// por variable, ver `collect_real_variables` en `mod.rs`): antes de
+    /// esto, una variable numérica se trataba SIEMPRE como entera de 8
+    /// bits, sin importar que se le asignara el resultado de una
+    /// expresión real en otra sentencia — `B=B+.5` en un bucle nunca se
+    /// leía ni escribía de forma consistente entre sentencias (encontrado
+    /// jugando bombing.bas, ver el comentario de
+    /// `test_oracle_bombing_space_drops_bomb_on_real_rom`). Aislado de
+    /// cualquier programa real, verifica:
+    /// - `B` acumula `+.5` cinco veces (2.5 exacto) y ese valor sobrevive
+    ///   intacto a través de un `FOR`/`NEXT` completo (la variable de
+    ///   control `I` NO se marca real — ver la exclusión documentada en
+    ///   `real_variables` — así que esto también cubre que ambos
+    ///   mecanismos conviven sin interferirse).
+    /// - Comparaciones reales de las cuatro formas (`=`,`<>`,`>`,`<`)
+    ///   contra un literal real y contra un literal entero (que debe
+    ///   promocionarse con `Int2Real`) dan el resultado correcto.
+    /// - La pila hardware (`S`) vuelve exactamente a `stack_top` al
+    ///   `END`, sin ningún byte suelto — la fuga real del bug original:
+    ///   cada `B=B+.5` sin este fix perdía 5 bytes de pila por vuelta.
+    #[test]
+    fn test_oracle_real_variable_roundtrips_and_compares_correctly_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "\
+10 B=0\n\
+20 FOR I=1TO5\n\
+30 B=B+.5\n\
+40 NEXT I\n\
+50 IF B=2.5 THEN @(21700)=1\n\
+60 IF B<>2.5 THEN @(21701)=1\n\
+70 IF B>2 THEN @(21702)=1\n\
+80 IF B<2 THEN @(21703)=1\n\
+90 END\n\
+";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
+
+        assert_eq!(pc1500.read_byte(21700), 1, "B debe ser exactamente 2.5 tras 5 vueltas de B=B+.5");
+        assert_eq!(pc1500.read_byte(21701), 0, "B<>2.5 debe ser falso (B es exactamente 2.5)");
+        assert_eq!(pc1500.read_byte(21702), 1, "B>2 (2.5>2) debe ser cierto, con el entero 2 promocionado a real");
+        assert_eq!(pc1500.read_byte(21703), 0, "B<2 debe ser falso (2.5 no es menor que 2)");
+
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "la pila hardware debe volver a stack_top tras las 5 asignaciones reales del bucle: S={:#06X}",
+            pc1500.cpu().s()
+        );
     }
 
     /// Regresión directa del bug de la barra negra en las primeras
@@ -4693,10 +5783,11 @@ mod tests {
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
 
-        // 21600 = 0x5460 (dentro de 0x4000-0x57FF; 22600/0x5848 usado en un
-        // intento anterior de este test EXCEDE 0x57FF, el tope real de
-        // standard_user_memory — la escritura ahí no persiste, lo cual no
-        // es un bug del compilador sino una dirección de prueba inválida).
+        // 21600 = 0x5460 (dentro de standard_user_memory, 0x3800-0x5FFF
+        // con la expansión CE-155 — 22600/0x5848, usado en un intento
+        // anterior de este test, excedía el tope de la época, 0x57FF con
+        // la expansión CE-151; sería válido con el rango actual, pero
+        // 21600 sigue funcionando igual de bien y no hace falta tocarlo).
         assert_eq!(
             pc1500.read_byte(0x5460), 5,
             "IF 1=1 THEN X=5 (condición cierta) debe asignar 5; IF 1=2 THEN X=9 (falsa) no debe ejecutarse"
@@ -4891,8 +5982,8 @@ mod tests {
     #[test]
     fn test_initialization() {
         let backend = Lh5801Backend::new();
-        assert_eq!(backend.start_address, 0x4100);
-        assert_eq!(backend.stack_top, 0x57FF);
+        assert_eq!(backend.start_address, 0x3800);
+        assert_eq!(backend.stack_top, 0x5FFF);
     }
 
     #[test]
@@ -5092,8 +6183,8 @@ mod tests {
 
         // Sección de datos anexada al final: "HI\0"
         assert!(code.ends_with(&[b'H', b'I', 0x00]));
-        // Debe haber RTN antes de la sección de datos
-        assert!(has_subsequence(&code, &[0x9A, b'H', b'I', 0x00]));
+        // Debe haber HALT (0xFD 0xB1, ver emit_halt) antes de la sección de datos
+        assert!(has_subsequence(&code, &[0xFD, 0xB1, b'H', b'I', 0x00]));
     }
 
     /// `CHR$`/`ABS` sobre el corpus de "lagunas a cubrir": `CHR$(65)` debe
@@ -5160,7 +6251,7 @@ mod tests {
         let code = compile_native("10 PAUSE \"HI\"\n20 END\n");
         let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 2000);
 
-        assert_eq!(pc1500.read_byte(0x7875), (2 + 1) * 6, "CURSOR_PTR tras PAUSE \"HI\" (\"HI\" + salto de línea)");
+        assert_eq!(pc1500.read_byte(0x7875), 0, "CURSOR_PTR tras PAUSE \"HI\" (\"HI\" + salto de línea, que debe resetearlo a 0 vía INIT_MTRX)");
         let pc = pc1500.cpu().p();
         assert!(
             (0xE88C..=0xE8C0).contains(&pc) || (0xE451..=0xE456).contains(&pc),
@@ -5313,6 +6404,112 @@ mod tests {
         pc1500.release(Key::Five);
     }
 
+    /// Verifica que SPACE de verdad dispara el lanzamiento de bomba
+    /// (línea 150: `D=P`, condicionado a `B<=0` y `INKEY$=" "`) durante
+    /// una partida real de `bombing.bas`, no un fragmento sintético, y que
+    /// la pila hardware sobrevive intacta a toda la aritmética real que
+    /// dispara (`B=B+.5`, `IF B>0`, `IF B=INT B`).
+    ///
+    /// Esto responde a una duda planteada tras probar el juego en la GUI
+    /// real: "al pulsar SPACE no se lanza la bomba". La causa NO era que
+    /// SPACE no funcionase: un primer diagnóstico tecleaba la respuesta
+    /// N+Enter al prompt de "Explanations (Y/N)?" demasiado pronto (antes
+    /// de que el PAUSE inicial hubiera terminado de imprimir y pausar de
+    /// verdad), así que el programa se quedaba bloqueado esperando una
+    /// respuesta real que nunca llegaba — nunca llegaba a jugarse de
+    /// verdad. Con el timing corregido, SPACE sí dispara `D=P` — pero eso
+    /// reveló un bug real y mucho más grave: `B` es una variable real
+    /// (`B=B+.5`), y `gen_store_to_lvalue`/`gen_acc_val` la trataban
+    /// siempre como entera de 8 bits (ningún seguimiento de tipo por
+    /// variable existía antes de `collect_real_variables`), así que cada
+    /// `B=B+.5` guardaba basura en una dirección de basura y dejaba bytes
+    /// sueltos en la pila hardware — con SPACE mantenido el tiempo
+    /// suficiente para que la lógica de caída de la bomba (que depende de
+    /// `B`) se ejercitara de verdad, la pila se desincronizaba hasta
+    /// ejecutar código máquina arbitrario ("Illegal opcode" en la ROM
+    /// real). Arreglado con seguimiento de tipo real por variable
+    /// (`real_variables`, ver `mod.rs`) más `ApilaIndReal`/
+    /// `DesapilaIndReal`/comparaciones reales (`MenorReal`/`MayorReal`/...)
+    /// en el backend.
+    ///
+    /// Con el fix, `D` cambia al menos una vez (SPACE sí lanza una bomba)
+    /// y el resto de la partida transcurre sin corromper `S` ni saltar a
+    /// memoria inválida — el juego real puede perfectamente acabar
+    /// (`END`/`HALT` limpio) dentro de la ventana de 600 frames si la
+    /// primera bomba cae sobre una columna sin edificio (no hay mecanismo
+    /// en el propio BASIC para relanzar sin acertar primero, "next bomb
+    /// can be dropped only after the previous hits something" — así que
+    /// no se puede exigir más de un lanzamiento sin depender de la
+    /// disposición aleatoria de la ciudad).
+    #[test]
+    fn test_oracle_bombing_space_drops_bomb_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, load, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        use ceres_core::Key;
+
+        let source = std::fs::read_to_string("test/basic/bombing.bas")
+            .expect("no se pudo leer test/basic/bombing.bas");
+        let (code, addrs) = compile_native_with_addresses(&source);
+        let d_addr = *addrs.get("D").expect("D") as u32;
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        let type_key = |pc1500: &mut ceres_core::Pc1500, key: Key| {
+            pc1500.press(key);
+            for _ in 0..3 {
+                pc1500.step_frame();
+            }
+            pc1500.release(key);
+            for _ in 0..3 {
+                pc1500.step_frame();
+            }
+        };
+
+        // Esperar a que el mensaje de PAUSE (línea 10) termine de
+        // imprimirse Y de pausar de verdad antes de responder al
+        // prompt de INPUT (ver comentario del test arriba).
+        for _ in 0..40 {
+            pc1500.step_frame();
+        }
+
+        type_key(&mut pc1500, Key::N);
+        type_key(&mut pc1500, Key::Enter);
+
+        pc1500.press(Key::Space);
+        let mut last_d = 255u8;
+        let mut d_changes = 0u32;
+        for frame in 0..600 {
+            pc1500.step_frame();
+            let d = pc1500.read_byte(d_addr);
+            if d != last_d {
+                d_changes += 1;
+                last_d = d;
+            }
+
+            // Mismo gate que el resto de tests "runs sustained without
+            // crashing": si la pila hardware se desincroniza (el bug real
+            // que este test encontró) o el PC salta a memoria inválida,
+            // fallar aquí con contexto en vez de dejar que el emulador
+            // paniquee más adelante con un "Illegal opcode" sin contexto.
+            let s = pc1500.cpu().s();
+            assert!(
+                s <= ORACLE_STACK_TOP,
+                "frame {frame}: S se pasó de stack_top ({ORACLE_STACK_TOP:#06X}): {s:#06X} \
+                 (pila hardware desincronizada — ¿aritmética/comparación real desequilibrando la pila?)"
+            );
+            let pc = pc1500.cpu().p();
+            assert!(
+                (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+                "frame {frame}: PC salió a memoria inválida: {pc:#06X}"
+            );
+        }
+        pc1500.release(Key::Space);
+
+        assert!(
+            d_changes >= 1,
+            "D (columna de la última bomba lanzada) debería cambiar al menos una vez \
+             mientras se mantiene SPACE pulsado durante una partida real; nunca cambió"
+        );
+    }
+
     /// Prueba end-to-end sobre `bathyscaph.bas` **sin modificar**, el
     /// programa real de referencia de todo este proyecto — no un
     /// fragmento sintético. Cubre, en un solo pipeline real (fuente →
@@ -5431,4 +6628,649 @@ mod tests {
         );
     }
 
+    /// Verifica `CALL &<dirección>` a código máquina embebido vía `POKE`
+    /// (patrón real de la época: rutinas escritas a mano en ensamblador,
+    /// inyectadas en RAM desde BASIC para evitar el coste de
+    /// interpretación) contra un desensamblado AUTÉNTICO conocido — no
+    /// una suposición nuestra sobre qué deberían hacer estos opcodes.
+    /// Fuente: invader.bas (E. Beaurepaire, 1984-2000), rutina "Smart
+    /// bomb: invert columns + call sci-fi sound + erase columns"
+    /// ($7088-$70A8), que a su vez llama a "Sci-fi sound" ($70A9-$70C7) y
+    /// esta a "Call beep routine" ($70C8-$70D3) — las tres, con su
+    /// desensamblado línea a línea, proporcionadas junto al listado BASIC
+    /// original.
+    ///
+    /// Cadena de opcodes relevante en $7088-$70A8:
+    /// - $708C-7098: por cada byte de $7620 a $762F, invierte el nibble
+    ///   alto (`EAI FF` = XOR 0xFF, confirmado leyendo el opcode `0xBD` en
+    ///   `ceres-core::lh5801::instruction`: `self.eor(val)`) preservando
+    ///   el bajo.
+    /// - $709A: `SJP $70A9` (rutina de sonido, con su propia cadena de
+    ///   `SJP $70C8` → `PSH U/X; SJP $E66F` (BEEP real de la ROM); `POP
+    ///   X/U`).
+    /// - $709D-70A6: por cada byte de $7620 a $762F OTRA VEZ, limpia el
+    ///   nibble alto (`ANI (Y),0F`), dejando solo el bajo.
+    ///
+    /// El efecto neto de invertir y luego limpiar el nibble alto es el
+    /// mismo sea cual sea su valor original: **al terminar `CALL &7088`,
+    /// cada byte de $7620-$762F debe tener el nibble alto a 0 y el bajo
+    /// intacto** — invariante de comportamiento, no solo de bytes
+    /// estáticos, así que también prueba que el `CALL`/`SJP` anidado y el
+    /// `RTN` de verdad devuelven el control correctamente.
+    ///
+    /// Esto ejercita de una sola vez: el arreglo de `POKE` multi-valor (76
+    /// bytes en las 5 líneas usadas aquí — antes se perdían todos salvo
+    /// el primero de cada línea), el arreglo de `CALL <dirección
+    /// constante>` (antes garantizaba un panic de compilación, "Undefined
+    /// label: MACHINE_CODE"), y un conjunto amplio de opcodes reales del
+    /// emulador (LDI, LDX, LDA/STA indirectos por Y, ANI/EOR/ORA, INC,
+    /// CPI, BZR, SJP anidado incluyendo una llamada real a la ROM,
+    /// PSH/POP, RTN) ejecutando código escrito a mano por un programador
+    /// de 1984, no generado por nuestro propio compilador.
+    #[test]
+    fn test_oracle_invader_smart_bomb_machine_code_matches_disassembly_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "\
+10 POKE &7088,&58,&76,&5A,&20,&15,&BD,&FF,&B9,&F0,&59,&0F,&1B,&1E,&50,&5E,&30,&99\n\
+20 POKE &7099,&0E,&BE,&70,&A9,&58,&76,&5A,&20,&59,&0F,&50,&5E,&30,&99,&07,&9A\n\
+30 POKE &70A9,&68,&03,&6A,&09,&48,&01,&4A,&02,&BE,&70,&C8,&62,&6E,&00,&99,&08,&BE\n\
+40 POKE &70BA,&70,&C8,&60,&6E,&32,&99,&08,&FD,&62,&6C,&00,&99,&1C,&9A\n\
+50 POKE &70C8,&FD,&A8,&FD,&88,&BE,&E6,&6F,&FD,&0A,&FD,&2A,&9A\n\
+60 POKE &7620,&F1,&E2,&D3,&C4,&B5,&A6,&97,&88,&79,&6A,&5B,&4C,&3D,&2E,&1F,&10\n\
+70 CALL &7088\n\
+80 END\n\
+";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 500_000);
+
+        assert!(
+            pc1500.cpu().is_halted(),
+            "el programa debe llegar a END/HALT limpiamente (sin corromper PC/pila al volver del CALL anidado)"
+        );
+
+        // 1. Los bytes POKEados coinciden EXACTAMENTE con el
+        // desensamblado, byte a byte, dirección a dirección — antes del
+        // arreglo, `POKE addr,v1,v2,...` solo escribía v1, así que de
+        // estos 76 bytes solo 5 (el primero de cada línea) habrían
+        // llegado a escribirse.
+        #[rustfmt::skip]
+        let expected_bytes: [u8; 76] = [
+            // $7088-$7098 (línea 20)
+            0x58, 0x76, 0x5A, 0x20, 0x15, 0xBD, 0xFF, 0xB9, 0xF0, 0x59, 0x0F, 0x1B, 0x1E, 0x50, 0x5E, 0x30, 0x99,
+            // $7099-$70A8 (línea 22)
+            0x0E, 0xBE, 0x70, 0xA9, 0x58, 0x76, 0x5A, 0x20, 0x59, 0x0F, 0x50, 0x5E, 0x30, 0x99, 0x07, 0x9A,
+            // $70A9-$70B9 (línea 24)
+            0x68, 0x03, 0x6A, 0x09, 0x48, 0x01, 0x4A, 0x02, 0xBE, 0x70, 0xC8, 0x62, 0x6E, 0x00, 0x99, 0x08, 0xBE,
+            // $70BA-$70C7 (línea 26)
+            0x70, 0xC8, 0x60, 0x6E, 0x32, 0x99, 0x08, 0xFD, 0x62, 0x6C, 0x00, 0x99, 0x1C, 0x9A,
+            // $70C8-$70D3 (línea 28)
+            0xFD, 0xA8, 0xFD, 0x88, 0xBE, 0xE6, 0x6F, 0xFD, 0x0A, 0xFD, 0x2A, 0x9A,
+        ];
+        for (i, &expected) in expected_bytes.iter().enumerate() {
+            let addr = 0x7088u32 + i as u32;
+            assert_eq!(
+                pc1500.read_byte(addr), expected,
+                "byte en {addr:#06X} no coincide con el desensamblado (esperado {expected:#04X})"
+            );
+        }
+
+        // 2. Invariante de comportamiento: invertir-y-limpiar deja el
+        // nibble alto a 0 y el bajo intacto, para los 16 bytes de
+        // $7620-$762F — confirma que el código realmente SE EJECUTÓ (no
+        // solo que los bytes estaban bien puestos en memoria) y que el
+        // SJP anidado (incluida la llamada real a BEEP en la ROM) volvió
+        // correctamente en cada nivel.
+        let originals: [u8; 16] = [
+            0xF1, 0xE2, 0xD3, 0xC4, 0xB5, 0xA6, 0x97, 0x88, 0x79, 0x6A, 0x5B, 0x4C, 0x3D, 0x2E, 0x1F, 0x10,
+        ];
+        for (i, &orig) in originals.iter().enumerate() {
+            let addr = 0x7620u32 + i as u32;
+            let actual = pc1500.read_byte(addr);
+            let expected_low = orig & 0x0F;
+            assert_eq!(
+                actual, expected_low,
+                "byte en {addr:#06X}: se esperaba el nibble alto limpiado (preservando el bajo de {orig:#04X} -> {expected_low:#04X}), se obtuvo {actual:#04X}"
+            );
+        }
+    }
+
+    /// Regresión directa de la concatenación de cadenas (`A$+B$`): antes,
+    /// `+` sobre cadenas caía siempre en `SumaInt` (suma entera de 8 bits
+    /// sobre dos punteros de 16 bits), corrompiendo la pila en CUALQUIER
+    /// concatenación — confirmado contra la ROM real: `A$="X":B$=A$+"Y"`
+    /// dejaba `S` un byte por debajo de `stack_top`. Encontrado
+    /// investigando `GOTO "*"+INKEY$` en invader.bas (E. Beaurepaire),
+    /// pero el bug era general, no específico de ese programa.
+    ///
+    /// Cada caso se ejecuta en un programa PROPIO, cargado desde cero, en
+    /// vez de encadenar varias asignaciones en un único programa: una
+    /// variable de cadena escalar solo guarda el PUNTERO de 16 bits al
+    /// resultado (`DesapilaIndWord`), nunca una copia de los caracteres —
+    /// así que si el mismo programa hiciera una SEGUNDA concatenación
+    /// después de la primera, ambas compartirían `__CONCAT_BUF` y la
+    /// segunda invalidaría silenciosamente el contenido de la primera
+    /// variable. Esto no es un bug de la concatenación en sí (se
+    /// comprueba aquí que cada resultado, leído antes de que nada más
+    /// toque el buffer, es exacto) — es una limitación más amplia y
+    /// PREEXISTENTE del mismo patrón de "buffer compartido" que ya usan
+    /// `MID$`/`LEFT$`/`RIGHT$`/`CHR$`/`STR$` (confirmada también sobre
+    /// `LEFT$` durante esta misma investigación), documentada aparte.
+    ///
+    /// Verifica, cada una en su propio programa:
+    /// - Concatenación simple (`A$+"WORLD"`), contenido exacto.
+    /// - Concatenación encadenada (`A$+B$+C$`) — el resultado de la
+    ///   concatenación interna vive en el mismo `__CONCAT_BUF` que se
+    ///   reutiliza como operando izquierdo de la externa: mismo origen y
+    ///   destino para esa primera copia, caso límite que confirma que no
+    ///   corrompe nada (la copia es sobre sí misma, byte a byte, antes de
+    ///   añadir el lado derecho).
+    /// - `PRINT` de una concatenación (ejercita el `is_string_expr` del
+    ///   `Binary(Add)` completo, no solo del `LValue` — sin ese caso,
+    ///   `PRINT A$+"Y"` habría elegido `SystemOutInt` sobre el puntero de
+    ///   16 bits del resultado en vez de `SystemOutString`), verificado
+    ///   por avance de `CURSOR_PTR` (mismo patrón que
+    ///   `test_oracle_print_int_and_string_cursor_advance_on_real_rom`).
+    /// - En los tres casos, la pila hardware (`S`) vuelve exactamente a
+    ///   `stack_top`.
+    #[test]
+    fn test_oracle_string_concatenation_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Lee el contenido de una variable de cadena escalar directamente
+        // de su propia dirección (ES el buffer, no un puntero — ver
+        // `is_direct_string_buffer`).
+        let read_string_var = |pc1500: &ceres_core::Pc1500, addr: usize| -> String {
+            let addr = addr as u32;
+            let mut s = String::new();
+            for i in 0..40 {
+                let byte = pc1500.read_byte(addr + i);
+                if byte == 0 {
+                    break;
+                }
+                s.push(byte as char);
+            }
+            s
+        };
+
+        // Caso 1: concatenación simple.
+        {
+            let source = "10 A$=\"HELLO\":B$=A$+\"WORLD\"\n20 END\n";
+            let (code, addrs) = compile_native_with_addresses(source);
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20_000);
+
+            assert!(pc1500.cpu().is_halted(), "caso 1: debe llegar a END/HALT limpiamente");
+            assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "caso 1: S debe volver a stack_top: {:#06X}", pc1500.cpu().s());
+            let b_addr = *addrs.get("B$").expect("dirección de B$ no encontrada");
+            assert_eq!(read_string_var(&pc1500, b_addr), "HELLOWORLD", "B$=A$+\"WORLD\" incorrecto");
+        }
+
+        // Caso 2: concatenación encadenada, tres operandos.
+        {
+            let source = "10 A$=\"HELLO\":B$=\"HELLOWORLD\":C$=\"!\":D$=A$+B$+C$\n20 END\n";
+            let (code, addrs) = compile_native_with_addresses(source);
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20_000);
+
+            assert!(pc1500.cpu().is_halted(), "caso 2: debe llegar a END/HALT limpiamente");
+            assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "caso 2: S debe volver a stack_top: {:#06X}", pc1500.cpu().s());
+            let d_addr = *addrs.get("D$").expect("dirección de D$ no encontrada");
+            assert_eq!(read_string_var(&pc1500, d_addr), "HELLOHELLOWORLD!", "D$=A$+B$+C$ (concatenación encadenada) incorrecto");
+        }
+
+        // Caso 3: PRINT directo de una concatenación (is_string_expr del
+        // Binary completo) — verificado por avance de CURSOR_PTR: "HELLOY"
+        // son 6 caracteres * 6 = 36.
+        {
+            let source = "10 A$=\"HELLO\":PRINT A$+\"Y\";\n20 END\n";
+            let code = compile_native_with_addresses(source).0;
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20_000);
+
+            assert!(pc1500.cpu().is_halted(), "caso 3: debe llegar a END/HALT limpiamente");
+            assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "caso 3: S debe volver a stack_top: {:#06X}", pc1500.cpu().s());
+            assert_eq!(
+                pc1500.read_byte(0x7875), 36,
+                "PRINT A$+\"Y\" debe avanzar CURSOR_PTR 36 (6 caracteres * 6) — si is_string_expr no reconociera \
+                 la concatenación, se habría usado SystemOutInt en vez de SystemOutString"
+            );
+        }
+    }
+
+    /// Regresión directa del bug de aliasing de variables de cadena
+    /// escalares: antes, `X$=<expr>` guardaba solo un PUNTERO de 16 bits
+    /// (`DesapilaIndWord`) — si `<expr>` venía de una función con buffer
+    /// de resultado COMPARTIDO por función (`LEFT$`→`__LEFT_BUF`,
+    /// `MID$`→`__MID_BUF`, etc., una única dirección fija reutilizada por
+    /// TODAS las llamadas a esa función en el programa), la variable
+    /// quedaba apuntando al buffer compartido, no a una copia propia.
+    /// Confirmado contra la ROM real durante la investigación de la
+    /// concatenación de cadenas: `B$=LEFT$(A$,5)` seguido de una segunda
+    /// llamada — NO RELACIONADA — a `LEFT$` en la línea siguiente dejaba
+    /// `B$` con el resultado de la SEGUNDA llamada ("HEL" en vez de
+    /// "HELLO"). No es un bug de `LEFT$` en sí ni de ningún programa
+    /// concreto: afecta a cualquier programa real que llame a la MISMA
+    /// función de cadena más de una vez y guarde ambos resultados para
+    /// usarlos más tarde — un patrón común, no una rareza.
+    ///
+    /// Arreglado haciendo que una variable de cadena escalar reserve su
+    /// propio buffer (`DEFAULT_STRING_MAX_LEN+1` bytes, ver
+    /// `get_or_create_variable_address`) y que la asignación COPIE el
+    /// contenido ahí (`DesapilaIndStringCopy`, el mismo mecanismo que ya
+    /// usaba un array de cadena de ancho fijo) en vez de solo el puntero
+    /// — ver `is_direct_string_buffer`.
+    #[test]
+    fn test_oracle_scalar_string_variable_does_not_alias_shared_function_buffer_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 A$=\"HELLOWORLD\":B$=LEFT$ (A$,5)\n20 C$=LEFT$ (A$,3)\n30 END\n";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top: {:#06X}", pc1500.cpu().s());
+
+        let read_string_var = |addr: usize| -> String {
+            let addr = addr as u32;
+            let mut s = String::new();
+            for i in 0..40 {
+                let byte = pc1500.read_byte(addr + i);
+                if byte == 0 {
+                    break;
+                }
+                s.push(byte as char);
+            }
+            s
+        };
+
+        let b_addr = *addrs.get("B$").expect("dirección de B$ no encontrada");
+        let c_addr = *addrs.get("C$").expect("dirección de C$ no encontrada");
+        assert_eq!(
+            read_string_var(b_addr), "HELLO",
+            "B$=LEFT$(A$,5) debe seguir siendo \"HELLO\" después de la llamada a LEFT$ de la línea 20 \
+             (si hubiera aliasing, mostraría \"HEL\", el resultado de esa segunda llamada)"
+        );
+        assert_eq!(read_string_var(c_addr), "HEL", "C$=LEFT$(A$,3) incorrecto");
+    }
+
+    fn read_cstr(pc1500: &ceres_core::Pc1500, addr: u32, max: u32) -> String {
+        let mut s = String::new();
+        for i in 0..max {
+            let b = pc1500.read_byte(addr + i);
+            if b == 0 {
+                break;
+            }
+            s.push(b as char);
+        }
+        s
+    }
+
+    /// Regresión directa de `PRINT USING`: antes, `PRINT USING
+    /// <patrón>;valor` era un TODO que no generaba ningún código (ni
+    /// siquiera consumía el valor de la pila), y `USING` suelta emitía
+    /// una instrucción sin caso real en el backend (NOP silencioso). El
+    /// patrón siempre se resuelve en tiempo de COMPILACIÓN
+    /// (`UsingFormat`/`parse_using_pattern` en `mod.rs`) contra los
+    /// patrones que de verdad aparecen en el corpus (`test/basic/*.bas`):
+    /// dígitos simples (`"####"`), relleno de asteriscos + signo forzado
+    /// (`"*+###"`, literalmente el patrón de bombing.bas), y decimales
+    /// (`"##.##"`). Verifica el contenido EXACTO del buffer formateado
+    /// para cada uno, y que la pila hardware vuelve a `stack_top` (sin
+    /// fuga) en los tres casos.
+    #[test]
+    fn test_oracle_print_using_real_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // "####" sobre un entero (promovido a real): relleno con
+        // espacios, sin signo forzado.
+        {
+            let source = "10 A=42:PRINT USING \"####\";A\n20 END\n";
+            let (code, addrs) = compile_native_with_addresses(source);
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+            assert!(pc1500.cpu().is_halted(), "\"####\": debe llegar a END/HALT limpiamente");
+            assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "\"####\": S debe volver a stack_top");
+            let buf = *addrs.get("__USING_BUF").expect("__USING_BUF") as u32;
+            assert_eq!(read_cstr(&pc1500, buf, 10), "   42", "PRINT USING \"####\";42 incorrecto");
+        }
+
+        // "*+###" (patrón real de bombing.bas): relleno con asteriscos +
+        // signo siempre visible.
+        {
+            let source = "10 B=7:PRINT USING \"*+###\";B\n20 END\n";
+            let (code, addrs) = compile_native_with_addresses(source);
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+            assert!(pc1500.cpu().is_halted(), "\"*+###\": debe llegar a END/HALT limpiamente");
+            assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "\"*+###\": S debe volver a stack_top");
+            let buf = *addrs.get("__USING_BUF").expect("__USING_BUF") as u32;
+            assert_eq!(read_cstr(&pc1500, buf, 10), "+**7", "PRINT USING \"*+###\";7 incorrecto");
+        }
+
+        // "##.##": dígitos antes y después del punto decimal.
+        {
+            let source = "10 C=12.5:PRINT USING \"##.##\";C\n20 END\n";
+            let (code, addrs) = compile_native_with_addresses(source);
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+            assert!(pc1500.cpu().is_halted(), "\"##.##\": debe llegar a END/HALT limpiamente");
+            assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "\"##.##\": S debe volver a stack_top");
+            let buf = *addrs.get("__USING_BUF").expect("__USING_BUF") as u32;
+            assert_eq!(read_cstr(&pc1500, buf, 10), " 12.50", "PRINT USING \"##.##\";12.5 incorrecto");
+        }
+    }
+
+    /// Regresión directa del bug encontrado investigando `USING`: `PRINT`
+    /// de una variable real SIN `USING` activo perdía 7 de los 8 bytes
+    /// que empuja esa variable (`ApilaIndReal`), porque antes de esto
+    /// SIEMPRE se emitía `SystemOutInt` (que solo consume 1 byte) para
+    /// cualquier valor no-cadena — confirmado contra la ROM real:
+    /// `B=2.5:PRINT B` dejaba `S` en `0x5FF8`, 7 bytes por debajo de
+    /// `stack_top`. Verifica que ahora `S` vuelve exacto, y que el
+    /// recorte de ceros/espacios sobrantes (`PrintRealNatural`) deja
+    /// "2.5" (avance de `CURSOR_PTR` de 4 caracteres * 6 = 24: signo,
+    /// '2', '.', '5' — no los 15 caracteres del ancho fijo sin recortar).
+    #[test]
+    fn test_oracle_print_real_variable_without_using_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 D=2.5:CURSOR 0:PRINT D;\n20 END\n";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "PRINT de una variable real sin USING no debe perder bytes de pila: S={:#06X}",
+            pc1500.cpu().s()
+        );
+
+        let buf = *addrs.get("__PRINT_REAL_BUF").expect("__PRINT_REAL_BUF") as u32;
+        assert_eq!(
+            read_cstr(&pc1500, buf, 15), "       2.500000",
+            "el buffer sin recortar (ancho fijo 7+6) debe contener el valor exacto antes de recortar"
+        );
+        assert_eq!(
+            pc1500.read_byte(0x7875), 24,
+            "CURSOR_PTR debe avanzar 4 caracteres * 6 (' ','2','.','5') tras recortar, no los 15 del ancho fijo"
+        );
+    }
+
+    /// `NOT`: complemento a 1 de 8 bits (`EOR #0xFF`), que en complemento
+    /// a 2 equivale a `-x-1` — la semántica estándar de `NOT` en esta
+    /// generación de BASIC, tanto para uso bit a bit como lógico (dado el
+    /// convenio "0=falso, no-cero=verdadero" que ya usa el resto de este
+    /// backend). Nota: buscando `NOT` en el corpus real de 39 programas,
+    /// **cada aparición está dentro de un literal de cadena** (p.ej.
+    /// `"SPLIT NOT ALLOWED"`) — ningún programa usa el operador `NOT` de
+    /// verdad. Se implementa igualmente (coste mínimo, ya en la lista de
+    /// trabajo acordada) pero, a diferencia de `Using`, no había ningún
+    /// caso real que verificar contra el corpus.
+    #[test]
+    fn test_oracle_not_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        let source = "10 A=5:B=NOT A:C=NOT 0\n20 END\n";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top");
+        let b = *addrs.get("B").expect("B") as u32;
+        let c = *addrs.get("C").expect("C") as u32;
+        assert_eq!(pc1500.read_byte(b), 250, "NOT 5 debe ser -6 (0xFA=250 en complemento a 2)");
+        assert_eq!(pc1500.read_byte(c), 255, "NOT 0 debe ser -1 (0xFF=255 en complemento a 2)");
+    }
+
+    /// `SQR`: raíz cuadrada por Newton (`x=(x+v/x)/2`), compuesta sobre la
+    /// aritmética real ya verificada — ver el comentario de
+    /// `FunctionInner::Sqr` y `gen_sqr_routine` en `mod.rs`. Casos
+    /// cubiertos: un cuadrado perfecto exacto (`SQR 16=4`), un valor
+    /// irracional dentro de tolerancia (`SQR 2`≈1.41421), y el caso
+    /// especial `SQR 0=0` (Newton nunca llega exactamente a 0 partiendo de
+    /// `x_0=(v+1)/2` en un nº finito de iteraciones — necesitó un atajo
+    /// explícito para v=0, encontrado con este mismo test antes del
+    /// arreglo). También verifica que `B=SQR(A)` propaga `is_real_expr`
+    /// (encontrado con este test: sin el caso `FunctionCall` en
+    /// `is_real_expr`, el resultado de 8 bytes se guardaba con
+    /// `DesapilaInd` de 1 byte, perdiendo 7 bytes de pila en cada
+    /// llamada).
+    #[test]
+    fn test_oracle_sqr_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        let source = "\
+10 A=16:B=SQR A\n\
+20 IF B=4 THEN @(21700)=1\n\
+30 C=SQR 2\n\
+40 IF C>1.41 THEN @(21701)=1\n\
+50 IF C<1.42 THEN @(21702)=1\n\
+60 D=SQR 0\n\
+70 IF D=0 THEN @(21703)=1\n\
+80 END\n\
+";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 500_000);
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S debe volver a stack_top tras 3 llamadas a SQR: S={:#06X}",
+            pc1500.cpu().s()
+        );
+        assert_eq!(pc1500.read_byte(21700), 1, "SQR(16) debe ser exactamente 4");
+        assert_eq!(pc1500.read_byte(21701), 1, "SQR(2) debe ser mayor que 1.41");
+        assert_eq!(pc1500.read_byte(21702), 1, "SQR(2) debe ser menor que 1.42");
+        assert_eq!(pc1500.read_byte(21703), 1, "SQR(0) debe ser exactamente 0 (caso especial en gen_sqr_routine)");
+    }
+
+    /// `GOTO`/`GOSUB` a una etiqueta de cadena CALCULADA en tiempo de
+    /// ejecución con un prefijo constante — patrón real de invader-v2.bas
+    /// (`GOTO "*"+INKEY$`, ver `test_oracle_invader_smart_bomb_...` para
+    /// el propio invader-v2.bas completo). Sin instrucción de salto "por
+    /// nombre calculado" en el backend: se resuelve en tiempo de
+    /// COMPILACIÓN como una cascada de comparaciones de cadena
+    /// (`IgualCadena`, ya verificado por `IF A$=B$`) contra cada etiqueta
+    /// candidata que empiece por el mismo prefijo (`self.all_string_labels`,
+    /// recogidas en una pre-pasada) — ver `gen_computed_string_goto`.
+    ///
+    /// El `GOTO` prueba las 4 etiquetas candidatas reales de
+    /// invader-v2.bas (`"*9"`, `"*="`, `"*"`, `"* "`) con dos valores de
+    /// sufijo distintos, para confirmar que no siempre cae en la primera
+    /// candidata por casualidad de orden.
+    #[test]
+    fn test_oracle_computed_string_label_goto_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source_9 = "\
+10 K$=\"9\"\n\
+20 GOTO \"*\"+K$\n\
+30 \"*9\"@(21700)=1:GOTO 60\n\
+40 \"*=\"@(21700)=2:GOTO 60\n\
+50 \"*\"@(21700)=3:GOTO 60\n\
+55 \"* \"@(21700)=4:GOTO 60\n\
+60 END\n\
+";
+        let code_9 = compile_native(source_9);
+        let pc1500_9 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code_9, ORACLE_STACK_TOP, 40_000);
+        assert!(pc1500_9.cpu().is_halted(), "debe llegar a END/HALT limpiamente (sufijo \"9\")");
+        assert_eq!(pc1500_9.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top (sufijo \"9\")");
+        assert_eq!(pc1500_9.read_byte(21700), 1, "K$=\"9\" -> \"*\"+K$=\"*9\" debe saltar a la etiqueta \"*9\"");
+
+        let source_eq = source_9.replacen("K$=\"9\"", "K$=\"=\"", 1);
+        let code_eq = compile_native(&source_eq);
+        let pc1500_eq = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code_eq, ORACLE_STACK_TOP, 40_000);
+        assert!(pc1500_eq.cpu().is_halted(), "debe llegar a END/HALT limpiamente (sufijo \"=\")");
+        assert_eq!(pc1500_eq.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top (sufijo \"=\")");
+        assert_eq!(pc1500_eq.read_byte(21700), 2, "K$=\"=\" -> \"*\"+K$=\"*=\" debe saltar a la etiqueta \"*=\"");
+    }
+
+    /// Como el test de arriba pero para `GOSUB` (llamada, no salto): debe
+    /// volver correctamente al punto de llamada tras el `RETURN` de la
+    /// etiqueta candidata que coincidió, y seguir ejecutando el resto del
+    /// programa con la pila hardware balanceada — no solo saltar, que ya
+    /// prueba el caso `GOTO`. Usa el sufijo VACÍO (`K$=""`, `"*"+K$="*"`)
+    /// a propósito: es el caso límite donde el sufijo candidato también es
+    /// una cadena vacía.
+    #[test]
+    fn test_oracle_computed_string_label_gosub_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "\
+10 K$=\"\"\n\
+20 GOSUB \"*\"+K$\n\
+25 @(21701)=1\n\
+30 END\n\
+50 \"*9\"@(21700)=1:RETURN \n\
+55 \"*=\"@(21700)=2:RETURN \n\
+60 \"*\"@(21700)=3:RETURN \n\
+65 \"* \"@(21700)=4:RETURN \n\
+";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S debe volver a stack_top tras el GOSUB calculado + RETURN: S={:#06X}",
+            pc1500.cpu().s()
+        );
+        assert_eq!(pc1500.read_byte(21700), 3, "K$=\"\" -> \"*\"+K$=\"*\" debe llamar a la etiqueta \"*\"");
+        assert_eq!(pc1500.read_byte(21701), 1, "tras el RETURN debe seguir ejecutando la línea 25, no perderse");
+    }
+
+    /// `DIM A$(N)` SIN `*M` (ancho de elemento explícito) — patrón real
+    /// de decathlon.bas (`DIM A$(7)`) y monstres&merveilles.bas (`DIM
+    /// C$(3)`). Antes `array_element_size` usaba 1 byte/elemento por
+    /// defecto (el mismo valor que un array NUMÉRICO) — demasiado
+    /// estrecho ni para una cadena vacía, y por debajo del umbral
+    /// (`element_size > 2`) que `is_direct_string_buffer` usa para decidir
+    /// "ancho fijo, copiar contenido" vs "puntero indirecto de 16 bits":
+    /// cada asignación `A$(i)=...` habría escrito un puntero de 2 bytes en
+    /// un hueco de 1 byte, pisando el primer byte del elemento siguiente
+    /// — un solapamiento real, no solo el aliasing de buffer compartido ya
+    /// arreglado para variables escalares. Ahora el valor por defecto para
+    /// un array de CADENA sin `*M` es el mismo que una variable escalar
+    /// (`DEFAULT_STRING_MAX_LEN+1`, ancho fijo con copia de contenido).
+    /// Verificado con 4 elementos consecutivos, cada uno con contenido
+    /// distinto, leyendo directamente la memoria (no solo que el programa
+    /// no crashee).
+    #[test]
+    fn test_oracle_string_array_without_explicit_width_does_not_overlap_elements_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 DIM A$(3)\n20 A$(0)=\"AA\"\n30 A$(1)=\"BB\"\n40 A$(2)=\"CC\"\n50 A$(3)=\"DD\"\n60 END\n";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let base = *addrs.get("A$").expect("dirección de A$ no encontrada") as u32;
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top tras 4 asignaciones a elementos de cadena");
+
+        let element_size = 41u32; // DEFAULT_STRING_MAX_LEN(40) + 1
+        for (i, expected) in ["AA", "BB", "CC", "DD"].iter().enumerate() {
+            let elem_base = base + (i as u32) * element_size;
+            let actual: String = (0..2).map(|j| pc1500.read_byte(elem_base + j) as char).collect();
+            assert_eq!(&actual, expected, "A$({}) debe contener \"{}\" sin pisar al elemento vecino", i, expected);
+            assert_eq!(pc1500.read_byte(elem_base + 2), 0, "A$({}) debe terminar en NUL, no en basura del elemento siguiente", i);
+        }
+    }
+
+    /// `STATUS 2`/`STATUS 4`, verificados contra el Manual de Referencia
+    /// Técnico real (sección 5-1-2) — ver el comentario largo en
+    /// `FunctionInner::Status` (`mod.rs`) para el alcance exacto (solo
+    /// lectura del valor numérico; POKE/CALL a la dirección devuelta con
+    /// una dirección CALCULADA en tiempo de ejecución queda fuera,
+    /// decisión explícita del usuario del 2026-08-26). Se compara contra
+    /// la dirección real de `__STATUS2_SCRATCH` (no un literal hardcodeado
+    /// — la dirección varía con `data_base`, igual que cualquier otra
+    /// variable) en vez de asumir un valor fijo.
+    #[test]
+    fn test_oracle_status_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        let source = "10 A=STATUS 2:B=STATUS 4\n20 END\n";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top tras 2 asignaciones reales: S={:#06X}", pc1500.cpu().s());
+
+        let a_addr = *addrs.get("A").expect("A") as u32;
+        let scratch_addr = *addrs.get("__STATUS2_SCRATCH").expect("__STATUS2_SCRATCH") as u32;
+        let a_bytes: Vec<u8> = (0..8).map(|i| pc1500.read_byte(a_addr + i)).collect();
+        let expected_bytes = f64_to_bcd8(scratch_addr as f64);
+        assert_eq!(a_bytes, expected_bytes, "A=STATUS 2 debe ser exactamente la dirección de __STATUS2_SCRATCH");
+
+        let b_addr = *addrs.get("B").expect("B") as u32;
+        let b_bytes: Vec<u8> = (0..8).map(|i| pc1500.read_byte(b_addr + i)).collect();
+        assert_eq!(b_bytes, f64_to_bcd8(0.0), "B=STATUS 4 debe ser 0 (sin intérprete de líneas en código nativo)");
+    }
+
+    /// Regresión directa del bug de desbordamiento de 16 bits en el
+    /// campo de longitud del formato `.lh5` (ver el `assert!` en
+    /// `test_oracle::load` y el comentario de `lh5_format::write_lh5_file`)
+    /// — encontrado investigando por qué decathlon.bas (67310 bytes)
+    /// producía un "Illegal opcode" confuso en vez de un error claro de
+    /// tamaño. `GOSUB` con un número de línea en notación científica
+    /// (`61E3` = 61000, patrón real de decathlon.bas para ahorrar bytes
+    /// en el BASIC tokenizado original) en sí mismo NO es el bug — se
+    /// verifica aquí en aislamiento, con un programa pequeño que cabe de
+    /// sobra, para dejar constancia de que la sintaxis en sí funciona
+    /// correctamente y que el problema real de decathlon.bas es solo de
+    /// tamaño.
+    #[test]
+    fn test_oracle_gosub_to_scientific_notation_line_number_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+        let source = "10 GOSUB 61E3:@(21700)=1:GOTO 20\n61000 @(21701)=1:RETURN \n20 END\n";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20_000);
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top tras el GOSUB+RETURN: S={:#06X}", pc1500.cpu().s());
+        assert_eq!(pc1500.read_byte(21700), 1, "el código tras el GOSUB debe ejecutarse");
+        assert_eq!(pc1500.read_byte(21701), 1, "GOSUB 61E3 debe llamar a la línea 61000 (61E3 = 61*10^3)");
+    }
+
+    /// Los últimos 4 programas reales del corpus de 39 que nunca se
+    /// habían ejecutado (el resto, o ya estaba verificado, o genera más
+    /// código del que cabe en la RAM real de usuario — ver
+    /// `roadmap_toward_solid_release.md`, sección "Corrección honesta
+    /// post-roadmap"). Los 4 empiezan con `WAIT 0` y comparten un patrón
+    /// de ejecución sano: sondeo de teclado corto y repetitivo
+    /// (`ISKEY`/`KEY_2_ASCII`) intercalado con código de usuario propio —
+    /// confirmado con `step_cpu()` ciclo a ciclo tras varios `step_frame()`
+    /// (ver la nota de infraestructura de
+    /// `test_oracle_input_numeric_and_string_via_simulated_keypresses_on_real_rom`:
+    /// solo `step_frame()` deriva el "strobe" de teclado real). pacman.bas
+    /// en particular PARECÍA congelado en `ISKEY` durante cientos de
+    /// `step_frame()` seguidos con el PC exactamente igual en cada
+    /// muestreo — resultó ser un artefacto de muestreo (el presupuesto
+    /// fijo de ticks de `step_frame()` cae, por coincidencia, siempre en
+    /// el mismo punto de un bucle corto de sondeo de ~14 instrucciones que
+    /// SÍ avanza, confirmado bajando a `step_cpu()` individual desde ese
+    /// punto), no un cuelgue real. Este test solo confirma que los 4
+    /// compilan, cargan y ejecutan un número sustancial de frames sin
+    /// panic ni desincronización grave de la pila — no hay forma de
+    /// verificar jugabilidad real sin simular una partida completa.
+    #[test]
+    fn test_oracle_four_previously_unexecuted_corpus_programs_run_without_crashing_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
+
+        for name in ["Pilesjr.bas", "bowling.bas", "jackpot.bas", "pacman.bas"] {
+            let path = format!("test/basic/{}", name);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("no se pudo leer {}: {}", path, e));
+            let code = compile_native(&source);
+            let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+            for _ in 0..200u32 {
+                pc1500.step_frame();
+            }
+
+            // No debe haber "explotado" en un salto salvaje: la pila
+            // hardware no puede haberse desbordado por debajo de la
+            // región de usuario (0x3800) ni haber crecido más allá de
+            // stack_top — cualquiera de los dos indicaría PSH/POP
+            // desequilibrados acumulados durante 200 frames reales de
+            // ejecución (bastante más exigente que un END limpio de un
+            // programa corto).
+            let s = pc1500.cpu().s();
+            assert!(
+                (0x3800..=0x5FFF).contains(&s),
+                "{}: S se salió de la región de usuario tras 200 frames: S={:#06X}",
+                name,
+                s
+            );
+        }
+    }
 }

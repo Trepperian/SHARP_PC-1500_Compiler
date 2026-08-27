@@ -73,6 +73,90 @@ pub struct StackCodeGenerator {
     /// Dirección base del área de variables (`DATA_BASE` como valor de
     /// instancia en vez de constante — ver [`compile_native_two_pass`]).
     data_base: usize,
+
+    /// Nombres de variables escalares (sin `$`) que, en algún `LET` del
+    /// programa, reciben el resultado de una expresión real (`is_real_expr`
+    /// devuelve `true` para el lado derecho) — recogido por
+    /// `collect_real_variables` antes de generar código, igual que
+    /// `collect_data_pool` recoge los `DATA`. Sin esto, cada variable
+    /// numérica se trataba SIEMPRE como entera de 8 bits (ver el comentario
+    /// histórico de `is_real_expr`): una variable pensada para acumular un
+    /// valor fraccionario entre sentencias (p.ej. `B=B+.5` en un bucle)
+    /// nunca se leía ni escribía de forma consistente, porque "es real" se
+    /// decidía solo mirando la expresión de CADA sentencia por separado,
+    /// nunca la variable en sí. Bug real jugando bombing.bas: `B=B+.5`
+    /// (línea 160) calculaba correctamente un resultado real de 8 bytes
+    /// (vía `SumaReal`/`ADDIT`), pero se guardaba con `DesapilaInd` (que
+    /// solo consume 1 byte), perdiendo los otros 5 bytes en la pila
+    /// hardware en cada vuelta del bucle principal — clase de bug de fuga
+    /// de pila ya vista antes con `GPRINT MID$`, aquí con consecuencias
+    /// mucho más graves por repetirse decenas de veces por partida hasta
+    /// desincronizar la pila por completo (visible como escrituras a
+    /// memoria no mapeada, dirección 0x0000).
+    ///
+    /// Deliberadamente EXCLUYE cualquier variable usada alguna vez como
+    /// variable de control de un `FOR` (ver `collect_real_variables`):
+    /// `gen_for`/`gen_next` siempre incrementan con `SumaInt` y comparan
+    /// como enteros de 8 bits, sin ninguna noción de real — extender eso
+    /// es una pieza mayor, fuera de alcance aquí (documentado como
+    /// limitación conocida, no un olvido).
+    real_variables: std::collections::HashSet<String>,
+
+    /// Formato `USING` activo, o `None` si no hay ninguno (formato
+    /// decimal simple). Se actualiza en tiempo de COMPILACIÓN al procesar
+    /// cada sentencia `USING <patrón>` o `PRINT USING <patrón>;...`
+    /// (`patrón` siempre debe ser un literal de cadena — núcleo reducido,
+    /// como el resto de patrones/tamaños constantes de este backend) y se
+    /// consulta cada vez que `PRINT`/`PRINT USING` imprime un valor
+    /// numérico. No hace falta ningún estado en tiempo de EJECUCIÓN: como
+    /// el patrón siempre se conoce en compilación, todo el ancho fijo se
+    /// resuelve aquí, no en la ROM real (que si usara esto en tiempo real
+    /// leería el bloque `USING_BLOCK`, `$7895-7898` — investigar su
+    /// formato exacto habría sido una tarea de investigación de ROM con
+    /// riesgo de acabar en callejón sin salida, como pasó con `RND`).
+    current_using_format: Option<UsingFormat>,
+
+    /// `true` si el programa usa `SQR` alguna vez — controla si
+    /// `generate()` emite la subrutina compartida `__SQR_ROUTINE` (ver el
+    /// comentario de `FunctionInner::Sqr`). Emitirla siempre, la use el
+    /// programa o no, desperdiciaría ~200 bytes de un presupuesto de
+    /// código ya ajustado (ver la investigación de RAM de esta misma
+    /// tanda de trabajo: 10240 bytes es el techo real de hardware).
+    sqr_used: bool,
+
+    /// `true` en cuanto se ha emitido la inicialización única del heap de
+    /// arrays con `DIM` dinámico (`__ARRAY_HEAP_PTR = __ARRAY_HEAP`) — ver
+    /// el comentario largo en `gen_dim`. Se hace una sola vez, en el punto
+    /// del PRIMER `DIM` dinámico que aparece en el código fuente (asume
+    /// que los `DIM` se ejecutan una sola vez cada uno, al principio del
+    /// programa — el patrón real de todo el corpus; un `DIM` dinámico
+    /// dentro de un bucle reinicializaría el heap en cada vuelta y
+    /// aliasearía arrays entre sí, límite conocido no verificado en
+    /// ningún programa real).
+    dynamic_array_heap_initialized: bool,
+
+    /// Todas las etiquetas de usuario (literales de cadena que prefijan
+    /// una línea, p.ej. `"*9"A=...`) que aparecen en el programa,
+    /// recogidas por `collect_string_labels` antes de generar nada —
+    /// mismo motivo que `data_pool`/`line_numbers`: un `GOTO`/`GOSUB` a
+    /// una etiqueta de cadena CALCULADA en tiempo de ejecución (p.ej.
+    /// `GOTO "*"+INKEY$`, patrón real de invader-v2.bas) necesita conocer
+    /// de antemano el conjunto de etiquetas candidatas que empiezan por
+    /// el mismo prefijo constante, para generar una cascada de
+    /// comparaciones — ver `gen_computed_string_goto`.
+    all_string_labels: Vec<String>,
+}
+
+/// Patrón `USING` ya parseado (ver `parse_using_pattern`): cuántos
+/// dígitos antes/después del punto decimal, y los dos modificadores que
+/// aparecen en el corpus real (`*` de relleno con asteriscos, `+` de
+/// signo forzado).
+#[derive(Debug, Clone, Copy)]
+struct UsingFormat {
+    digits_before: u8,
+    digits_after: u8,
+    asterisk_fill: bool,
+    forced_sign: bool,
 }
 
 /// Metadatos de un array declarado con `DIM`, usados por
@@ -86,6 +170,16 @@ struct ArrayMeta {
     /// si es una constante conocida.
     element_size: usize,
     dims: ArrayDims,
+    /// `DIM A(N)` con `N` una expresión NO constante (p.ej. `DIM B$(R)*1`
+    /// con `R` variable, patrón real de blackjack.bas): la dirección base
+    /// real solo se conoce en tiempo de EJECUCIÓN (se reserva de un heap
+    /// dinámico de tamaño fijo, `__ARRAY_HEAP`, avanzando
+    /// `__ARRAY_HEAP_PTR`), así que `base_addr` de arriba no sirve — este
+    /// campo guarda la dirección del "descriptor" (una variable normal de
+    /// 2 bytes) donde el código generado por `gen_dim` deja la base real
+    /// en tiempo de ejecución. `None` para el caso normal (tamaño
+    /// constante, `base_addr` ya es la dirección real).
+    dynamic_base_descriptor: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,13 +191,13 @@ enum ArrayDims {
 /// Área de datos de usuario en memoria (variables escalares y, más
 /// adelante, el heap de arrays).
 ///
-/// Mapa de memoria real (PC-1500 **con expansión de RAM**, ver
-/// `codegen::system_memory` y el doc de `codegen::lh5801_backend`):
-/// `STANDARD_USER_MEMORY` mapea `0x4000-0x57FF` (6144 bytes), repartido en
-/// ventanas disjuntas: código en `start_address..`
-/// (`Lh5801Backend::start_address`), variables desde `data_base`
-/// (ver [`compile_native_two_pass`]), pila propia desde `0x57FF` hacia
-/// abajo (`Lh5801Backend::stack_top`).
+/// Mapa de memoria real (PC-1500 **con expansión de RAM CE-155**, 8KB,
+/// confirmada contra el manual real — ver `codegen::system_memory` y el
+/// doc de `codegen::lh5801_backend`): `STANDARD_USER_MEMORY` mapea
+/// `0x3800-0x5FFF` (10240 bytes), repartido en ventanas disjuntas: código
+/// en `start_address..` (`Lh5801Backend::start_address`), variables desde
+/// `data_base` (ver [`compile_native_two_pass`]), pila propia desde
+/// `0x5FFF` hacia abajo (`Lh5801Backend::stack_top`).
 ///
 /// Este valor era antes una constante fija (primero `0x5000`, luego
 /// `0x5600` tras un incidente ya documentado en el historial: con
@@ -172,6 +266,11 @@ impl StackCodeGenerator {
             data_pool: Vec::new(),
             data_line_index: HashMap::new(),
             data_base,
+            real_variables: std::collections::HashSet::new(),
+            current_using_format: None,
+            sqr_used: false,
+            dynamic_array_heap_initialized: false,
+            all_string_labels: Vec::new(),
         }
     }
 
@@ -190,6 +289,15 @@ impl StackCodeGenerator {
         // aparece cada DATA (que podría ni ejecutarse nunca, p.ej. si está
         // después de un END o en una rama no tomada).
         self.collect_data_pool(program);
+        self.collect_string_labels(program);
+
+        // Pre-pasada: qué variables escalares son reales (ver el
+        // comentario de `real_variables`) — antes de generar nada, porque
+        // una variable puede leerse (p.ej. en un `PRINT` o una condición)
+        // antes de la línea donde se le asigna por primera vez un valor
+        // real, y `gen_acc_val`/`gen_binary_op` necesitan saberlo desde el
+        // principio para elegir `ApilaIndReal` en vez de `ApilaInd`.
+        self.collect_real_variables(program);
         if !self.data_pool.is_empty() {
             self.emit(StackInstruction::DataPool(self.data_pool.clone()));
             let mut table: Vec<(u16, usize)> = self.data_line_index.iter().map(|(&k, &v)| (k, v)).collect();
@@ -219,7 +327,94 @@ impl StackCodeGenerator {
         // Fin del programa
         self.emit(StackInstruction::Stop);
 
+        // Subrutina compartida de `SQR` (ver `FunctionInner::Sqr`), si
+        // algún punto del programa la usó — emitida una sola vez, después
+        // del `Stop` (nunca se cae en ella por flujo normal, solo se
+        // alcanza vía el `Call` que ya emitió cada punto de llamada).
+        if self.sqr_used {
+            self.gen_sqr_routine();
+        }
+
         self.instructions.clone()
+    }
+
+    /// Cuerpo de `__SQR_ROUTINE`: 15 vueltas de Newton
+    /// (`x = (x + v/x) / 2`) sobre `__SQR_V`/`__SQR_X`, como un bucle real
+    /// en tiempo de ejecución (contador `__SQR_I`) — no desenrollado, para
+    /// no multiplicar el tamaño de código por cada llamada a `SQR` del
+    /// programa (ver el comentario en `FunctionInner::Sqr`). 15 iteraciones
+    /// es holgado: la convergencia de Newton es cuadrática una vez cerca
+    /// de la raíz, y hasta con una estimación inicial mala (`x_0=(v+1)/2`,
+    /// mala para `v` grande) hay margen de sobra dentro de la precisión de
+    /// 12 dígitos BCD del formato real de esta calculadora.
+    fn gen_sqr_routine(&mut self) {
+        let i_addr = self.get_or_create_variable_address("__SQR_I");
+        let v_addr = self.get_or_create_array_address("__SQR_V", 8);
+        let x_addr = self.get_or_create_array_address("__SQR_X", 8);
+
+        let loop_start = self.new_label("SQR_LOOP");
+        let loop_end = self.new_label("SQR_FIN");
+        let zero_case = self.new_label("SQR_ZERO");
+
+        self.emit(StackInstruction::Label("__SQR_ROUTINE".to_string()));
+
+        // Caso especial v=0: Newton nunca alcanza exactamente 0 partiendo
+        // de x_0=(v+1)/2 (para v=0, x_0=0.5, y cada vuelta solo lo divide
+        // a la mitad: x=0.5/2^15 ≈ 0.000015, nunca 0 en un nº finito de
+        // iteraciones) — visible como un residuo pequeño pero no-cero en
+        // `SQR(0)`, confirmado con un test aislado antes de este arreglo.
+        self.emit(StackInstruction::ApilaInt(v_addr as i64));
+        self.emit(StackInstruction::ApilaIndReal);
+        self.emit(StackInstruction::ApilaReal(0.0));
+        self.emit(StackInstruction::IgualReal);
+        self.emit(StackInstruction::IrV(zero_case.clone()));
+
+        // i = 15
+        self.emit(StackInstruction::ApilaInt(i_addr as i64));
+        self.emit(StackInstruction::ApilaInt(15));
+        self.emit(StackInstruction::DesapilaInd);
+
+        self.emit(StackInstruction::Label(loop_start.clone()));
+
+        // if i == 0 goto fin
+        self.emit(StackInstruction::ApilaInt(i_addr as i64));
+        self.emit(StackInstruction::ApilaInd);
+        self.emit(StackInstruction::ApilaInt(0));
+        self.emit(StackInstruction::IgualInt);
+        self.emit(StackInstruction::IrV(loop_end.clone()));
+
+        // x = (x + v/x) / 2
+        self.emit(StackInstruction::ApilaInt(x_addr as i64));
+        self.emit(StackInstruction::ApilaInt(v_addr as i64));
+        self.emit(StackInstruction::ApilaIndReal);
+        self.emit(StackInstruction::ApilaInt(x_addr as i64));
+        self.emit(StackInstruction::ApilaIndReal);
+        self.emit(StackInstruction::DivReal);
+        self.emit(StackInstruction::ApilaInt(x_addr as i64));
+        self.emit(StackInstruction::ApilaIndReal);
+        self.emit(StackInstruction::SumaReal);
+        self.emit(StackInstruction::ApilaReal(2.0));
+        self.emit(StackInstruction::DivReal);
+        self.emit(StackInstruction::DesapilaIndReal);
+
+        // i = i - 1
+        self.emit(StackInstruction::ApilaInt(i_addr as i64));
+        self.emit(StackInstruction::ApilaInt(i_addr as i64));
+        self.emit(StackInstruction::ApilaInd);
+        self.emit(StackInstruction::ApilaInt(1));
+        self.emit(StackInstruction::RestaInt);
+        self.emit(StackInstruction::DesapilaInd);
+
+        self.emit(StackInstruction::IrA(loop_start));
+
+        self.emit(StackInstruction::Label(loop_end));
+        self.emit(StackInstruction::IrInd);
+
+        self.emit(StackInstruction::Label(zero_case));
+        self.emit(StackInstruction::ApilaInt(x_addr as i64));
+        self.emit(StackInstruction::ApilaReal(0.0));
+        self.emit(StackInstruction::DesapilaIndReal);
+        self.emit(StackInstruction::IrInd);
     }
 
     /// Recorre todo el programa (en orden de línea) recogiendo los valores
@@ -250,6 +445,98 @@ impl StackCodeGenerator {
         }
     }
     
+    /// Recoge todas las etiquetas de usuario (`line.label()`) del
+    /// programa en `self.all_string_labels` — ver el comentario del campo.
+    fn collect_string_labels(&mut self, program: &Program) {
+        for line in program.lines() {
+            if let Some(label) = line.label() {
+                self.all_string_labels.push(label.to_string());
+            }
+        }
+    }
+
+    /// Recorre todo el programa (dos veces: ver más abajo) para decidir
+    /// qué variables escalares deben tratarse como reales — ver el
+    /// comentario del campo `real_variables`.
+    ///
+    /// Primero recoge el conjunto de variables usadas alguna vez como
+    /// variable de control de un `FOR` (esas quedan excluidas siempre,
+    /// FOR/NEXT no soporta reales). Luego recorre cada `LET` del programa
+    /// (incluyendo los anidados dentro de un `IF ... THEN <stmt>`) y, si el
+    /// lado derecho es una expresión real (`is_real_expr`) y el destino es
+    /// una variable escalar no excluida, la marca como real.
+    ///
+    /// Esto se repite hasta un punto fijo (ninguna variable nueva marcada
+    /// en una vuelta completa) porque `is_real_expr` de una variable ya
+    /// depende de `real_variables` (para que `X=B` propague la realidad de
+    /// `B` a `X` si `B` ya se marcó real), y el orden de las sentencias en
+    /// el programa no tiene por qué coincidir con el orden en que hace
+    /// falta descubrirlas (p.ej. si la asignación que revela que `B` es
+    /// real aparece en una línea posterior a otra que ya usa `B`). El
+    /// número de variables reales de un programa real es pequeño, así que
+    /// esto converge en pocas vueltas.
+    fn collect_real_variables(&mut self, program: &Program) {
+        let mut for_control_vars = std::collections::HashSet::new();
+        for line in program.lines() {
+            for stmt in line.statements() {
+                self.collect_for_control_vars(stmt, &mut for_control_vars);
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for line in program.lines() {
+                for stmt in line.statements() {
+                    self.collect_real_variables_from_stmt(stmt, &for_control_vars, &mut changed);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn collect_for_control_vars(&self, stmt: &Statement, out: &mut std::collections::HashSet<String>) {
+        match &stmt.inner {
+            StatementInner::For { assignment, .. } => {
+                if let LValueInner::Identifier(id) = &assignment.lvalue().inner {
+                    out.insert(id.to_string());
+                }
+            }
+            StatementInner::If { then_stmt, .. } => self.collect_for_control_vars(then_stmt, out),
+            _ => {}
+        }
+    }
+
+    fn collect_real_variables_from_stmt(
+        &mut self,
+        stmt: &Statement,
+        for_control_vars: &std::collections::HashSet<String>,
+        changed: &mut bool,
+    ) {
+        match &stmt.inner {
+            StatementInner::Let { inner, .. } => {
+                for assignment in inner.assignments() {
+                    if let LValueInner::Identifier(id) = &assignment.lvalue().inner {
+                        let name = id.to_string();
+                        if !id.has_dollar()
+                            && !for_control_vars.contains(&name)
+                            && !self.real_variables.contains(&name)
+                            && self.is_real_expr(assignment.expr())
+                        {
+                            self.real_variables.insert(name);
+                            *changed = true;
+                        }
+                    }
+                }
+            }
+            StatementInner::If { then_stmt, .. } => {
+                self.collect_real_variables_from_stmt(then_stmt, for_control_vars, changed);
+            }
+            _ => {}
+        }
+    }
+
     /// Generar código para una línea de código
     /// Cada CodeLine tiene un número de línea y opcionalmente una etiqueta de usuario
     fn gen_code_line(&mut self, line: &CodeLine) {
@@ -285,7 +572,7 @@ impl StackCodeGenerator {
             StatementInner::Pause { inner } => self.gen_pause(inner),
             StatementInner::LPrint { inner } => self.gen_lprint(inner),
             StatementInner::Input { input_exprs } => self.gen_input(input_exprs),
-            StatementInner::Using { using_clause } => self.gen_using(using_clause),
+            StatementInner::Using { using_clause } => self.apply_using_clause(using_clause),
             
             // === CONTROL DE FLUJO ===
             StatementInner::If { condition, then_stmt, .. } => 
@@ -389,6 +676,20 @@ impl StackCodeGenerator {
             self.gen_expression(expr);
             self.gen_acc_val(expr);
 
+            // Si el destino es una variable marcada real
+            // (`collect_real_variables`) pero la expresión del lado
+            // derecho no lo es (p.ej. `B=0` tras haber marcado `B` real
+            // por `B=B+.5` en otra línea), promocionar aquí el valor de 1
+            // byte recién apilado a 8 bytes — sin esto, `gen_store_to_lvalue`
+            // emitiría `DesapilaIndReal` (que hace pop de 8 bytes de valor)
+            // sobre un valor de 1 byte, robando 7 bytes de la pila que no
+            // le pertenecen (mismo patrón de fuga que motivó
+            // `DesapilaIndReal` en primer lugar, aquí en el lado de la
+            // promoción de tipo en vez del formato de la operación).
+            if self.is_real_lvalue(lvalue) && !self.is_real_expr(expr) {
+                self.emit(StackInstruction::Int2Real);
+            }
+
             // Almacenar: desapila valor, desapila dirección, guarda
             self.gen_store_to_lvalue(lvalue);
         }
@@ -407,13 +708,40 @@ impl StackCodeGenerator {
                     self.gen_acc_val(expr);
                     if self.is_string_expr(expr) {
                         self.emit(StackInstruction::SystemOutString);
+                    } else if let Some(fmt) = self.current_using_format {
+                        // PRINT USING activo: el valor tiene que estar en
+                        // la pila como real de 8 bytes (mismo criterio de
+                        // promoción que gen_binary_op/gen_let) antes de
+                        // formatearlo con ancho fijo.
+                        if !self.is_real_expr(expr) {
+                            self.emit(StackInstruction::Int2Real);
+                        }
+                        let buf_len = 1 // signo
+                            + fmt.digits_before as usize
+                            + if fmt.digits_after > 0 { 1 + fmt.digits_after as usize } else { 0 }
+                            + 1; // NUL
+                        let buf = self.get_or_create_array_address("__USING_BUF", buf_len);
+                        self.emit(StackInstruction::PrintUsingReal(
+                            fmt.digits_before, fmt.digits_after, fmt.asterisk_fill, fmt.forced_sign, buf,
+                        ));
+                    } else if self.is_real_expr(expr) {
+                        // Sin USING activo: variable/expresión real
+                        // impresa "a pelo". Antes esto caía en
+                        // SystemOutInt (que solo consume 1 byte de los 8
+                        // que empuja una variable real), perdiendo 7
+                        // bytes de pila en cada PRINT — confirmado contra
+                        // la ROM real investigando USING. Formato ancho
+                        // fijo generoso (7 enteros + 6 decimales) con
+                        // recorte de ceros/espacios sobrantes al imprimir
+                        // — ver PrintRealNatural en el backend.
+                        let buf = self.get_or_create_array_address("__PRINT_REAL_BUF", 16);
+                        self.emit(StackInstruction::PrintRealNatural(buf));
                     } else {
                         self.emit(StackInstruction::SystemOutInt);
                     }
                 }
-                crate::parse::statement::printable::Printable::UsingClause(_using) => {
-                    // TODO: Implementar soporte para USING clause
-                    self.emit_comment("USING clause no soportado aún");
+                crate::parse::statement::printable::Printable::UsingClause(using) => {
+                    self.apply_using_clause(using);
                 }
             }
 
@@ -502,10 +830,13 @@ impl StackCodeGenerator {
 
         match self.static_goto_label(target) {
             Some(label) => self.emit(StackInstruction::IrA(label)),
-            None => {
-                self.gen_dynamic_line_number(target);
-                self.emit(StackInstruction::IrIndirect);
-            }
+            None => match self.computed_string_goto_prefix(target) {
+                Some((prefix, suffix)) => self.gen_computed_string_goto(&prefix, suffix, false),
+                None => {
+                    self.gen_dynamic_line_number(target);
+                    self.emit(StackInstruction::IrIndirect);
+                }
+            },
         }
     }
 
@@ -518,10 +849,13 @@ impl StackCodeGenerator {
 
         match self.static_goto_label(target) {
             Some(label) => self.emit(StackInstruction::Call(label)),
-            None => {
-                self.gen_dynamic_line_number(target);
-                self.emit(StackInstruction::CallIndirect);
-            }
+            None => match self.computed_string_goto_prefix(target) {
+                Some((prefix, suffix)) => self.gen_computed_string_goto(&prefix, suffix, true),
+                None => {
+                    self.gen_dynamic_line_number(target);
+                    self.emit(StackInstruction::CallIndirect);
+                }
+            },
         }
     }
 
@@ -537,6 +871,93 @@ impl StackCodeGenerator {
             ExprInner::StringLiteral { value, .. } => Some(value.clone()),
             ExprInner::Parentheses(inner) => self.static_goto_label(inner),
             _ => None,
+        }
+    }
+
+    /// Reconoce el patrón `<literal de cadena> + <expresión>` (en ese
+    /// orden) — devuelve `(prefijo, &expresión)` si `target` tiene esa
+    /// forma. Patrón real de invader-v2.bas: `GOTO "*"+INKEY$`, donde el
+    /// conjunto de etiquetas posibles (`"*9"`, `"*="`, `"*"`, `"* "`, cada
+    /// una definida en alguna línea del programa) comparte el prefijo
+    /// constante `"*"` — ver `gen_computed_string_goto`.
+    fn computed_string_goto_prefix<'e>(&self, target: &'e Expr) -> Option<(String, &'e Expr)> {
+        match target.inner() {
+            ExprInner::Parentheses(inner) => self.computed_string_goto_prefix(inner),
+            ExprInner::Binary(left, BinaryOp::Add, right) => {
+                if let ExprInner::StringLiteral { value, .. } = left.inner() {
+                    Some((value.clone(), right.as_ref()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `GOTO`/`GOSUB` a una etiqueta de cadena CALCULADA en tiempo de
+    /// ejecución con un prefijo constante conocido (ver
+    /// `computed_string_goto_prefix`). Sin ninguna instrucción de salto
+    /// "por nombre calculado" real en el backend (ni la necesita: el
+    /// conjunto de etiquetas posibles es siempre pequeño y enumerable en
+    /// tiempo de COMPILACIÓN, buscando en `self.all_string_labels` cuáles
+    /// empiezan por el prefijo), esto se resuelve como una cascada de
+    /// comparaciones: para cada etiqueta candidata, compara el sufijo
+    /// dinámico contra el sufijo literal de esa etiqueta concreta
+    /// (`IgualCadena`, ya verificado por `IF A$=B$`) y salta/llama si
+    /// coincide. Si ninguna candidata coincide en tiempo de ejecución
+    /// (valor inesperado), el flujo sigue normalmente tras la última
+    /// comprobación — comportamiento indefinido ante un valor sin
+    /// etiqueta correspondiente, igual que ya asume el resto del backend
+    /// para GOTO/GOSUB calculado (ver `gen_dynamic_line_number`).
+    fn gen_computed_string_goto(&mut self, prefix: &str, suffix_expr: &Expr, is_call: bool) {
+        self.emit_comment(&format!(
+            "{} calculado con prefijo {:?}",
+            if is_call { "GOSUB" } else { "GOTO" },
+            prefix
+        ));
+
+        let mut candidates: Vec<String> = self
+            .all_string_labels
+            .iter()
+            .filter(|label| label.starts_with(prefix))
+            .cloned()
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+
+        if candidates.is_empty() {
+            eprintln!(
+                "WARNING: {} a etiqueta de cadena calculada con prefijo {:?}, pero ninguna etiqueta del programa empieza por ese prefijo: ignorado",
+                if is_call { "GOSUB" } else { "GOTO" },
+                prefix
+            );
+            self.emit_comment("Sin etiquetas candidatas: ignorado");
+            return;
+        }
+
+        let done_label = self.new_label("COMPUTED_GOTO_FIN");
+
+        for candidate in &candidates {
+            let suffix_literal = candidate[prefix.len()..].to_string();
+
+            self.gen_expression(suffix_expr);
+            self.gen_acc_val(suffix_expr);
+            self.emit(StackInstruction::ApilaCadena(suffix_literal));
+            self.emit(StackInstruction::IgualCadena);
+
+            if is_call {
+                let skip_label = self.new_label("COMPUTED_GOSUB_SKIP");
+                self.emit(StackInstruction::IrF(skip_label.clone()));
+                self.emit(StackInstruction::Call(candidate.clone()));
+                self.emit(StackInstruction::IrA(done_label.clone()));
+                self.emit(StackInstruction::Label(skip_label));
+            } else {
+                self.emit(StackInstruction::IrV(candidate.clone()));
+            }
+        }
+
+        if is_call {
+            self.emit(StackInstruction::Label(done_label));
         }
     }
 
@@ -811,17 +1232,94 @@ impl StackCodeGenerator {
                         Some(n) if n >= 0 => {
                             // DIM A(N) declara índices 0..=N -> N+1 elementos.
                             let element_count = n as usize + 1;
-                            let element_size = self.array_element_size(string_length);
+                            let element_size = self.array_element_size(string_length, identifier.has_dollar());
                             let name = identifier.to_string();
                             let base_addr = self.get_or_create_array_address(&name, element_count * element_size);
                             self.array_metadata.insert(name, ArrayMeta {
                                 base_addr,
                                 element_size,
                                 dims: ArrayDims::OneD { len: element_count },
+                                dynamic_base_descriptor: None,
                             });
                         }
                         _ => {
-                            self.emit_comment("DIM con tamaño dinámico (no constante): no soportado todavía, no se reserva espacio real");
+                            // `DIM A(N)` con `N` no constante en tiempo de
+                            // compilación (p.ej. `DIM B$(R)*1` con `R`
+                            // variable, patrón real de blackjack.bas): la
+                            // cuenta de elementos (y por tanto la dirección
+                            // base) solo se conoce en tiempo de EJECUCIÓN.
+                            // `array_element_size` sigue siendo constante
+                            // (viene del `*N` de DIM, no de esto), así que
+                            // solo hace falta reservar la base
+                            // dinámicamente — de un heap fijo dedicado
+                            // (`__ARRAY_HEAP`), avanzando un puntero
+                            // (`__ARRAY_HEAP_PTR`) en tiempo de ejecución,
+                            // y guardando la base resultante de ESTE array
+                            // en su propio "descriptor" de 2 bytes
+                            // (`__DIM_BASE_<nombre>`). `gen_lvalue_address`
+                            // sabe leer esa base en tiempo de ejecución en
+                            // vez de asumir un literal de compilación (ver
+                            // `ArrayMeta::dynamic_base_descriptor`).
+                            //
+                            // Alcance deliberadamente acotado a 1D: el
+                            // único caso 2D del corpus (`DIM A(Z,Z)` en
+                            // jeu-des-blocs.bas) necesitaría ADEMÁS un
+                            // nº de columnas dinámico releído en cada
+                            // acceso indexado (hoy siempre una constante
+                            // de compilación) — no soportado, cae al
+                            // límite ya documentado en el caso 2D de abajo.
+                            let element_size = self.array_element_size(string_length, identifier.has_dollar());
+                            let name = identifier.to_string();
+
+                            const DYNAMIC_ARRAY_HEAP_SIZE: usize = 512;
+                            let heap_ptr_addr = self.get_or_create_variable_address("__ARRAY_HEAP_PTR");
+                            let heap_base_addr =
+                                self.get_or_create_array_address("__ARRAY_HEAP", DYNAMIC_ARRAY_HEAP_SIZE);
+                            let descriptor_addr =
+                                self.get_or_create_variable_address(&format!("__DIM_BASE_{}", name));
+
+                            if !self.dynamic_array_heap_initialized {
+                                self.dynamic_array_heap_initialized = true;
+                                self.emit_comment("Inicializar heap de arrays con DIM dinámico (una sola vez)");
+                                self.emit(StackInstruction::ApilaInt(heap_ptr_addr as i64));
+                                self.emit(StackInstruction::ApilaInt(heap_base_addr as i64));
+                                self.emit(StackInstruction::DesapilaIndWord);
+                            }
+
+                            self.emit_comment(&format!(
+                                "DIM dinámico: reservar {} en __ARRAY_HEAP",
+                                name
+                            ));
+
+                            // descriptor(name) = __ARRAY_HEAP_PTR actual (base de este array).
+                            self.emit(StackInstruction::ApilaInt(descriptor_addr as i64));
+                            self.emit(StackInstruction::ApilaInt(heap_ptr_addr as i64));
+                            self.emit(StackInstruction::ApilaIndWord);
+                            self.emit(StackInstruction::DesapilaIndWord);
+
+                            // __ARRAY_HEAP_PTR += (size_expr + 1) * element_size.
+                            // SumaIntWord espera [base(16 bits), offset(8
+                            // bits)] en ese orden en la pila — la dirección
+                            // de destino para el DesapilaIndWord final se
+                            // apila ANTES de todo lo demás (modelo Tiny).
+                            self.emit(StackInstruction::ApilaInt(heap_ptr_addr as i64));
+                            self.emit(StackInstruction::ApilaInt(heap_ptr_addr as i64));
+                            self.emit(StackInstruction::ApilaIndWord);
+                            self.gen_expression(size);
+                            self.gen_acc_val(size);
+                            self.emit(StackInstruction::ApilaInt(1));
+                            self.emit(StackInstruction::SumaInt);
+                            self.emit(StackInstruction::ApilaInt(element_size as i64));
+                            self.emit(StackInstruction::MulInt);
+                            self.emit(StackInstruction::SumaIntWord);
+                            self.emit(StackInstruction::DesapilaIndWord);
+
+                            self.array_metadata.insert(name, ArrayMeta {
+                                base_addr: 0,
+                                element_size,
+                                dims: ArrayDims::OneD { len: 0 },
+                                dynamic_base_descriptor: Some(descriptor_addr),
+                            });
                         }
                     }
                 }
@@ -836,7 +1334,7 @@ impl StackCodeGenerator {
                             // DIM A(R,C) declara índices 0..=R, 0..=C.
                             let row_count = r as usize + 1;
                             let col_count = c as usize + 1;
-                            let element_size = self.array_element_size(string_length);
+                            let element_size = self.array_element_size(string_length, identifier.has_dollar());
                             let name = identifier.to_string();
                             let base_addr = self.get_or_create_array_address(
                                 &name,
@@ -846,6 +1344,7 @@ impl StackCodeGenerator {
                                 base_addr,
                                 element_size,
                                 dims: ArrayDims::TwoD { rows: row_count, cols: col_count },
+                                dynamic_base_descriptor: None,
                             });
                         }
                         _ => {
@@ -861,12 +1360,29 @@ impl StackCodeGenerator {
     /// constante conocida) para arrays de cadena, o 1 byte para arrays
     /// numéricos — el único ancho que el resto del backend maneja de
     /// forma fiable hoy vía `ApilaInd`/`DesapilaInd`.
-    fn array_element_size(&self, string_length: &Option<Expr>) -> usize {
+    ///
+    /// Para un array de CADENA sin `*N` explícito (`DIM A$(7)`, patrón
+    /// real de decathlon.bas/monstres&merveilles.bas), el valor por
+    /// defecto NO puede ser 1 byte (el mismo que para un array numérico):
+    /// ni siquiera cabe una cadena vacía (necesita al menos el NUL
+    /// terminador), y un elemento de 1 byte hace que
+    /// `is_direct_string_buffer` (que exige `element_size > 2`) trate el
+    /// array como de ancho NO fijo — cada elemento pasaría a guardar un
+    /// PUNTERO de 16 bits (`DesapilaIndWord`) en un hueco de solo 1 byte,
+    /// pisando el primer byte del elemento siguiente en cada asignación
+    /// (bug de solapamiento, distinto pero relacionado con el aliasing de
+    /// buffer compartido ya arreglado para variables escalares). Se usa
+    /// el mismo tamaño por defecto que una variable de cadena escalar
+    /// (`DEFAULT_STRING_MAX_LEN+1`, dueña de su propio buffer con copia de
+    /// contenido) para que `A$(i)` reciba exactamente el mismo tratamiento
+    /// ya verificado, en vez de inventar un tercer caso.
+    fn array_element_size(&self, string_length: &Option<Expr>, is_string_array: bool) -> usize {
+        let default = if is_string_array { DEFAULT_STRING_MAX_LEN + 1 } else { 1 };
         string_length
             .as_ref()
             .and_then(|e| self.const_eval_int(e))
             .filter(|&n| n > 0)
-            .map_or(1, |n| n as usize)
+            .map_or(default, |n| n as usize)
     }
     
     /// Generar código para READ
@@ -977,13 +1493,25 @@ impl StackCodeGenerator {
     
     fn gen_wait(&mut self, expr: &Option<Expr>) {
         self.emit_comment("WAIT");
-        if let Some(e) = expr {
-            self.gen_expression(e);
-            self.gen_acc_val(e);
-        } else {
-            self.emit(StackInstruction::ApilaInt(0));
+        match expr {
+            Some(e) => {
+                self.gen_expression(e);
+                self.gen_acc_val(e);
+                self.emit(StackInstruction::Wait);
+            }
+            None => {
+                // `WAIT` sin argumento, en BASIC Sharp real, no es un
+                // retardo de duración cero: bloquea indefinidamente
+                // hasta que se pulsa cualquier tecla — semántica
+                // completamente distinta de `WAIT n` (retardo
+                // cronometrado real vía TIME_DELAY). Encontrado
+                // compilando bombing.bas (línea 310: `WAIT :USING
+                // :PRINT "*** SCORE *** :";W`, tras el choque —
+                // claramente pensado para pausar hasta que el jugador
+                // reaccione antes de ver la puntuación final).
+                self.emit(StackInstruction::WaitForKey);
+            }
         }
-        self.emit(StackInstruction::Wait);
     }
     
     fn gen_random(&mut self) {
@@ -1046,9 +1574,75 @@ impl StackCodeGenerator {
         self.emit(StackInstruction::LPrint);
     }
     
-    fn gen_using(&mut self, _using_clause: &UsingClause) {
-        self.emit_comment("USING");
-        self.emit(StackInstruction::Using);
+    /// `USING <patrón>` (sentencia suelta) y `PRINT USING <patrón>;...`
+    /// (dentro de un `PRINT`, ver `gen_print`) comparten exactamente esta
+    /// lógica: actualizar `self.current_using_format`, que es lo único
+    /// que existe de "USING" en este compilador — no hay ninguna
+    /// instrucción de pila para ello, porque el patrón siempre se conoce
+    /// en tiempo de compilación (ver el comentario del campo). `USING`
+    /// sin argumento (`format` es `None`) reinicia a formato decimal
+    /// simple — igual que en BASIC real.
+    fn apply_using_clause(&mut self, using_clause: &UsingClause) {
+        match using_clause.format() {
+            None => {
+                self.current_using_format = None;
+            }
+            Some(expr) => match expr.inner() {
+                ExprInner::StringLiteral { value, .. } => {
+                    match Self::parse_using_pattern(value) {
+                        Some(fmt) => self.current_using_format = Some(fmt),
+                        None => {
+                            eprintln!("WARNING: patrón USING \"{value}\" no reconocido: se ignora (formato decimal simple)");
+                            self.current_using_format = None;
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("WARNING: USING con patrón no literal ({}) no soportado todavía: se ignora", expr.show(false));
+                    self.current_using_format = None;
+                }
+            },
+        }
+    }
+
+    /// Parsea un patrón `USING` real (ver los patrones que de verdad
+    /// aparecen en el corpus: `"####"`, `"###.##"`, `"*####"`,
+    /// `"*+###"`, `"+####.##"`) a `UsingFormat`. Núcleo reducido:
+    /// `[*][+]#+[.#+]` — un `*` opcional (relleno con asteriscos en vez
+    /// de espacios), un `+` opcional (signo siempre visible), una tanda
+    /// de `#` (dígitos enteros), y opcionalmente un `.` seguido de otra
+    /// tanda de `#` (dígitos decimales). Cualquier otra cosa (separador
+    /// de miles `,`, `$$`, `**`, patrón vacío) no está soportada y
+    /// devuelve `None` — el llamador cae a formato decimal simple con un
+    /// aviso, en vez de generar código incorrecto.
+    fn parse_using_pattern(pattern: &str) -> Option<UsingFormat> {
+        let mut chars = pattern.chars().peekable();
+
+        let asterisk_fill = chars.next_if_eq(&'*').is_some();
+        let forced_sign = chars.next_if_eq(&'+').is_some();
+
+        let mut digits_before = 0u8;
+        while chars.next_if_eq(&'#').is_some() {
+            digits_before += 1;
+        }
+        if digits_before == 0 {
+            return None;
+        }
+
+        let mut digits_after = 0u8;
+        if chars.next_if_eq(&'.').is_some() {
+            while chars.next_if_eq(&'#').is_some() {
+                digits_after += 1;
+            }
+        }
+
+        if chars.next().is_some() {
+            // Sobra algo tras el último '#' reconocido (separador de
+            // miles, '$$', '**', etc.) — patrón no soportado.
+            return None;
+        }
+
+        Some(UsingFormat { digits_before, digits_after, asterisk_fill, forced_sign })
     }
     
     fn gen_lf(&mut self, expr: &Expr) {
@@ -1077,10 +1671,32 @@ impl StackCodeGenerator {
             if self.is_string_expr(expr) {
                 match self.gprint_string_length(expr) {
                     Some(len) => self.emit(StackInstruction::GPrintString(len)),
-                    None => self.emit_comment(
-                        "GPRINT de cadena con longitud no determinable en tiempo de \
-                         compilación (p.ej. variable escalar): no soportado todavía",
-                    ),
+                    None => {
+                        // `gen_expression`+`gen_acc_val` ya empujaron el
+                        // puntero (16 bits) de la cadena — si no sabemos
+                        // su longitud en tiempo de compilación, no
+                        // dejarlo ahí sin más: eso filtra 2 bytes en la
+                        // pila software por cada llamada. Bug real
+                        // encontrado compilando bombing.bas: `GPRINT
+                        // MID$ (A$,RND 5*2-1,2)` (perfil de ciudad, 100
+                        // veces por partida) caía justo aquí — la
+                        // ciudad nunca se dibujaba (ningún GPRINT real
+                        // se emitía) Y además desincronizaba la pila
+                        // para el resto del programa. Arreglado en dos
+                        // frentes: `gprint_string_length` ahora sí
+                        // reconoce `MID$`/`LEFT$`/`RIGHT$` cuando su
+                        // longitud es una constante (el caso real de
+                        // bombing.bas), y este `None` — que debería ser
+                        // un caso ya raro tras ese fix — al menos
+                        // descarta el puntero en vez de dejarlo fugado.
+                        self.emit_comment(
+                            "GPRINT de cadena con longitud no determinable en tiempo de \
+                             compilación (p.ej. variable escalar): no soportado todavía — \
+                             descartando el puntero ya empujado para no desbalancear la pila",
+                        );
+                        self.emit(StackInstruction::Desapila);
+                        self.emit(StackInstruction::Desapila);
+                    }
                 }
             } else {
                 self.emit(StackInstruction::GPrint);
@@ -1098,11 +1714,17 @@ impl StackCodeGenerator {
     /// `GPRINT` (necesita saber cuántos bytes iterar en el buffer): un
     /// literal usa su propia longitud; un elemento de array de cadena de
     /// ancho fijo (`DIM A$(N)*M`) usa `element_size` de
-    /// `array_metadata`. Variables de cadena escalares (puntero a un
-    /// buffer NUL-terminado de longitud dinámica) no están soportadas —
-    /// ninguno de los programas objetivo usa `GPRINT` sobre una variable
-    /// de cadena escalar, solo sobre literales y arrays de ancho fijo
-    /// (ver bathyscaph.bas: `GPRINT A$(0)` / `GPRINT "141C"`).
+    /// `array_metadata`; `MID$`/`LEFT$`/`RIGHT$` usan su propio
+    /// argumento de longitud cuando es una constante evaluable en
+    /// tiempo de compilación (el patrón real de bombing.bas: `GPRINT
+    /// MID$ (A$,RND 5*2-1,2)` — la POSICIÓN de inicio es dinámica, pero
+    /// la LONGITUD, "2", es un literal, así que sí se puede saber de
+    /// antemano cuántos bytes leerá GPRINT aunque no sepamos de qué
+    /// posición). Variables de cadena escalares (puntero a un buffer
+    /// NUL-terminado de longitud dinámica) no están soportadas — ningún
+    /// programa objetivo usa `GPRINT` sobre una variable de cadena
+    /// escalar, solo sobre literales, arrays de ancho fijo y
+    /// MID$/LEFT$/RIGHT$ con longitud constante.
     fn gprint_string_length(&self, expr: &Expr) -> Option<usize> {
         match expr.inner() {
             ExprInner::Parentheses(inner) => self.gprint_string_length(inner),
@@ -1112,6 +1734,15 @@ impl StackCodeGenerator {
                 | LValueInner::Array2DAccess { identifier, .. } => {
                     self.array_metadata.get(&identifier.to_string()).map(|m| m.element_size)
                 }
+                _ => None,
+            },
+            ExprInner::FunctionCall(func) => match &func.inner {
+                FunctionInner::Mid { length, .. }
+                | FunctionInner::Left { length, .. }
+                | FunctionInner::Right { length, .. } => self
+                    .const_eval_int(length)
+                    .filter(|&n| n >= 0)
+                    .map(|n| n as usize),
                 _ => None,
             },
             _ => None,
@@ -1238,62 +1869,119 @@ impl StackCodeGenerator {
     // MEMORIA (POKE, CALL)
     // =========================================================================
     
+    /// `POKE dirección, v1, v2, ..., vN`: escribe `v1` en `dirección`, `v2`
+    /// en `dirección+1`, ..., `vN` en `dirección+N-1` — la forma
+    /// multi-valor real de Sharp BASIC, usada para embeber bloques de
+    /// código máquina (ver invader.bas: `POKE &7050,&58,&76,&5A,...` con
+    /// hasta 17 valores en una sola sentencia). Antes esto solo escribía
+    /// `v1` e ignoraba silenciosamente `v2..vN` — cualquier programa con
+    /// más de un valor por `POKE` perdía casi todos sus bytes sin ningún
+    /// aviso ni error (el propio invader.bas: de los 17-18 bytes por
+    /// línea, solo el primero llegaba a escribirse).
     fn gen_poke(&mut self, memory_area: &MemoryArea, exprs: &[Expr]) {
         self.emit_comment(&format!("POKE {:?}", memory_area));
 
-        // La dirección en POKE es absoluta, no relativa a una base
-        // POKE dirección, valor: apilar dirección, apilar valor, ejecutar poke
+        // La dirección en POKE es absoluta, no relativa a una base.
         // La diferencia entre Me0 y Me1 (POKE vs POKE#) es solo semántica
         // en la ROM real (memoria normal vs espacio de E/S) — ninguna
         // dirección de sistema que nos interesa vive en espacio de E/S,
         // así que ambas se tratan igual aquí (escritura directa a
         // memoria absoluta).
 
-        if exprs.len() >= 2 {
-            // Primera expresión: dirección absoluta. Siempre de 16 bits
-            // (una dirección de memoria nunca cabe en 1 byte) — un
-            // literal constante se apila con ApilaIntWord (nunca
-            // ApilaInt, que elegiría 1 byte para valores <=255 y
-            // descuadraría la pila). Dirección dinámica (variable, no
-            // constante) no soportada todavía, documentado como límite
-            // conocido (igual que RESTORE con línea calculada).
-            match self.const_eval_int(&exprs[0]) {
-                Some(n) if (0..=0xFFFF).contains(&n) => {
-                    self.emit(StackInstruction::ApilaIntWord(n));
-                }
-                _ => {
-                    self.emit_comment(
-                        "POKE con dirección dinámica (no constante): no soportado todavía \
-                         (necesitaría aritmética de 16 bits en tiempo de ejecución)",
-                    );
-                    self.gen_expression(&exprs[0]);
-                    self.gen_acc_val(&exprs[0]);
-                }
-            }
-
-            // Segunda expresión: valor a escribir (1 byte).
-            self.gen_expression(&exprs[1]);
-            self.gen_acc_val(&exprs[1]);
-
-            self.emit(StackInstruction::Poke);
-        } else {
+        if exprs.len() < 2 {
             // Si hay menos de 2 expresiones, es un error de sintaxis
             // pero generamos algo para no romper
             self.emit_comment("ERROR: POKE requiere dirección y valor");
+            return;
+        }
+
+        let values = &exprs[1..];
+
+        // Dirección base: siempre de 16 bits (una dirección de memoria
+        // nunca cabe en 1 byte). Con múltiples valores, cada uno necesita
+        // su propia dirección (base+i) conocida en tiempo de compilación
+        // para poder generarla como literal — así que, a diferencia del
+        // caso de un solo valor, aquí una dirección dinámica (variable,
+        // no constante) con MÁS de un valor no está soportada (solo se
+        // escribiría el primero, documentado como límite conocido, igual
+        // que RESTORE con línea calculada); con un único valor sí se
+        // soporta la dirección dinámica como antes.
+        match self.const_eval_int(&exprs[0]) {
+            Some(base) if (0..=0xFFFF).contains(&base) => {
+                for (i, value) in values.iter().enumerate() {
+                    let addr = base + i as i64;
+                    if addr > 0xFFFF {
+                        self.emit_comment("POKE: dirección se salió de 16 bits, resto ignorado");
+                        break;
+                    }
+                    self.emit(StackInstruction::ApilaIntWord(addr));
+                    self.gen_expression(value);
+                    self.gen_acc_val(value);
+                    self.emit(StackInstruction::Poke);
+                }
+            }
+            _ => {
+                if values.len() > 1 {
+                    eprintln!(
+                        "WARNING: POKE con dirección dinámica y {} valores: solo se escribirá el primero",
+                        values.len()
+                    );
+                }
+                self.emit_comment(
+                    "POKE con dirección dinámica (no constante): no soportado todavía \
+                     (necesitaría aritmética de 16 bits en tiempo de ejecución)",
+                );
+                self.gen_expression(&exprs[0]);
+                self.gen_acc_val(&exprs[0]);
+                self.gen_expression(&values[0]);
+                self.gen_acc_val(&values[0]);
+                self.emit(StackInstruction::Poke);
+            }
         }
     }
     
+    /// `CALL <dirección>`: invoca código máquina POKEado en RAM por el
+    /// propio programa BASIC (patrón real de la época — el hueco de
+    /// rendimiento de la interpretación se sorteaba escribiendo rutinas a
+    /// mano en ensamblador y llamándolas desde BASIC; ver invader.bas,
+    /// `POKE &7050,...` seguido de `CALL &7050`).
+    ///
+    /// En la inmensa mayoría de programas reales `<dirección>` es un
+    /// literal (decimal o hex `&XXXX`) conocido en tiempo de compilación
+    /// — se resuelve con `const_eval_int` (que ya reconoce ambos formatos)
+    /// y se emite un `SJP` directo a esa dirección, sin pasar por el
+    /// sistema de etiquetas. Antes de esto, CUALQUIER `CALL` (sin importar
+    /// la dirección) emitía `Call("MACHINE_CODE")`, una etiqueta que nunca
+    /// se definía en ningún sitio (panic "Undefined label" en cuanto un
+    /// programa usaba `CALL`) y que, aunque se hubiera definido, habría
+    /// mandado todos los `CALL &X` del programa a la MISMA dirección.
+    ///
+    /// Una dirección genuinamente dinámica (`CALL X`, `X` variable) NO
+    /// está soportada todavía — necesitaría un salto indirecto real (el
+    /// LH5801 no tiene "SJP (registro)", solo SJP a dirección inmediata;
+    /// haría falta código automodificable o una tabla), nunca visto en el
+    /// corpus real. Se documenta como límite conocido en vez de generar
+    /// código roto: no se evalúa la expresión (evita descuadrar la pila
+    /// con un push que nadie consumiría) y se avisa por stderr.
     fn gen_call(&mut self, expr: &Expr, variable: &Option<LValue>) {
         self.emit_comment(&format!("CALL {}", expr.show(false)));
-        self.gen_expression(expr);
-        self.gen_acc_val(expr);
-        
-        // Si hay variable de retorno, generar asignación después
+
         if let Some(_var) = variable {
-            self.emit_comment("CALL with return variable");
+            self.emit_comment("CALL with return variable: no soportado (nunca visto en el corpus real)");
         }
-        
-        self.emit(StackInstruction::Call("MACHINE_CODE".to_string()));
+
+        match self.const_eval_int(expr) {
+            Some(addr) => {
+                self.emit(StackInstruction::CallAddr(addr as u16));
+            }
+            None => {
+                eprintln!(
+                    "WARNING: CALL a una dirección no constante ({}) no soportado todavía: ignorado",
+                    expr.show(false)
+                );
+                self.emit_comment("CALL con dirección dinámica: no soportado, ignorado");
+            }
+        }
     }
     
     // =========================================================================
@@ -1403,15 +2091,32 @@ impl StackCodeGenerator {
     
     /// Generar código para operaciones binarias
     fn gen_binary_op(&mut self, left: &Expr, op: &BinaryOp, right: &Expr) {
-        // Para las operaciones aritméticas (no comparaciones/lógicas, que
-        // bathyscaph.bas nunca usa sobre reales), un operando "real" es
-        // contagioso: si CUALQUIERA de los dos lados contiene un literal
-        // decimal (ver `is_real_expr`), toda la operación pasa a BCD real
+        // Para las operaciones aritméticas y de comparación (no las
+        // lógicas AND/OR, fuera de alcance para reales — ver el
+        // comentario de `real_variables`), un operando "real" es
+        // contagioso: si CUALQUIERA de los dos lados es una expresión real
+        // (`is_real_expr` — literal decimal, o una variable marcada real
+        // por `collect_real_variables`), toda la operación pasa a BCD real
         // — el otro lado, si era entero, se promociona con `Int2Real`
         // justo después de evaluarlo (mismo patrón que `ApilaInt` vs
-        // `ApilaReal` para un literal suelto).
-        let is_real = matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div)
-            && (self.is_real_expr(left) || self.is_real_expr(right));
+        // `ApilaReal` para un literal suelto). Las comparaciones necesitan
+        // esto igual que la aritmética desde que una variable puede quedar
+        // marcada real (p.ej. `B=B+.5` en una línea, `IF B>0` en otra):
+        // antes de eso ningún programa del corpus comparaba un real de
+        // verdad, así que esta rama nunca se ejercía.
+        let is_real = matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        ) && (self.is_real_expr(left) || self.is_real_expr(right));
 
         // Generar código para ambos operandos
         self.gen_expression(left);
@@ -1428,7 +2133,18 @@ impl StackCodeGenerator {
         match op {
             // Operaciones aritméticas
             BinaryOp::Add => {
-                if is_real {
+                // Concatenación de cadenas (`A$+B$`): antes `+` sobre
+                // cadenas caía siempre en `SumaInt`, sumando como enteros
+                // de 8 bits dos punteros de 16 bits — corrompía la pila en
+                // cualquier concatenación (confirmado contra la ROM real:
+                // `A$="X":B$=A$+"Y"` dejaba S un byte por debajo de
+                // stack_top). Mismo chequeo que ya usan `Eq`/`Neq` más
+                // abajo para elegir comparación de cadenas.
+                if self.is_string_expr(left) || self.is_string_expr(right) {
+                    let buf = self.get_or_create_array_address("__CONCAT_BUF", 2 * DEFAULT_STRING_MAX_LEN + 1);
+                    let right_scratch = self.get_or_create_array_address("__CONCAT_RIGHT_PTR", 2);
+                    self.emit(StackInstruction::ConcatString(DEFAULT_STRING_MAX_LEN, buf, right_scratch));
+                } else if is_real {
                     self.emit(StackInstruction::SumaReal);
                 } else {
                     self.emit(StackInstruction::SumaInt);
@@ -1459,11 +2175,14 @@ impl StackCodeGenerator {
                 self.emit(StackInstruction::PowInt);
             }
 
-            // Operaciones de comparación (siempre enteras/cadena: ningún
-            // programa objetivo compara valores reales directamente).
+            // Operaciones de comparación: cadena si cualquier lado es
+            // cadena, si no real si `is_real` (ver comentario de arriba),
+            // si no entera.
             BinaryOp::Eq => {
                 if self.is_string_expr(left) || self.is_string_expr(right) {
                     self.emit(StackInstruction::IgualCadena);
+                } else if is_real {
+                    self.emit(StackInstruction::IgualReal);
                 } else {
                     self.emit(StackInstruction::IgualInt);
                 }
@@ -1471,21 +2190,39 @@ impl StackCodeGenerator {
             BinaryOp::Neq => {
                 if self.is_string_expr(left) || self.is_string_expr(right) {
                     self.emit(StackInstruction::DistintoCadena);
+                } else if is_real {
+                    self.emit(StackInstruction::DistintoReal);
                 } else {
                     self.emit(StackInstruction::DistintoInt);
                 }
             }
             BinaryOp::Lt => {
-                self.emit(StackInstruction::MenorInt);
+                if is_real {
+                    self.emit(StackInstruction::MenorReal);
+                } else {
+                    self.emit(StackInstruction::MenorInt);
+                }
             }
             BinaryOp::Leq => {
-                self.emit(StackInstruction::MenorIgualInt);
+                if is_real {
+                    self.emit(StackInstruction::MenorIgualReal);
+                } else {
+                    self.emit(StackInstruction::MenorIgualInt);
+                }
             }
             BinaryOp::Gt => {
-                self.emit(StackInstruction::MayorInt);
+                if is_real {
+                    self.emit(StackInstruction::MayorReal);
+                } else {
+                    self.emit(StackInstruction::MayorInt);
+                }
             }
             BinaryOp::Geq => {
-                self.emit(StackInstruction::MayorIgualInt);
+                if is_real {
+                    self.emit(StackInstruction::MayorIgualReal);
+                } else {
+                    self.emit(StackInstruction::MayorIgualInt);
+                }
             }
             
             // Operaciones lógicas
@@ -1569,10 +2306,49 @@ impl StackCodeGenerator {
 
                 self.emit(StackInstruction::Label(done));
             }
+            // SQR(x): sin rutina ROM verificada ni intención de investigar
+            // una (mismo riesgo de callejón sin salida que RND/SIN/COS/TAN,
+            // ver el roadmap acordado) — compuesto en su lugar con la
+            // aritmética real YA verificada (`SumaReal`/`DivReal`, Fase 4)
+            // vía iteración de Newton (`x_(n+1) = (x_n + v/x_n)/2` desde
+            // `x_0=(v+1)/2`). El cuerpo del bucle se genera UNA sola vez
+            // como subrutina compartida `__SQR_ROUTINE` (bucle real en
+            // tiempo de EJECUCIÓN, contador `__SQR_I`) y no desenrollado en
+            // cada punto de llamada: la primera versión desenrollaba 15
+            // vueltas por cada `SQR`, y ya con solo 3 llamadas en un
+            // programa de prueba de 8 líneas se superaba el techo real de
+            // 10240 bytes de RAM de usuario (`CodeTooLarge` al cargar en el
+            // emulador) — un desastre de tamaño de código si algún programa
+            // del corpus llama a `SQR` más de una o dos veces. Cada punto de
+            // llamada solo guarda `v`/`x_0` y hace un `Call` (SJP) a la
+            // subrutina, igual que una llamada ROM.
             FunctionInner::Sqr { expr } => {
+                self.sqr_used = true;
+                let v_addr = self.get_or_create_array_address("__SQR_V", 8);
+                let x_addr = self.get_or_create_array_address("__SQR_X", 8);
+
+                self.emit(StackInstruction::ApilaInt(v_addr as i64));
                 self.gen_expression(expr);
                 self.gen_acc_val(expr);
-                self.emit(StackInstruction::CallSqr);
+                if !self.is_real_expr(expr) {
+                    self.emit(StackInstruction::Int2Real);
+                }
+                self.emit(StackInstruction::DesapilaIndReal);
+
+                // x = (v + 1) / 2 (estimación inicial).
+                self.emit(StackInstruction::ApilaInt(x_addr as i64));
+                self.emit(StackInstruction::ApilaInt(v_addr as i64));
+                self.emit(StackInstruction::ApilaIndReal);
+                self.emit(StackInstruction::ApilaReal(1.0));
+                self.emit(StackInstruction::SumaReal);
+                self.emit(StackInstruction::ApilaReal(2.0));
+                self.emit(StackInstruction::DivReal);
+                self.emit(StackInstruction::DesapilaIndReal);
+
+                self.emit(StackInstruction::Call("__SQR_ROUTINE".to_string()));
+
+                self.emit(StackInstruction::ApilaInt(x_addr as i64));
+                self.emit(StackInstruction::ApilaIndReal);
             }
             FunctionInner::Sin { expr } => {
                 self.gen_expression(expr);
@@ -1697,11 +2473,58 @@ impl StackCodeGenerator {
                 self.emit(StackInstruction::CallPoint);
             }
             
-            // Funciones de sistema
+            // Funciones de sistema.
+            //
+            // `STATUS n`, verificado contra el Manual de Referencia
+            // Técnico real (sección 5-1-2, no adivinado): `STATUS 0/1/3`
+            // hablan de tamaños/direcciones del ÁREA DE PROGRAMA BASIC
+            // interpretado, que no existe como tal en código nativo — sin
+            // uso real en el corpus, no implementados (documentado como
+            // descarte, no olvido). `STATUS 2` (dirección justo después
+            // del programa BASIC, "área de usuario libre") sí se usa de
+            // verdad (blackjack.bas, pacman.bas, simulateur-de-vol.bas):
+            // aquí se resuelve como la dirección de un buffer de scratch
+            // fijo (`__STATUS2_SCRATCH`), reservado por si el programa
+            // quiere hacer PEEK/POKE ahí — el patrón real de la época
+            // "reservar código máquina justo después del programa". NO
+            // cubre el patrón de blackjack.bas/pacman.bas que además hace
+            // `POKE`/`CALL` a una dirección CALCULADA en tiempo de
+            // ejecución a partir de este valor (`POKE A,...` con `A`
+            // variable) — `gen_poke`/`gen_call` solo soportan direcciones
+            // constantes; extenderlos es un trabajo aparte, mayor y
+            // explícitamente pospuesto (ver roadmap, decisión del
+            // 2026-08-26). `STATUS 4` (línea BASIC actual en ejecución,
+            // 0 si no hay programa corriendo interpretado) no tiene
+            // equivalente real en código nativo sin intérprete de líneas
+            // — se documenta como limitación conocida y siempre devuelve
+            // 0 (usado en monstres&merveilles.bas solo para un chequeo
+            // puntual `IF E=709`, que simplemente nunca se cumplirá).
+            //
+            // Siempre real (`ApilaReal`, nunca `ApilaInt`): una dirección
+            // de 16 bits no cabe en el entero de 8 bits que usa el resto
+            // del backend para variables no reales — cabe sin problema en
+            // el formato BCD real (ver el comentario de `is_real_expr`).
             FunctionInner::Status { arg } => {
-                self.gen_expression(arg);
-                self.gen_acc_val(arg);
-                self.emit(StackInstruction::CallStatus);
+                match self.const_eval_int(arg) {
+                    Some(2) => {
+                        let addr = self.get_or_create_array_address("__STATUS2_SCRATCH", 32);
+                        self.emit(StackInstruction::ApilaReal(addr as f64));
+                    }
+                    Some(4) => {
+                        self.emit(StackInstruction::ApilaReal(0.0));
+                    }
+                    Some(n) => {
+                        eprintln!(
+                            "WARNING: STATUS {} no soportado (núcleo reducido: solo 2 y 4), devolviendo 0",
+                            n
+                        );
+                        self.emit(StackInstruction::ApilaReal(0.0));
+                    }
+                    None => {
+                        eprintln!("WARNING: STATUS con argumento no constante no soportado, devolviendo 0");
+                        self.emit(StackInstruction::ApilaReal(0.0));
+                    }
+                }
             }
             
             _ => {
@@ -1721,7 +2544,10 @@ impl StackCodeGenerator {
     /// identificador decide el modo (es más fiable que intentar inferir
     /// el tipo de la expresión del lado derecho, ya que en BASIC el `$`
     /// es una declaración de tipo del propio nombre, no de la expresión):
-    /// - Variable numérica o array numérico: `DesapilaInd` (1 byte).
+    /// - Variable numérica o array numérico: `DesapilaInd` (1 byte) — salvo
+    ///   que sea una variable escalar marcada real por
+    ///   `collect_real_variables` (ver el comentario de `real_variables`),
+    ///   en cuyo caso `DesapilaIndReal` (8 bytes).
     /// - Variable de cadena escalar (`Z$`, sin DIM de ancho fijo):
     ///   `DesapilaIndWord` — el valor es un puntero de 16 bits.
     /// - Elemento de array de cadena con ancho fijo declarado (`DIM
@@ -1729,7 +2555,16 @@ impl StackCodeGenerator {
     ///   caracteres al buffer reservado, no sobreescribe un puntero.
     fn gen_store_to_lvalue(&mut self, lvalue: &LValue) {
         let instr = match &lvalue.inner {
-            LValueInner::Identifier(id) if id.has_dollar() => StackInstruction::DesapilaIndWord,
+            // Variable de cadena escalar: COPIA el contenido real a su
+            // propio buffer (`DEFAULT_STRING_MAX_LEN+1` bytes, ver
+            // `get_or_create_variable_address`) en vez de guardar solo un
+            // puntero — ver `is_direct_string_buffer` para el porqué
+            // (bug de aliasing real, confirmado contra la ROM, cuando el
+            // lado derecho venía de un buffer compartido como
+            // `__LEFT_BUF`/`__MID_BUF`/`__CONCAT_BUF`/...).
+            LValueInner::Identifier(id) if id.has_dollar() => {
+                StackInstruction::DesapilaIndStringCopy(DEFAULT_STRING_MAX_LEN)
+            }
             LValueInner::Array1DAccess { identifier, .. } | LValueInner::Array2DAccess { identifier, .. }
                 if identifier.has_dollar() =>
             {
@@ -1739,6 +2574,9 @@ impl StackCodeGenerator {
                 } else {
                     StackInstruction::DesapilaIndWord
                 }
+            }
+            LValueInner::Identifier(id) if self.real_variables.contains(&id.to_string()) => {
+                StackInstruction::DesapilaIndReal
             }
             _ => StackInstruction::DesapilaInd,
         };
@@ -1769,13 +2607,26 @@ impl StackCodeGenerator {
             LValueInner::Array1DAccess { identifier, index } => {
                 // Dirección base del array. Si hubo un DIM con tamaño
                 // constante, usa el tamaño de elemento real registrado en
-                // gen_dim; si no (array sin DIM, o con tamaño dinámico
-                // todavía no soportado), cae al valor histórico de 5 bytes
-                // como límite conocido, no una constante "correcta".
+                // gen_dim; si no (array sin DIM), cae al valor histórico
+                // de 5 bytes como límite conocido, no una constante
+                // "correcta". Si el DIM fue de tamaño DINÁMICO (ver
+                // `ArrayMeta::dynamic_base_descriptor`), la base no es un
+                // literal de compilación: hay que leerla en tiempo de
+                // ejecución del descriptor que `gen_dim` fue rellenando.
                 let name = identifier.to_string();
-                let base_addr = self.get_or_create_variable_address(&name);
-                let element_size = self.array_metadata.get(&name).map_or(5, |m| m.element_size);
-                self.emit(StackInstruction::ApilaInt(base_addr as i64));
+                let meta = self.array_metadata.get(&name).copied();
+                let element_size = meta.map_or(5, |m| m.element_size);
+
+                match meta.and_then(|m| m.dynamic_base_descriptor) {
+                    Some(descriptor_addr) => {
+                        self.emit(StackInstruction::ApilaInt(descriptor_addr as i64));
+                        self.emit(StackInstruction::ApilaIndWord);
+                    }
+                    None => {
+                        let base_addr = self.get_or_create_variable_address(&name);
+                        self.emit(StackInstruction::ApilaInt(base_addr as i64));
+                    }
+                }
 
                 // Índice
                 self.gen_expression(index);
@@ -1784,8 +2635,17 @@ impl StackCodeGenerator {
                 self.emit(StackInstruction::ApilaInt(element_size as i64));
                 self.emit(StackInstruction::MulInt);
 
-                // Dirección = base + índice * tamaño
-                self.emit(StackInstruction::SumaInt);
+                // Dirección = base + índice * tamaño. `SumaIntWord`, no
+                // `SumaInt`: la base es una dirección de 16 bits (siempre
+                // > 255 en la práctica, cae en la rama de 2 bytes de
+                // `ApilaInt`/`ApilaIndWord`) y `SumaInt` solo suma el byte
+                // bajo, sin propagar el acarreo al alto — invisible
+                // mientras `índice*tamaño` no cruce un límite de página de
+                // 256 bytes dentro del propio array, pero real: confirmado
+                // contra la ROM real con `DIM A$(3)` sin ancho fijo (element
+                // ahora de 41 bytes, ver `array_element_size`) — A$(2)/A$(3)
+                // escribían 256 bytes por debajo de su dirección real.
+                self.emit(StackInstruction::SumaIntWord);
             }
 
             // Array 2D
@@ -1818,8 +2678,10 @@ impl StackCodeGenerator {
                 self.emit(StackInstruction::ApilaInt(element_size as i64));
                 self.emit(StackInstruction::MulInt);
 
-                // Sumar a la base
-                self.emit(StackInstruction::SumaInt);
+                // Sumar a la base. `SumaIntWord`, no `SumaInt` — mismo
+                // motivo que en Array1DAccess (acarreo al byte alto de la
+                // dirección de 16 bits).
+                self.emit(StackInstruction::SumaIntWord);
             }
             
             // Built-in identifiers like TIME, PI, INKEY$
@@ -1869,30 +2731,59 @@ impl StackCodeGenerator {
         if !self.es_designador(expr) {
             return;
         }
-        if self.is_fixed_width_string_array_access(expr) {
-            // Un elemento de array de cadena de ancho fijo (`DIM
-            // A$(N)*M`) es el buffer en sí — sus caracteres viven ahí
-            // directamente, no hay un puntero intermedio que cargar. La
-            // dirección que ya dejó gen_lvalue_address/gen_expression es
-            // el "valor" a efectos de comparación/paso a funciones, así
-            // que no se emite nada más aquí.
+        if self.is_direct_string_buffer(expr) {
+            // Cadena cuyo almacenamiento ES el buffer de caracteres (ver
+            // `is_direct_string_buffer`: elemento de array de ancho fijo
+            // O variable escalar `Z$`) — no hay un puntero intermedio que
+            // cargar. La dirección que ya dejó
+            // gen_lvalue_address/gen_expression es el "valor" a efectos
+            // de comparación/paso a funciones, así que no se emite nada
+            // más aquí.
         } else if self.is_string_expr(expr) {
-            // Una variable de cadena escalar (`Z$`) guarda un puntero de
-            // 16 bits, así que cargarla necesita ApilaIndWord, no
-            // ApilaInd (8 bits) — usarla ahí perdería el byte alto del
-            // puntero y descuadraría la pila (mismo bug que DesapilaInd
-            // tenía para el lado de escritura, aquí en el de lectura).
+            // Cualquier otra expresión de cadena (literal, resultado de
+            // MID$/LEFT$/RIGHT$/CHR$/STR$/concatenación, INKEY$, un
+            // array de cadena SIN ancho fijo) sí guarda/produce un
+            // puntero de 16 bits, así que cargarla necesita
+            // ApilaIndWord, no ApilaInd (8 bits) — usarla ahí perdería
+            // el byte alto del puntero y descuadraría la pila.
             self.emit(StackInstruction::ApilaIndWord);
+        } else if self.is_real_expr(expr) {
+            // Variable escalar marcada real por `collect_real_variables`:
+            // guarda 8 bytes (formato ARX/ARY), así que cargarla necesita
+            // ApilaIndReal, no ApilaInd (1 byte) — mismo motivo que el
+            // caso de cadena de arriba, aquí para el resultado de
+            // aritmética real (`SumaReal`/`RestaReal`/...).
+            self.emit(StackInstruction::ApilaIndReal);
         } else {
             self.emit(StackInstruction::ApilaInd);
         }
     }
 
-    /// ¿Es `expr` el acceso a un elemento de un array de cadena de ancho
-    /// fijo (`DIM A$(N)*M`, `M>2`)? Ver `gen_acc_val`.
-    fn is_fixed_width_string_array_access(&self, expr: &Expr) -> bool {
+    /// ¿Es `expr` un designador de cadena cuyo almacenamiento ES el
+    /// buffer de caracteres en sí — sin ningún puntero intermedio que
+    /// desreferenciar? Dos casos:
+    /// - Un elemento de array de cadena de ancho fijo (`DIM A$(N)*M`,
+    ///   `M>2`).
+    /// - Una variable de cadena escalar (`Z$`). Antes SOLO el primer caso
+    ///   se trataba así: una variable escalar guardaba un PUNTERO de 16
+    ///   bits (vía `DesapilaIndWord`/`ApilaIndWord`) a lo que fuera que
+    ///   produjo el lado derecho de su asignación — si eso era el
+    ///   resultado de `MID$`/`LEFT$`/`RIGHT$`/`CHR$`/`STR$`/concatenación
+    ///   (todas con un único buffer de scratch COMPARTIDO por función,
+    ///   ver `__MID_BUF` etc.), la variable quedaba apuntando al buffer
+    ///   compartido, no a una copia propia — cualquier llamada POSTERIOR
+    ///   a esa MISMA función en cualquier parte del programa invalidaba
+    ///   en silencio el valor ya asignado (confirmado contra la ROM real:
+    ///   `B$=LEFT$(A$,5)` seguido de una llamada a `LEFT$` no relacionada
+    ///   dejaba `B$` con el resultado de la SEGUNDA llamada). Ahora una
+    ///   variable escalar reserva sus propios `DEFAULT_STRING_MAX_LEN+1`
+    ///   bytes (ver `get_or_create_variable_address`) y la asignación
+    ///   COPIA los caracteres ahí (`DesapilaIndStringCopy`, ver
+    ///   `gen_store_to_lvalue`) — exactamente el mismo modelo que ya
+    ///   usaba un array de ancho fijo, extendido a variables escalares.
+    fn is_direct_string_buffer(&self, expr: &Expr) -> bool {
         match expr.inner() {
-            ExprInner::Parentheses(inner) => self.is_fixed_width_string_array_access(inner),
+            ExprInner::Parentheses(inner) => self.is_direct_string_buffer(inner),
             ExprInner::LValue(lvalue) => match &lvalue.inner {
                 LValueInner::Array1DAccess { identifier, .. }
                 | LValueInner::Array2DAccess { identifier, .. } => {
@@ -1902,6 +2793,7 @@ impl StackCodeGenerator {
                             .get(&identifier.to_string())
                             .is_some_and(|m| m.element_size > 2)
                 }
+                LValueInner::Identifier(id) => id.has_dollar(),
                 _ => false,
             },
             _ => false,
@@ -1980,30 +2872,77 @@ impl StackCodeGenerator {
                     | FunctionInner::Chr { .. }
                     | FunctionInner::Str { .. }
             ),
+            // `A$+B$` (concatenación, ver `ConcatString` en `gen_binary_op`)
+            // es una expresión de cadena igual que cualquier otra — sin
+            // este caso, un consumidor que pregunte "¿esto es cadena?"
+            // sobre la expresión COMPLETA (p.ej. `PRINT A$+"Y"`, que
+            // decide `SystemOutString` vs `SystemOutInt` mirando
+            // `is_string_expr` del `Expr` entero, no del `LValue`) nunca
+            // vería la concatenación como cadena e imprimiría el puntero
+            // de 16 bits del resultado como si fuera un entero pequeño.
+            ExprInner::Binary(left, BinaryOp::Add, right) => {
+                self.is_string_expr(left) || self.is_string_expr(right)
+            }
             _ => false,
         }
     }
 
-    /// ¿Es `expr` una expresión de tipo real? No hay tabla de tipos real
-    /// (las variables numéricas siempre se tratan como enteras de 8 bits,
-    /// ver `is_real` en `gen_binary_op`): una expresión es "real" solo si
+    /// ¿Es `lvalue` un designador de una variable escalar real? Una
+    /// variable se considera real si `collect_real_variables` la marcó así
+    /// antes de generar código (ver el comentario de `real_variables`) —
+    /// nunca un array (los arrays numéricos de este backend son siempre de
+    /// 1 byte por elemento, ver `array_element_size`).
+    fn is_real_lvalue(&self, lvalue: &LValue) -> bool {
+        match &lvalue.inner {
+            LValueInner::Identifier(id) if !id.has_dollar() => {
+                self.real_variables.contains(&id.to_string())
+            }
+            _ => false,
+        }
+    }
+
+    /// ¿Es `expr` una expresión de tipo real? Una expresión es real si
     /// contiene, en algún punto, un literal con parte decimal (p.ej. `.5`,
     /// `10.5`) combinado mediante operadores aritméticos — coincide con la
     /// misma condición (`fract() != 0.0`) que decide `ApilaInt` vs
-    /// `ApilaReal` para un literal suelto en `gen_expression`. Las llamadas
-    /// a función (`SGN`, `INT`, ...) NO se propagan como reales: siempre
-    /// devuelven un entero pequeño que ya cabe en el modelo de enteros
-    /// existente (ver `CallSgn`/`CallInt` en el backend), así que no hace
-    /// falta `Real2Int` genérico.
+    /// `ApilaReal` para un literal suelto en `gen_expression` — o una
+    /// referencia a una variable ya marcada real por `collect_real_variables`
+    /// (ver `real_variables`/`is_real_lvalue`): sin esto último, leer una
+    /// variable real en una sentencia que no repite el literal decimal
+    /// (p.ej. `X=B` tras `B=B+.5` en otra línea) volvería a tratarla como
+    /// entera de 8 bits e interpretaría mal sus 8 bytes reales. Las
+    /// llamadas a función (`SGN`, `INT`, ...) NO se propagan como reales:
+    /// siempre devuelven un entero pequeño que ya cabe en el modelo de
+    /// enteros existente (ver `CallSgn`/`CallInt` en el backend), así que
+    /// no hace falta `Real2Int` genérico.
     fn is_real_expr(&self, expr: &Expr) -> bool {
         match expr.inner() {
             ExprInner::DecimalNumber(num) => num.as_f64().fract() != 0.0,
             ExprInner::Parentheses(inner) => self.is_real_expr(inner),
             ExprInner::Unary(_, operand) => self.is_real_expr(operand),
+            ExprInner::LValue(lvalue) => self.is_real_lvalue(lvalue),
             ExprInner::Binary(left, op, right)
                 if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div) =>
             {
                 self.is_real_expr(left) || self.is_real_expr(right)
+            }
+            // `SQR` siempre devuelve un real (ver `FunctionInner::Sqr`),
+            // sin importar si el argumento era entero o real — a
+            // diferencia de `SGN`/`INT`, que sí devuelven enteros pequeños
+            // (ver el comentario de arriba). Sin este caso, `B=SQR(A)`
+            // hacía que `collect_real_variables` NO marcara `B` como real,
+            // y `gen_store_to_lvalue` guardaba el resultado con
+            // `DesapilaInd` (1 byte) en vez de `DesapilaIndReal` (8 bytes)
+            // — los 7 bytes restantes del real calculado se quedaban en la
+            // pila hardware para siempre, desincronizándola.
+            // `STATUS n` también siempre real (ver `FunctionInner::Status`
+            // más abajo, que empuja `ApilaReal` en todos los casos —
+            // aunque el valor devuelto sea conceptualmente una dirección
+            // de memoria de 16 bits, cabe sin problema en el formato BCD
+            // real, y evita el mismo bug de truncado a 1 byte que `Sqr`
+            // ya tuvo).
+            ExprInner::FunctionCall(func) => {
+                matches!(func.inner, FunctionInner::Sqr { .. } | FunctionInner::Status { .. })
             }
             _ => false,
         }
@@ -2040,9 +2979,16 @@ impl StackCodeGenerator {
         if let Some(&addr) = self.variable_addresses.get(name) {
             addr
         } else {
+            // Una variable de cadena escalar (`Z$`) reserva su propio
+            // buffer de `DEFAULT_STRING_MAX_LEN+1` bytes (caracteres +
+            // NUL) en vez del hueco genérico de 10 — ver el comentario de
+            // `is_direct_string_buffer`: es lo que permite que
+            // `DesapilaIndStringCopy` copie ahí el contenido real en vez
+            // de solo un puntero a un buffer compartido y transitorio.
+            let size = if name.ends_with('$') { DEFAULT_STRING_MAX_LEN + 1 } else { 10 };
             let addr = self.data_base + self.next_address;
             self.variable_addresses.insert(name.to_string(), addr);
-            self.next_address += 10; // Espacio genérico por variable
+            self.next_address += size;
             addr
         }
     }
@@ -2066,9 +3012,14 @@ impl StackCodeGenerator {
     /// constant-folding de expresiones como `2+3`): es lo que necesita el
     /// núcleo reducido de `DIM` para tamaños declarados como literales,
     /// que es como aparecen en la inmensa mayoría de programas reales.
+    /// También reconoce literales hexadecimales `&XXXX` (`BinaryNumber`,
+    /// pese al nombre histórico — es hex, no binario), el formato real que
+    /// usan las direcciones de memoria en programas con código máquina
+    /// embebido vía `POKE`/`CALL` (ver `gen_call`).
     fn const_eval_int(&self, expr: &Expr) -> Option<i64> {
         match expr.inner() {
             ExprInner::DecimalNumber(n) => n.as_integer(),
+            ExprInner::BinaryNumber(n) => Some(n.as_u16() as i64),
             ExprInner::Parentheses(inner) => self.const_eval_int(inner),
             _ => None,
         }

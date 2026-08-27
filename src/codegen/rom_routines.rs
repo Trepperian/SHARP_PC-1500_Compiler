@@ -206,6 +206,16 @@ impl RomRoutines {
             verified: true,
         });
 
+        routines.insert("INIT_MTRX", RomRoutine {
+            name: "INIT_MTRX",
+            address: 0xECB2,
+            description: "Resetea solo CURSOR_PTR a 0 (ANI (CURSOR_PTR),$00 ; RTN), sin tocar CURSOR_ENA — la segunda mitad de INIT_CURS, y el mismo destino al que salta CHAR_OUT cuando el Carry indica que imprimir el último carácter desbordó el ancho de la pantalla (BCS INIT_MTRX). Ver el comentario de StackInstruction::Newline: imprimir 0x0D vía CHAR_OUT NO resetea el cursor por sí mismo (0x0D solo se dibuja como un carácter más y avanza CURSOR_PTR en 6, igual que cualquier otro) — para saltar de verdad a la columna 0 hay que llamar aquí directamente",
+            inputs: "Ninguno",
+            outputs: "CURSOR_PTR=0",
+            preserved: "CURSOR_ENA y todo lo demás",
+            verified: true,
+        });
+
         routines.insert("GPRINT_OUT", RomRoutine {
             name: "GPRINT_OUT",
             address: 0xEDEF,
@@ -320,7 +330,7 @@ impl RomRoutines {
             ("Aritmética BCD", vec!["ADDIT", "SUBTR", "MULTIPLY", "DIVISION"]),
             ("Salida de texto", vec!["CHAR_OUT", "STR_2_OUTBUF", "BCD_2_ASCII_OUTBUF", "ARX_2_STRNG"]),
             ("Entrada de teclado", vec!["ISKEY", "KEY_2_ASCII"]),
-            ("Gráficos / pantalla", vec!["LCD_CLR", "INIT_CURS", "GPRINT_OUT", "MTRX_INC", "MTRX_IN_RANGE"]),
+            ("Gráficos / pantalla", vec!["LCD_CLR", "INIT_CURS", "INIT_MTRX", "GPRINT_OUT", "MTRX_INC", "MTRX_IN_RANGE"]),
             ("Sonido / temporización", vec!["BEEP", "TIME_DELAY"]),
             ("Variables / aleatorios", vec!["DEL_STD_VARS", "RAND_GEN"]),
         ];

@@ -114,12 +114,36 @@ pub fn write_lh5_file<P: AsRef<Path>>(
     load_address: u16,
     machine_code: &[u8],
 ) -> io::Result<()> {
+    // El campo de longitud del formato `.lh5` es de 16 bits (ver la
+    // estructura del archivo, arriba) — `machine_code.len() as u16` sin
+    // comprobar antes desborda en silencio para cualquier programa de
+    // 65536 bytes o más (`len() as u16` = `len() % 65536`), escribiendo
+    // una cabecera con una longitud MENOR que el contenido real del
+    // archivo. `Pc1500::load_lh5_file` (el cargador real del emulador)
+    // confía en esa cabecera y copia solo esos bytes a memoria — el resto
+    // del programa, aunque está en el archivo, nunca llega a cargarse.
+    // Cualquier salto/llamada a una dirección más allá de esa longitud
+    // trunca acaba leyendo memoria nunca escrita: exactamente el bug que
+    // producía un "Illegal opcode" confuso al ejecutar decathlon.bas
+    // (67310 bytes → cabecera con 1774) en vez de un error claro de
+    // "programa demasiado grande" en el momento de compilar/escribir.
+    if machine_code.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "código máquina demasiado grande para el formato .lh5 ({} bytes, el campo de longitud es de 16 bits, máximo {})",
+                machine_code.len(),
+                u16::MAX
+            ),
+        ));
+    }
+
     let header = Lh5Header::new(load_address, machine_code.len() as u16);
-    
+
     let mut file = File::create(path)?;
     file.write_all(&header.to_bytes())?;
     file.write_all(machine_code)?;
-    
+
     Ok(())
 }
 

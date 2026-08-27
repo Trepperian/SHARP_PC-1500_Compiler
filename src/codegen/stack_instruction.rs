@@ -37,6 +37,17 @@ pub enum StackInstruction {
     /// maneja 8 bits, perdería el byte alto del puntero.
     ApilaIndWord,
 
+    /// apila-ind-real() - como `ApilaInd`, pero para un valor real (8
+    /// bytes crudos, mismo formato que `ARX`/`ARY` — ver el comentario de
+    /// `SumaReal`). Pop dirección (16 bits), Push los 8 bytes en
+    /// `dirección..dirección+8)`, en el mismo orden que `ApilaReal`/
+    /// `emit_push_8_from` (byte 0 primero, byte 7 al tope). Usada para
+    /// leer una variable escalar marcada real por `collect_real_variables`
+    /// (ver ese comentario en `mod.rs`) — mismo motivo que `ApilaIndWord`
+    /// para cadenas: `ApilaInd` solo maneja 1 byte, perdería el resto del
+    /// valor.
+    ApilaIndReal,
+
     /// desapila-ind() - Desapilar indirecto (escritura a memoria)
     /// Pop valor, Pop dirección, Mem[dirección] = valor
     DesapilaInd,
@@ -58,6 +69,22 @@ pub enum StackInstruction {
     /// cuenta — asignarle una cadena copia los caracteres dentro de ese
     /// buffer, no sobreescribe un puntero.
     DesapilaIndStringCopy(usize),
+
+    /// desapila-ind-real() - como `DesapilaInd`, pero para un valor real (8
+    /// bytes crudos, mismo formato que `ARX`/`ARY`). Pop dirección (16
+    /// bits) [tras haber sacado ya los 8 bytes de valor, que se apilaron
+    /// DESPUÉS de la dirección — modelo Tiny], Mem[dirección..dirección+8)
+    /// = valor. Necesaria porque `DesapilaInd` solo consume 1 byte de la
+    /// pila: usarla con el resultado de una operación real
+    /// (`SumaReal`/`RestaReal`/...) leería solo los 3 bytes superiores del
+    /// real como si fueran (valor, dir_baja, dir_alta) y dejaría los otros
+    /// 5 bytes reales sin consumir en la pila — descuadrándola de forma
+    /// silenciosa en cada asignación. Bug real encontrado jugando
+    /// bombing.bas: `B=B+.5` (línea 160) dejaba basura en `B` y perdía 5
+    /// bytes de pila por cada vuelta del bucle principal, hasta
+    /// desincronizar por completo la pila hardware (visible como
+    /// escrituras a memoria no mapeada, dirección 0x0000).
+    DesapilaIndReal,
 
     /// apilad(N) - Apilar dirección de nivel N
     /// Usado para acceder a variables en diferentes niveles de anidamiento
@@ -261,7 +288,14 @@ pub enum StackInstruction {
     /// call(etiqueta) - Llamada a subrutina (GOSUB)
     /// Guarda dirección de retorno y salta
     Call(String),
-    
+
+    /// call-addr(dirección) - Sentencia `CALL` de BASIC a una dirección
+    /// constante conocida en tiempo de compilación: código máquina
+    /// POKEado en RAM por el propio programa (ver el comentario en el
+    /// backend). A diferencia de `Call`, no pasa por el sistema de
+    /// etiquetas — SJP directo a la dirección literal.
+    CallAddr(u16),
+
     /// copia(N) - Copiar N bytes del tope de la pila
     Copia(usize),
     
@@ -354,7 +388,19 @@ pub enum StackInstruction {
     CallAsc,     // ASC(s) - Código ASCII
     CallStr(usize),               // STR$(n) - Número a cadena (buffer de resultado)
     CallVal(usize, usize),        // VAL(s) - Cadena a número (max_len, scratch de 4 bytes)
-    
+
+    /// concat-string(max_len, buffer, scratch_derecha) - `A$+B$`: copia
+    /// hasta `max_len` caracteres de cada lado al buffer de resultado
+    /// (uno detrás de otro, compartiendo el mismo patrón de copia
+    /// terminada en NUL que `CallLeft`/`CallMid`/`CallRight`) — pop
+    /// puntero derecho (16 bits, tope de pila) a `scratch_derecha` (hace
+    /// falta guardarlo aparte porque el izquierdo debe copiarse primero),
+    /// pop puntero izquierdo, copia izquierdo a `buffer`, copia derecho a
+    /// continuación del NUL que dejó la primera copia, push puntero a
+    /// `buffer`. `buffer` debe reservar `2*max_len+1` bytes (cada lado
+    /// puede llegar a `max_len`, más el NUL final).
+    ConcatString(usize, usize, usize),
+
     // ========================================================================
     // INSTRUCCIONES ESPECÍFICAS DE BASIC
     // ========================================================================
@@ -394,7 +440,8 @@ pub enum StackInstruction {
     // ========================================================================
     
     /// Instrucciones de sistema
-    Wait,         // WAIT - Esperar
+    Wait,         // WAIT n - Esperar n unidades de tiempo real (TIME_DELAY)
+    WaitForKey,   // WAIT (sin argumento) - Bloquear hasta que se pulse cualquier tecla
     Random(usize),       // RANDOM - Inicializar generador aleatorio (dirección de la semilla, compartida con CallRnd)
     Arun,         // ARUN - Auto-run
     Lock,         // LOCK - Bloquear programa
@@ -402,9 +449,28 @@ pub enum StackInstruction {
     
     /// Instrucciones de I/O avanzadas
     Pause,        // PAUSE - Pausar ejecución
-    LPrint,       // LPRINT - Imprimir a impresora
-    Using,        // USING - Formatear salida
-    
+    LPrint,       // LPRINT - Imprimir a impresora (subsistema CE-150/158, descartado — ver roadmap)
+
+    /// print-using-real(digits_before, digits_after, asterisk_fill,
+    /// forced_sign, buffer) - `PRINT USING <patrón>;valor` con `valor` ya
+    /// en la pila como real de 8 bytes. El patrón siempre se resuelve en
+    /// tiempo de compilación (`UsingFormat`, ver `mod.rs`), así que esta
+    /// instrucción recibe directamente los parámetros ya parseados, no
+    /// una cadena de patrón. Formatea con ancho fijo (relleno con
+    /// espacios o `*` si `asterisk_fill`, signo siempre visible si
+    /// `forced_sign`) en `buffer` y lo imprime tal cual, sin recortar
+    /// nada — el ancho fijo es el comportamiento esperado de `USING`.
+    PrintUsingReal(u8, u8, bool, bool, usize),
+
+    /// print-real-natural(buffer) - `PRINT` de un valor real SIN `USING`
+    /// activo. Formatea con un ancho fijo generoso (7 enteros + 6
+    /// decimales) en `buffer` y, a diferencia de `PrintUsingReal`, recorta
+    /// los espacios de relleno a la izquierda y los ceros decimales
+    /// sobrantes a la derecha (más el punto decimal si sobran TODOS) antes
+    /// de imprimir — para que un `PRINT` sin formato explícito no muestre
+    /// ceros de relleno como "2.500000" en vez de "2.5".
+    PrintRealNatural(usize),
+
     /// Instrucciones gráficas
     GPrint,       // GPRINT - Imprimir en gráficos (valor numérico: 1 byte, 1 columna)
 
@@ -473,9 +539,11 @@ impl StackInstruction {
             StackInstruction::ApilaBool(b) => format!("apila-bool {}", b),
             StackInstruction::ApilaInd => "apila-ind".to_string(),
             StackInstruction::ApilaIndWord => "apila-ind-word".to_string(),
+            StackInstruction::ApilaIndReal => "apila-ind-real".to_string(),
             StackInstruction::DesapilaInd => "desapila-ind".to_string(),
             StackInstruction::DesapilaIndWord => "desapila-ind-word".to_string(),
             StackInstruction::DesapilaIndStringCopy(n) => format!("desapila-ind-string-copy {n}"),
+            StackInstruction::DesapilaIndReal => "desapila-ind-real".to_string(),
             StackInstruction::Apilad(n) => format!("apilad {}", n),
             StackInstruction::Dup => "dup".to_string(),
             StackInstruction::Desapila => "desapila".to_string(),
@@ -537,6 +605,7 @@ impl StackInstruction {
                 format!("desactiva {}, {}", nivel, tam),
             StackInstruction::Desapilad(nivel) => format!("desapilad {}", nivel),
             StackInstruction::Call(label) => format!("call {}", label),
+            StackInstruction::CallAddr(addr) => format!("call-addr {:#06X}", addr),
             StackInstruction::Copia(n) => format!("copia {}", n),
             
             // Conversiones
@@ -571,6 +640,9 @@ impl StackInstruction {
             StackInstruction::CallAsc => "call ASC".to_string(),
             StackInstruction::CallStr(buf) => format!("call STR$ (buf @{buf:#x})"),
             StackInstruction::CallVal(max_len, scratch) => format!("call VAL (max {max_len}, scratch @{scratch:#x})"),
+            StackInstruction::ConcatString(max_len, buf, right_scratch) => {
+                format!("concat-string (max {max_len}, buf @{buf:#x}, scratch @{right_scratch:#x})")
+            }
             
             // BASIC específico
             StackInstruction::DataPool(items) => format!("data-pool ({} items)", items.len()),
@@ -585,6 +657,7 @@ impl StackInstruction {
             
             // Sistema Sharp PC-1500
             StackInstruction::Wait => "wait".to_string(),
+            StackInstruction::WaitForKey => "wait-for-key".to_string(),
             StackInstruction::Random(seed_addr) => format!("random (seed @{seed_addr:#x})"),
             StackInstruction::Arun => "arun".to_string(),
             StackInstruction::Lock => "lock".to_string(),
@@ -593,7 +666,10 @@ impl StackInstruction {
             // I/O avanzado
             StackInstruction::Pause => "pause".to_string(),
             StackInstruction::LPrint => "lprint".to_string(),
-            StackInstruction::Using => "using".to_string(),
+            StackInstruction::PrintUsingReal(db, da, ast, sgn, buf) => {
+                format!("print-using-real (before {db}, after {da}, asterisk {ast}, sign {sgn}, buf @{buf:#x})")
+            }
+            StackInstruction::PrintRealNatural(buf) => format!("print-real-natural (buf @{buf:#x})"),
             
             // Gráficos
             StackInstruction::GPrint => "gprint".to_string(),

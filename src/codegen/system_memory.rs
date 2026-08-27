@@ -65,3 +65,20 @@ pub const STR_BUF_LEN: u16 = 0x50;
 /// Buffer de entrada de la ROM (líneas leídas por teclado).
 pub const IN_BUF: u16 = 0x7BB0;
 pub const IN_BUF_LEN: u16 = 0x80;
+
+/// Bytes de control de los indicadores/anunciadores del LCD (BUSY, SHIFT,
+/// KANA, SML, DEG, RAD, RUN, PRO, RSV, DEF, I/II/III) — dos bytes
+/// consecutivos, confirmados leyendo directamente `update_display_buffer()`
+/// en `ceres-core/src/display.rs` (`self.read_byte(0x764E)`/`0x764F`).
+/// Lógica invertida (bit a 0 = símbolo ENCENDIDO, típica de un
+/// controlador de LCD real): un byte a `0x00` enciende TODOS los
+/// indicadores de golpe. La ROM los deja en un estado limpio (todo
+/// apagado, `0xFF`) como parte de su arranque normal — un programa
+/// cargado y ejecutado directamente (sin pasar por ese arranque) nunca
+/// toca esta región, así que empieza a `0x00` (memoria sin inicializar) y
+/// los 13 indicadores aparecen permanentemente encendidos, sin que
+/// pulsar SHIFT/DEF los apague ni los encienda (esas teclas solo
+/// cambian este byte a través del propio bucle de teclado de la ROM,
+/// que el código nativo tampoco recorre). Confirmado en la GUI real.
+pub const DISPLAY_SYMBOLS: u16 = 0x764E;
+pub const DISPLAY_SYMBOLS_LEN: u16 = 2;
