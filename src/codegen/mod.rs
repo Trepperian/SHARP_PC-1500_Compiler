@@ -130,6 +130,18 @@ pub struct StackCodeGenerator {
     /// `gen_for`/`gen_next` no tienen ninguna noción de 16 bits).
     word_variables: std::collections::HashSet<String>,
 
+    /// Mecanismo genérico de ritmo de ejecución (opt-in, `--authentic-timing`
+    /// en `main.rs`) — ver el comentario largo de
+    /// `StackInstruction::AuthenticTimingDelay`. `false` en TODO el código
+    /// existente hasta ahora (todos los constructores previos a este
+    /// campo, y todos los tests ya escritos, que usan `new()`/
+    /// `with_data_base()` sin este flag): con `false`, `gen_code_line`
+    /// nunca emite la instrucción de espera, así que el código generado
+    /// es byte-idéntico al de antes de que este mecanismo existiera —
+    /// cero riesgo para lo que ya funciona. Solo pasa a `true` cuando se
+    /// pide explícitamente vía `with_data_base_and_timing`.
+    authentic_timing: bool,
+
     /// Formato `USING` activo, o `None` si no hay ninguno (formato
     /// decimal simple). Se actualiza en tiempo de COMPILACIÓN al procesar
     /// cada sentencia `USING <patrón>` o `PRINT USING <patrón>;...`
@@ -298,6 +310,15 @@ impl StackCodeGenerator {
     /// variables — ver [`compile_native_two_pass`], que es quien de verdad
     /// calcula ese valor para código nativo.
     pub fn with_data_base(data_base: usize) -> Self {
+        Self::with_data_base_and_timing(data_base, false)
+    }
+
+    /// Como `with_data_base`, pero además controla el mecanismo genérico
+    /// de ritmo de ejecución (ver el comentario de `authentic_timing`).
+    /// `with_data_base`/`new()` siguen existiendo y llaman aquí con
+    /// `authentic_timing=false`, así que ningún código ni test previo a
+    /// la existencia de este parámetro cambia de comportamiento.
+    pub fn with_data_base_and_timing(data_base: usize, authentic_timing: bool) -> Self {
         Self {
             instructions: Vec::new(),
             label_counter: 0,
@@ -311,6 +332,7 @@ impl StackCodeGenerator {
             data_base,
             real_variables: std::collections::HashSet::new(),
             word_variables: std::collections::HashSet::new(),
+            authentic_timing,
             current_using_format: None,
             sqr_used: false,
             dynamic_array_heap_initialized: false,
@@ -688,10 +710,28 @@ impl StackCodeGenerator {
         
         // Generar código para cada sentencia en la línea
         for stmt in line.statements() {
-            self.gen_statement(stmt);
+            self.gen_statement_timed(stmt);
         }
-        
+
         self.emit_comment("");
+    }
+
+    /// Como `gen_statement`, pero además emite la espera calibrada del
+    /// mecanismo genérico de ritmo (`AuthenticTimingDelay`, ver el
+    /// comentario de `authentic_timing`) justo después, cuando está
+    /// activo — usado en los dos sitios donde de verdad se ejecuta una
+    /// sentencia BASIC completa por derecho propio: el bucle de
+    /// `gen_code_line` (una línea normal) y el de `StatementInner::Multi`
+    /// (el consecuente de varias sentencias de un `IF...THEN a:b:c`).
+    /// Deliberadamente NO se llama desde dentro de `gen_statement` en sí
+    /// (p.ej. el cuerpo de un `IF` de una sola sentencia ya pasa por uno
+    /// de estos dos sitios) — evita duplicar la espera para la misma
+    /// sentencia lógica.
+    fn gen_statement_timed(&mut self, stmt: &Statement) {
+        self.gen_statement(stmt);
+        if self.authentic_timing {
+            self.emit(StackInstruction::AuthenticTimingDelay);
+        }
     }
     
     /// Generar código para una sentencia
@@ -776,10 +816,16 @@ impl StackCodeGenerator {
 
             // Ver comentario de `StatementInner::Multi`: todas las
             // sentencias separadas por ':' que forman el consecuente de
-            // un IF sin bloque explícito.
+            // un IF sin bloque explícito. Cada una es una sentencia BASIC
+            // real y ejecutable por derecho propio (el intérprete real las
+            // despacha una a una igual que si estuvieran en `gen_code_line`),
+            // así que usa `gen_statement_timed` igual que ahí — no
+            // `gen_statement` a secas, que se saltaría la espera del
+            // mecanismo de ritmo (ver `authentic_timing`) para todo lo que
+            // cuelga de un `THEN` con varias sentencias.
             StatementInner::Multi(statements) => {
                 for statement in statements {
-                    self.gen_statement(statement);
+                    self.gen_statement_timed(statement);
                 }
             }
         }
@@ -1007,10 +1053,22 @@ impl StackCodeGenerator {
         
         // Si es falsa, saltar al final
         self.emit(StackInstruction::IrF(end_label.clone()));
-        
-        // Código del THEN
-        self.gen_statement(then_stmt);
-        
+
+        // Código del THEN. Si `then_stmt` es `Multi` (`IF cond THEN
+        // a:b:c`), su propio manejador en `gen_statement` ya llama a
+        // `gen_statement_timed` por cada sentencia interior — envolverlo
+        // aquí OTRA vez con `gen_statement_timed` añadiría una espera
+        // extra para el pseudo-nodo `Multi` en sí, que no es una
+        // sentencia BASIC real. Para un THEN de una sola sentencia
+        // (`IF cond THEN Y=1`, sin `Multi`), sí hace falta pasar por
+        // `gen_statement_timed` aquí explícitamente — si no, esa
+        // sentencia se quedaría sin su espera del mecanismo de ritmo.
+        if matches!(&then_stmt.inner, StatementInner::Multi(_)) {
+            self.gen_statement(then_stmt);
+        } else {
+            self.gen_statement_timed(then_stmt);
+        }
+
         // Etiqueta de fin
         self.emit(StackInstruction::Label(end_label));
     }
@@ -3580,9 +3638,28 @@ pub fn compile_native_two_pass(
     start_address: u16,
     stack_top: u16,
 ) -> (u16, Vec<u8>, HashMap<String, usize>) {
+    compile_native_two_pass_with_timing(program, start_address, stack_top, false)
+}
+
+/// Como [`compile_native_two_pass`], pero además controla el mecanismo
+/// genérico de ritmo de ejecución (ver el comentario de
+/// `StackCodeGenerator::authentic_timing`) — `compile_native_two_pass`
+/// sigue existiendo, sin cambiar su firma, y llama aquí con
+/// `authentic_timing=false`, así que cualquier llamador existente (todo
+/// el código y los tests ya escritos antes de este mecanismo) sigue
+/// produciendo exactamente el mismo `.lh5`, byte a byte.
+pub fn compile_native_two_pass_with_timing(
+    program: &Program,
+    start_address: u16,
+    stack_top: u16,
+    authentic_timing: bool,
+) -> (u16, Vec<u8>, HashMap<String, usize>) {
     use lh5801_backend::Lh5801Backend;
 
-    let mut first_pass_gen = StackCodeGenerator::new();
+    let mut first_pass_gen = StackCodeGenerator::with_data_base_and_timing(
+        DEFAULT_DATA_BASE_PLACEHOLDER,
+        authentic_timing,
+    );
     let first_pass_instructions = first_pass_gen.generate(program);
     let mut first_pass_backend = Lh5801Backend::with_config(start_address, stack_top);
     // La pasada 1 debe emitir el MISMO prólogo (mismo tamaño en bytes)
@@ -3604,7 +3681,8 @@ pub fn compile_native_two_pass(
 
     let real_data_base = start_address as usize + first_pass_code.len();
 
-    let mut second_pass_gen = StackCodeGenerator::with_data_base(real_data_base);
+    let mut second_pass_gen =
+        StackCodeGenerator::with_data_base_and_timing(real_data_base, authentic_timing);
     let second_pass_instructions = second_pass_gen.generate(program);
     let mut second_pass_backend = Lh5801Backend::with_config(start_address, stack_top);
     // Poner a 0 TODA la región de variables en el prólogo — ver el

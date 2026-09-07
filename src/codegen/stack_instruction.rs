@@ -586,7 +586,39 @@ pub enum StackInstruction {
     
     /// nop - No operación
     Nop,
-    
+
+    /// authentic-timing-delay - Espera calibrada, mecanismo GENÉRICO
+    /// (opt-in, ver `--authentic-timing` en `main.rs`) para acercar el
+    /// ritmo de ejecución del código nativo al del BASIC tokenizado
+    /// interpretado en la ROM real.
+    ///
+    /// Por qué hace falta: el intérprete real despacha cada paso de
+    /// cada sentencia mediante llamadas vectorizadas a través de una
+    /// tabla en `$FF00` (17 ciclos de despacho puro, confirmado en
+    /// `vector()` de `ceres-core`), y busca cada variable por NOMBRE en
+    /// tiempo de ejecución (`VAR_ON_BSTK`, "Searches for variable on
+    /// Basic stack") — un coste real, verificado, que nuestro código
+    /// nativo no paga (direcciones fijas en tiempo de compilación, sin
+    /// despacho indirecto). El resultado: un juego que en el original
+    /// se mueve a un ritmo jugable/observable se ejecuta en nuestra
+    /// versión en una fracción de segundo. Precedente ya usado dos
+    /// veces antes de este mecanismo genérico: copias `_demo.bas` con
+    /// un `WAIT` calibrado a mano (`bathyscaph_demo.bas`,
+    /// `mole_demo.bas`) — este mecanismo lo generaliza para no tener
+    /// que repetir ese proceso programa a programa.
+    ///
+    /// Se emite UNA vez por cada sentencia BASIC compilada (ver
+    /// `gen_code_line` en `mod.rs`), solo cuando `authentic_timing`
+    /// está activo — con el flag desactivado (el valor por defecto en
+    /// todo el código existente y en todos los tests ya escritos) esta
+    /// instrucción nunca se emite, y el código generado es
+    /// BYTE-IDÉNTICO al de antes de que este mecanismo existiera. Solo
+    /// usa registros hardware (A, X, Y, U) como scratch — nunca toca la
+    /// pila software ni memoria de programa — así que es seguro
+    /// insertarlo entre CUALQUIER par de sentencias sin arriesgar el
+    /// descuadre de pila que ha costado tantos bugs reales esta sesión.
+    AuthenticTimingDelay,
+
     /// comment - Comentario (solo para debugging del código generado)
     Comment(String),
 }
@@ -778,6 +810,7 @@ impl StackInstruction {
             
             // Utilidades
             StackInstruction::Nop => "nop".to_string(),
+            StackInstruction::AuthenticTimingDelay => "authentic-timing-delay".to_string(),
             StackInstruction::Comment(c) => format!("; {}", c),
         }
     }

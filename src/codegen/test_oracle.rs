@@ -167,3 +167,24 @@ pub fn compile_native_with_addresses(source: &str) -> (Vec<u8>, std::collections
         compile_native_two_pass(&program, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP);
     (machine_code, variable_addresses)
 }
+
+/// Como [`compile_native`], pero con el mecanismo genérico de ritmo de
+/// ejecución activado (`--authentic-timing`, ver
+/// `compile_native_two_pass_with_timing`) — para los tests que verifican
+/// ese mecanismo específicamente.
+pub fn compile_native_with_timing(source: &str) -> Vec<u8> {
+    use crate::codegen::compile_native_two_pass_with_timing;
+
+    let lexer = Lexer::new(source, RemarkLexOption::TrimWhitespace);
+    let tokens: Vec<_> = lexer
+        .map(|t| t.expect("error de lexado en fuente de test"))
+        .collect();
+
+    let mut parser = Parser::new(tokens.into_iter());
+    let (program, parse_errors) = parser.parse_with_error_recovery();
+    assert!(parse_errors.is_empty(), "errores de parseo en fuente de test: {parse_errors:?}");
+
+    let (_, machine_code, _) =
+        compile_native_two_pass_with_timing(&program, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP, true);
+    machine_code
+}

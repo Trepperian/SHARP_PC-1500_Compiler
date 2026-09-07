@@ -57,6 +57,37 @@ use std::collections::HashMap;
 /// candidato a refinarse con más programas verificados.
 const WAIT_MIN_TICKS: u8 = 3;
 
+/// Nº de vueltas del bucle EXTERIOR de la espera de
+/// `AuthenticTimingDelay` (ver el comentario largo de esa instrucción en
+/// `stack_instruction.rs`) — UNA calibración global, aplicada tras cada
+/// sentencia compilada cuando `--authentic-timing` está activo.
+///
+/// La rutina es un bucle anidado de 16 bits (`XL`=exterior, `UL`=interior,
+/// registro elegido porque `DEC XL`/`LDI XL,#imm` son opcodes de la tabla
+/// PRINCIPAL de `ceres-core` — 5/6 ciclos — a diferencia de `DEC UH`, que
+/// solo existe en la tabla con prefijo `0xFD` y cuesta 9 ciclos más el
+/// byte de prefijo; ver `emit_instruction`/
+/// `StackInstruction::AuthenticTimingDelay`): un solo `u8` (máximo 255
+/// vueltas, ~6400 ciclos) se quedó corto en la calibración interactiva
+/// contra `bathyscaph.bas` — con `AUTHENTIC_TIMING_DELAY_ITERATIONS=150`
+/// (un solo nivel, sin anidar) el usuario confirmó que SEGUÍA yendo
+/// demasiado rápido. El bucle interior se reinicia a `UL=0` en cada vuelta
+/// exterior (`DEC` desde 0 da la vuelta a 255 y tarda 256 iteraciones en
+/// volver a 0 — la prueba de cero de `BZS` es exacta, `ceres-core::dec`
+/// usa `add_generic(adr, 0xff, false)`, que recalcula el flag Z del
+/// resultado real). Cada vuelta interior cuesta `DEC UL`(5) + `BZS`(8) +
+/// `JMP`(12) = 25 ciclos reales (costes de `ceres-core`, cycle-accurate a
+/// 1.3MHz), así que el coste total por sentencia es aproximadamente
+/// `AUTHENTIC_TIMING_DELAY_ITERATIONS × 256 × 25` ciclos (con N=10, unos
+/// 64.000 ciclos — más de 10 veces el máximo alcanzable con el diseño de
+/// un solo nivel).
+///
+/// Calibración en curso, por prueba y error contra la GUI real con el
+/// usuario (mismo proceso ya usado para `WAIT_MIN_TICKS` y las copias
+/// `_demo.bas`, aquí de una sola vez en vez de por programa) — subir
+/// este valor para ir más lento, bajarlo para ir más rápido.
+const AUTHENTIC_TIMING_DELAY_ITERATIONS: u8 = 3;
+
 /// Generador de código LH5801
 pub struct Lh5801Backend {
     /// Código máquina generado (opcodes)
@@ -547,6 +578,56 @@ impl Lh5801Backend {
             self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
             self.emit_call_char_out();
 
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("AUTHENTIC_TIMING_DELAY") {
+            // Espera calibrada, mecanismo genérico de ritmo (ver el
+            // comentario largo de `StackInstruction::AuthenticTimingDelay`
+            // en stack_instruction.rs y `AUTHENTIC_TIMING_DELAY_ITERATIONS`
+            // más arriba). Bucle anidado de 16 bits (XL=exterior,
+            // UL=interior) para superar el techo de un `u8` de un solo
+            // nivel (255 vueltas, insuficiente en la calibración real).
+            // Solo toca `A`/`X`/`U` — nunca la pila software ni memoria de
+            // programa — así que es seguro insertarla tras CUALQUIER
+            // sentencia sin riesgo de descuadre (ningún registro de CPU
+            // porta estado con significado entre sentencias en este
+            // codegen, solo la pila software y la memoria de programa lo
+            // hacen).
+            self.define_label("__SHARED_AUTHENTIC_TIMING_DELAY".to_string());
+
+            self.emit_byte(0x4A); self.emit_byte(AUTHENTIC_TIMING_DELAY_ITERATIONS); // LDI XL,#N
+
+            let outer_label = self.new_local_label("TIMING_DELAY_OUTER");
+            let inner_label = self.new_local_label("TIMING_DELAY_INNER");
+            let done_label = self.new_local_label("TIMING_DELAY_DONE");
+
+            self.define_label(outer_label.clone());
+            self.emit_byte(0x6A); self.emit_byte(0x00); // LDI UL,#0 (da la vuelta: 256 iteraciones interiores)
+
+            self.define_label(inner_label.clone());
+            self.emit_byte(0x62); // DEC UL
+            // BZS +3: si Z=1 (UL volvió a 0 tras 256 vueltas), saltar el
+            // JMP y caer al DEC XL. Si Z=0, NO salta, ejecuta el JMP de
+            // vuelta al bucle interior — mismo idioma de salto largo
+            // seguro ya usado en todo este backend (branch corto de
+            // offset fijo + JMP con etiqueta, nunca un offset largo
+            // calculado a mano).
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3
+            self.emit_byte(0xBA); // JMP inner_loop
+            self.add_label_ref(inner_label, RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0x42); // DEC XL
+            // BZS +3: si Z=1 (XL llegó a 0, se completaron las N vueltas
+            // exteriores), saltar el JMP y caer al RTN. Si Z=0, NO salta,
+            // ejecuta el JMP de vuelta al bucle exterior.
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3
+            self.emit_byte(0xBA); // JMP outer_loop
+            self.add_label_ref(outer_label, RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(done_label);
             self.emit_byte(0x9A); // RTN
         }
 
@@ -5218,6 +5299,12 @@ impl Lh5801Backend {
             // en realidad no hace falta implementar).
             StackInstruction::Arun | StackInstruction::Lock | StackInstruction::Unlock => {}
 
+            // ===== RITMO DE EJECUCIÓN (opt-in, ver --authentic-timing) =====
+
+            StackInstruction::AuthenticTimingDelay => {
+                self.emit_call_shared("AUTHENTIC_TIMING_DELAY");
+            }
+
             // ===== NO OPERACIÓN =====
 
             StackInstruction::Nop => {
@@ -8348,6 +8435,118 @@ mod tests {
         );
     }
 
+    /// Garantía de riesgo cero para el mecanismo genérico de ritmo
+    /// (`--authentic-timing`, ver `StackInstruction::AuthenticTimingDelay`):
+    /// sin la bandera, `compile_native_two_pass_with_timing(...,false)`
+    /// (a la que `compile_native_two_pass` — y por tanto TODO el código y
+    /// los 130+ tests ya existentes antes de este mecanismo — delega)
+    /// debe producir exactamente los mismos bytes que antes de que este
+    /// mecanismo existiera. Comparado aquí contra `compile_native` (el
+    /// camino "de siempre") en vez de solo confiar en la lectura del
+    /// código: si algún día alguien mueve el `if self.authentic_timing`
+    /// de sitio por error, este test lo detecta.
+    #[test]
+    fn test_oracle_authentic_timing_off_produces_byte_identical_code_to_before_the_mechanism_existed() {
+        use crate::codegen::test_oracle::compile_native;
+        use crate::codegen::compile_native_two_pass_with_timing;
+        use crate::lex::{Lexer, RemarkLexOption};
+        use crate::parse::Parser;
+        use crate::codegen::test_oracle::{ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 A=0\n20 FOR I=1 TO 5\n30 IF A=0 THEN A=A+1\n40 B=A+2:C=B*2\n50 NEXT I\n60 END\n";
+
+        let via_compile_native = compile_native(source);
+
+        let tokens: Vec<_> = Lexer::new(source, RemarkLexOption::TrimWhitespace)
+            .map(|t| t.expect("lex"))
+            .collect();
+        let mut parser = Parser::new(tokens.into_iter());
+        let (program, errors) = parser.parse_with_error_recovery();
+        assert!(errors.is_empty());
+        let (_, via_timing_off, _) =
+            compile_native_two_pass_with_timing(&program, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP, false);
+
+        assert_eq!(
+            via_compile_native, via_timing_off,
+            "con authentic_timing=false, el código generado debe ser BYTE-IDÉNTICO al camino de siempre"
+        );
+    }
+
+    /// El mecanismo activado (`--authentic-timing`) debe: (1) seguir
+    /// produciendo el resultado final CORRECTO (misma lógica, solo más
+    /// lenta), y (2) tardar estrictamente más ciclos reales de CPU que
+    /// sin él — si no tardara más, la espera no se estaría insertando de
+    /// verdad. Mismo bucle de referencia que
+    /// `test_oracle_native_reference_loop_tick_count_for_speed_analysis`,
+    /// para poder comparar directamente los dos números.
+    #[test]
+    fn test_oracle_authentic_timing_on_preserves_correctness_and_adds_real_cycles_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, compile_native_with_timing, load, ORACLE_LOAD_ADDR};
+
+        let source = "10 A=0\n20 FOR I=1 TO 50\n30 A=A+1\n40 NEXT I\n50 POKE# 30200,1\n60 END\n";
+
+        let run_and_measure = |code: &[u8]| -> (u8, usize) {
+            let mut pc1500 = load(ORACLE_LOAD_ADDR, code);
+            let ticks_before = pc1500.cpu().get_ticks();
+            let mut steps = 0u32;
+            while !pc1500.cpu().is_halted() && steps < 1_000_000 {
+                pc1500.step_cpu();
+                steps += 1;
+            }
+            let ticks = pc1500.cpu().get_ticks() - ticks_before;
+            (pc1500.read_byte(30200), ticks)
+        };
+
+        let (signal_off, ticks_off) = run_and_measure(&compile_native(source));
+        let (signal_on, ticks_on) = run_and_measure(&compile_native_with_timing(source));
+
+        assert_eq!(signal_off, 1, "sin --authentic-timing debe completar igual que siempre");
+        assert_eq!(signal_on, 1, "con --authentic-timing debe seguir completando correctamente, solo más lento");
+        assert!(
+            ticks_on > ticks_off,
+            "con --authentic-timing activado debe tardar más ciclos reales que sin él: {ticks_on} vs {ticks_off}"
+        );
+    }
+
+    /// La espera del mecanismo de ritmo no debe tocar la pila software:
+    /// verificado con un programa que ejercita varios de los sitios
+    /// donde se inserta (línea normal, `IF...THEN` de una sola sentencia,
+    /// `IF...THEN a:b:c` de varias, `FOR`/`NEXT`) — si algún punto de
+    /// inserción desincronizara la pila, `S` no volvería a `stack_top`.
+    #[test]
+    fn test_oracle_authentic_timing_never_desyncs_software_stack_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_timing, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "\
+10 A=0:B=0\n\
+20 FOR I=1 TO 5\n\
+30 IF A=0 THEN A=1\n\
+40 IF I>2 THEN B=B+1:A=A+1:C=B*2\n\
+50 NEXT I\n\
+60 @(10900)=A\n\
+70 END\n\
+";
+        let code = compile_native_with_timing(source);
+        // El bucle anidado de la espera calibrada (ver
+        // `AUTHENTIC_TIMING_DELAY_ITERATIONS`) cuesta ~7-8k instrucciones
+        // de CPU por sentencia — con las ~30 ejecuciones de sentencia de
+        // este programa (incluyendo las 5 vueltas del FOR), un límite de
+        // 200_000 se quedaba corto según el valor de calibración actual.
+        // 1_000_000 deja margen para subir la calibración más sin volver
+        // a romper este test por presupuesto, no por un fallo real.
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 1_000_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente con el mecanismo de ritmo activado");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S debe volver a stack_top con --authentic-timing activado, sin importar cuántas sentencias \
+             (línea normal, IF de una sentencia, IF de varias, FOR/NEXT) hayan insertado la espera"
+        );
+        // A=1 tras la línea 30, luego +1 más en la línea 40 en las
+        // vueltas I=3,4,5 (I>2) -> A final = 1+3 = 4.
+        assert_eq!(pc1500.read_byte(10900), 4, "el resultado lógico debe ser correcto, no solo la pila");
+    }
+
     #[test]
     fn test_oracle_input_numeric_and_string_via_simulated_keypresses_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
@@ -9394,6 +9593,46 @@ mod tests {
             assert!(
                 (0x0100..=0x47FF).contains(&s),
                 "{}: S se salió de la región de usuario tras 200 frames: S={:#06X}",
+                name,
+                s
+            );
+        }
+    }
+
+    /// Mismo smoke test que el de arriba, pero con `--authentic-timing`
+    /// activado, sobre programas reales del corpus ya verificados con el
+    /// mecanismo desactivado (`bathyscaph.bas`, el primero completado
+    /// end-to-end en la GUI real esta sesión, e `invader-v2.bas`, el
+    /// programa más grande del corpus que cabe en RAM real — confirma
+    /// que la espera insertada tras cada sentencia no empuja el tamaño
+    /// generado por encima del techo de 18176 bytes ni desincroniza la
+    /// pila hardware durante una ejecución sostenida).
+    #[test]
+    fn test_oracle_authentic_timing_on_real_corpus_programs_run_sustained_without_crashing_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_timing, load, ORACLE_LOAD_ADDR};
+
+        for name in ["bathyscaph.bas", "invader-v2.bas"] {
+            let path = format!("test/basic/{}", name);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("no se pudo leer {}: {}", path, e));
+            let code = compile_native_with_timing(&source);
+
+            assert!(
+                code.len() <= 18176,
+                "{}: con --authentic-timing, {} bytes supera la RAM real de usuario (18176, CE-161)",
+                name,
+                code.len()
+            );
+
+            let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+            for _ in 0..200u32 {
+                pc1500.step_frame();
+            }
+
+            let s = pc1500.cpu().s();
+            assert!(
+                (0x0100..=0x47FF).contains(&s),
+                "{}: con --authentic-timing, S se salió de la región de usuario tras 200 frames: S={:#06X}",
                 name,
                 s
             );

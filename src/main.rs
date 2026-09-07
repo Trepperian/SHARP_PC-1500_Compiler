@@ -66,6 +66,18 @@ struct Args {
     #[arg(long, conflicts_with = "stack_code")]
     native_code: bool,
 
+    /// (Solo con --native-code) Inserta una espera calibrada tras cada
+    /// sentencia compilada, para acercar el ritmo de ejecución al del
+    /// BASIC tokenizado interpretado en la ROM real — el código nativo,
+    /// sin esto, ejecuta la misma lógica en una fracción del tiempo real
+    /// (el intérprete despacha cada sentencia mediante llamadas
+    /// vectorizadas y busca cada variable por nombre en tiempo de
+    /// ejecución; el código nativo resuelve todo eso en compilación).
+    /// Desactivado por defecto: sin esta bandera, el .lh5 generado es
+    /// exactamente igual que sin este mecanismo.
+    #[arg(long, requires = "native_code")]
+    authentic_timing: bool,
+
     /// Compile without header (only program bytes)
     #[arg(long)]
     no_header: bool,
@@ -281,12 +293,15 @@ fn main() {
         // variables justo después (ver `compile_native_two_pass`) — evita
         // que un programa grande corrompa su propio código con escrituras
         // de variables, como llegó a pasar con bathyscaph.bas.
-        use crate::codegen::compile_native_two_pass;
+        use crate::codegen::compile_native_two_pass_with_timing;
         let (load_address, machine_code, _variable_addresses) =
-            compile_native_two_pass(&program, 0x0100, 0x47FF);
+            compile_native_two_pass_with_timing(&program, 0x0100, 0x47FF, args.authentic_timing);
 
         println!("Generados {} bytes de código máquina LH5801", machine_code.len());
         println!("Dirección de carga: 0x{:04X}", load_address);
+        if args.authentic_timing {
+            println!("Ritmo de ejecución: espera calibrada activada (--authentic-timing)");
+        }
 
         // Aviso temprano si el código generado no cabe en la RAM de
         // usuario REAL de una Sharp PC-1500 con expansión CE-161 (18176
