@@ -3,26 +3,30 @@
 /// El LH5801 es el procesador de 8 bits del Sharp PC-1500
 /// Registros: A (acumulador), X, Y, U (índices de 16 bits), S (stack HW), P (program counter)
 ///
-/// Estrategia de memoria (asume una PC-1500 **con expansión de RAM CE-155**,
-/// 8KB, confirmada contra el manual real de la PC-1500 — ver
+/// Estrategia de memoria (asume una PC-1500 base **con expansión de RAM
+/// CE-161**, 16KB, confirmada en 3 fuentes independientes — imagen del
+/// manual de servicio, `lhasm.c` [`{ "CE161", ..., 1, 0x4000, 0, 0xE161 }`],
+/// y coherencia aritmética con el mapa oficial — ver
 /// `codegen::system_memory` para las direcciones de sistema verificadas
 /// contra el desensamblado real de la ROM):
-/// - `STANDARD_USER_MEMORY` mapea `0x3800-0x5FFF` (10240 bytes) — código,
+/// - `STANDARD_USER_MEMORY` mapea `0x0100-0x47FF` (18176 bytes) — código,
 ///   variables y pila propia viven ahí, en ventanas fijas y disjuntas:
-///   * `start_address` (por defecto `0x3800`, el propio inicio de
-///     `STANDARD_USER_MEMORY`): código generado. La suposición previa de
-///     que hacía falta dejar un hueco tras "RESMEM/PRGMEM" antes de
-///     `0x4100` no estaba respaldada por el desensamblado de la ROM —
-///     los 86 tests del oráculo (incluida la partida completa de
-///     bathyscaph.bas) pasan igual arrancando el código en `0x3800`.
+///   * `start_address` (por defecto `0x0100`, el propio inicio de
+///     `STANDARD_USER_MEMORY`, justo tras el área reservada de 256 bytes
+///     del CE-161 según el manual — `0x0000-0x00FF`, no usada por el
+///     compilador, sin confirmar qué la usa en hardware real): código
+///     generado.
 ///   * área de datos de usuario (variables): justo después del código
 ///     real, calculado dinámicamente en tiempo de compilación (ver
 ///     `compile_native_two_pass` en `codegen::mod` — antes una constante
 ///     fija, que dos veces distintas quedó por detrás del crecimiento
 ///     real del código y las variables acabaron solapando código
 ///     todavía sin ejecutar).
-///   * `stack_top` (por defecto `0x5FFF`): tope de una pila propia, ver
-///     abajo.
+///   * `stack_top` (por defecto `0x47FF`): tope de una pila propia, ver
+///     abajo. Nota histórica: este backend usó antes `0x3800-0x5FFF`
+///     (CE-155, 10240 bytes) — CE-161 y CE-155 son módulos mutuamente
+///     excluyentes de Sharp (ocupan la misma ranura de expansión real),
+///     así que CE-161 SUSTITUYE a CE-155, no lo extiende.
 /// - La pila usa el registro hardware real `S` (no un puntero propio en
 ///   memoria como antes) — `S` se inicializa en el prólogo a `stack_top`
 ///   con `LDI S,#imm16` (opcode `0xAA`). Esto es compatible con las
@@ -41,6 +45,17 @@ use crate::codegen::stack_instruction::StackInstruction;
 use crate::codegen::rom_routines::RomRoutines;
 use crate::codegen::system_memory;
 use std::collections::HashMap;
+
+/// Suelo mínimo, en unidades de `TIME_DELAY` (15.625 ms cada una), que
+/// aplica CUALQUIER `WAIT n` de CUALQUIER programa compilado — ver el
+/// comentario largo de `StackInstruction::Wait` en `emit_instruction`
+/// para el porqué (código nativo ejecuta la aritmética entera muchísimo
+/// más rápido que el intérprete real, que siempre pasa por BCD; `WAIT`
+/// en sí ya es fiel al hardware, pero todo lo que lo rodea no lo es).
+/// Calibrado contra el único dato real medido hasta ahora (bathyscaph.bas,
+/// `WAIT 3` ≈ 47ms, confirmado por el usuario como el ritmo correcto) —
+/// candidato a refinarse con más programas verificados.
+const WAIT_MIN_TICKS: u8 = 3;
 
 /// Generador de código LH5801
 pub struct Lh5801Backend {
@@ -110,6 +125,12 @@ pub struct Lh5801Backend {
     /// programa — permite compartir la rutina horneando estos valores
     /// directamente en su cuerpo en vez de pasarlos por registro.
     concat_string_params: Option<(u8, u16, u16)>,
+
+    /// Región completa de variables de usuario (`data_base`, tamaño total
+    /// en bytes) — `None` si nadie la ha fijado con `set_variable_region`.
+    /// Ver el comentario de esa función y el de `emit_initialization` para
+    /// por qué el prólogo la pone a 0 de forma incondicional.
+    variable_region: Option<(u16, u16)>,
 }
 
 /// Tipo de referencia a etiqueta
@@ -175,8 +196,8 @@ impl Lh5801Backend {
             labels: HashMap::new(),
             label_refs: Vec::new(),
             rom_routines: RomRoutines::new(),
-            start_address: 0x3800, // Código: 0x3800+, el inicio real de la RAM de usuario con la expansión CE-155
-            stack_top: 0x5FFF,     // Pila propia: crece hacia abajo desde el tope de RAM mapeada (CE-155, ver memory.rs de ceres-core)
+            start_address: 0x0100, // Código: 0x0100+, tras el área reservada del CE-161 (ver comentario de arriba)
+            stack_top: 0x47FF,     // Pila propia: crece hacia abajo desde el tope de RAM mapeada (CE-161, ver memory.rs de ceres-core)
             string_refs: Vec::new(),
             data_pool: Vec::new(),
             data_line_table: Vec::new(),
@@ -184,6 +205,7 @@ impl Lh5801Backend {
             local_label_counter: 0,
             used_shared_routines: std::collections::HashSet::new(),
             concat_string_params: None,
+            variable_region: None,
         }
     }
 
@@ -203,7 +225,18 @@ impl Lh5801Backend {
             local_label_counter: 0,
             used_shared_routines: std::collections::HashSet::new(),
             concat_string_params: None,
+            variable_region: None,
         }
+    }
+
+    /// Fija la región completa de variables de usuario (`data_base`,
+    /// tamaño total en bytes) para que el prólogo (`emit_initialization`)
+    /// la ponga a 0 de forma incondicional al arrancar el programa. Debe
+    /// llamarse ANTES de `generate()` — `compile_native_two_pass` la
+    /// obtiene de `StackCodeGenerator` (que ya conoce el tamaño total tras
+    /// su propio recorrido) y se la pasa al backend antes de generar.
+    pub fn set_variable_region(&mut self, data_base: u16, size: u16) {
+        self.variable_region = Some((data_base, size));
     }
 
     /// Marca la subrutina compartida `name` como usada (para que
@@ -357,8 +390,30 @@ impl Lh5801Backend {
             self.add_label_ref(finish.clone(), RefType::Absolute16);
             self.emit_label_placeholder(RefType::Absolute16);
 
-            // 3 dígitos.
+            // 3 dígitos. Bug real encontrado jugando bombing.bas (score
+            // de 2 cifras mostrado como "1T" en vez de "12", W=54
+            // mostrado como "5T" en vez de "54"): `CHAR_OUT` no tiene
+            // ningún registro preservado documentado (`rom_routines.rs`:
+            // "preserved: Ninguno documentado") y usa `X` internamente
+            // para traducir `CURSOR_PTR` a una dirección de pantalla —
+            // así que imprimir el dígito de centenas/decenas ANTES de
+            // leer `XL` (unidades, dejado ahí por
+            // `emit_extract_hundreds_tens_units`) lo corrompía: el valor
+            // real de `XL` se perdía y `LDA XL` leía lo que `CHAR_OUT`
+            // hubiera dejado en `X` como efecto colateral, SIEMPRE el
+            // mismo byte sin importar el dígito real (confirmado
+            // probando 10 valores de 2 cifras distintos: el "dígito"
+            // corrupto era idéntico en todos, 'T' = 0x54). Arreglado
+            // convirtiendo las unidades a ASCII y guardándolas en
+            // memoria (`ARX`, libre aquí — `SystemOutInt` imprime
+            // enteros, nunca corre a la vez que aritmética real) ANTES
+            // de imprimir ningún otro dígito, y usando ese valor
+            // guardado al final en vez de releer `XL`.
             self.define_label(case_hundreds);
+            self.emit_byte(0x04); // LDA XL (unidades, todavía intacto)
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_byte(0xAE); self.emit_word(system_memory::ARX); // STA ARX (guardar unidades)
             self.emit_byte(0xA4); // LDA UH
             self.emit_byte(0xF9); // REC
             self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
@@ -367,27 +422,131 @@ impl Lh5801Backend {
             self.emit_byte(0xF9); // REC
             self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
             self.emit_call_char_out();
-            self.emit_byte(0x04); // LDA XL
-            self.emit_byte(0xF9); // REC
-            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_byte(0xA5); self.emit_word(system_memory::ARX); // LDA ARX (unidades guardadas)
             self.emit_call_char_out();
             self.emit_byte(0xBA); // JMP finish
             self.add_label_ref(finish.clone(), RefType::Absolute16);
             self.emit_label_placeholder(RefType::Absolute16);
 
-            // 2 dígitos.
+            // 2 dígitos. Mismo arreglo que arriba: guardar unidades
+            // ANTES de imprimir las decenas (que llama a CHAR_OUT y
+            // corrompería XL).
             self.define_label(case_tens);
+            self.emit_byte(0x04); // LDA XL (unidades, todavía intacto)
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_byte(0xAE); self.emit_word(system_memory::ARX); // STA ARX (guardar unidades)
             self.emit_byte(0x24); // LDA UL
             self.emit_byte(0xF9); // REC
             self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
             self.emit_call_char_out();
-            self.emit_byte(0x04); // LDA XL
-            self.emit_byte(0xF9); // REC
-            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_byte(0xA5); self.emit_word(system_memory::ARX); // LDA ARX (unidades guardadas)
             self.emit_call_char_out();
             // (cae en finish)
 
             self.define_label(finish);
+            self.emit_byte(0x9A); // RTN
+        }
+
+        if self.used_shared_routines.contains("SYSTEMOUTINTWORD") {
+            // PRINT de una variable "de palabra" (16 bits sin signo, ver
+            // `word_variables` en `mod.rs`): imprime hasta 5 dígitos
+            // decimales, sin ceros a la izquierda. El punto de llamada
+            // deja el valor ya en `XH:XL` (dos `pop` antes del `SJP`,
+            // igual que `SYSTEMOUTINT` deja el suyo en `A`).
+            self.define_label("__SHARED_SYSTEMOUTINTWORD".to_string());
+
+            let ten_thousands = system_memory::ARX;
+            let thousands = system_memory::ARX + 1;
+            let hundreds = system_memory::ARX + 2;
+            let tens = system_memory::ARX + 3;
+            let units = system_memory::ARX + 4;
+
+            self.emit_extract_word_digit(10000, ten_thousands);
+            self.emit_extract_word_digit(1000, thousands);
+            self.emit_extract_word_digit(100, hundreds);
+            self.emit_extract_word_digit(10, tens);
+            // Lo que queda en XL tras las 4 restas repetidas es, por
+            // construcción, siempre 0-9: las unidades.
+            self.emit_byte(0x04); // LDA XL
+            self.emit_byte(0xAE); self.emit_word(units); // STA units
+
+            // Despacho de "por qué dígito empezar a imprimir" (mismo
+            // patrón que los 3 casos de SYSTEMOUTINT, extendido a 5):
+            // cada bloque de impresión de abajo cae en el siguiente
+            // (imprimir desde el dígito N implica imprimir también todos
+            // los que le siguen), así que solo hace falta saltar al
+            // primer dígito no-nulo.
+            let print_from_thousands = self.new_local_label("PRINTWORD_FROM_THOUSANDS");
+            let print_from_hundreds = self.new_local_label("PRINTWORD_FROM_HUNDREDS");
+            let print_from_tens = self.new_local_label("PRINTWORD_FROM_TENS");
+            let print_from_units = self.new_local_label("PRINTWORD_FROM_UNITS");
+
+            self.emit_byte(0xA5); self.emit_word(ten_thousands); // LDA ten_thousands
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si ==0, saltar el JMP)
+            self.emit_byte(0xBA); // JMP (caer directo a imprimir desde ten_thousands: ya estamos ahí)
+            let print_from_ten_thousands = self.new_local_label("PRINTWORD_FROM_TEN_THOUSANDS");
+            self.add_label_ref(print_from_ten_thousands.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0xA5); self.emit_word(thousands); // LDA thousands
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3
+            self.emit_byte(0xBA); // JMP print_from_thousands
+            self.add_label_ref(print_from_thousands.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0xA5); self.emit_word(hundreds); // LDA hundreds
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3
+            self.emit_byte(0xBA); // JMP print_from_hundreds
+            self.add_label_ref(print_from_hundreds.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.emit_byte(0xA5); self.emit_word(tens); // LDA tens
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3
+            self.emit_byte(0xBA); // JMP print_from_tens
+            self.add_label_ref(print_from_tens.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            // Ninguno de los 4 dígitos altos es distinto de 0: solo
+            // unidades (incluye el caso del propio 0).
+            self.emit_byte(0xBA); // JMP print_from_units
+            self.add_label_ref(print_from_units.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(print_from_ten_thousands);
+            self.emit_byte(0xA5); self.emit_word(ten_thousands); // LDA ten_thousands
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+
+            self.define_label(print_from_thousands);
+            self.emit_byte(0xA5); self.emit_word(thousands); // LDA thousands
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+
+            self.define_label(print_from_hundreds);
+            self.emit_byte(0xA5); self.emit_word(hundreds); // LDA hundreds
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+
+            self.define_label(print_from_tens);
+            self.emit_byte(0xA5); self.emit_word(tens); // LDA tens
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+
+            self.define_label(print_from_units);
+            self.emit_byte(0xA5); self.emit_word(units); // LDA units
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xB3); self.emit_byte(0x30); // ADC A,#'0'
+            self.emit_call_char_out();
+
             self.emit_byte(0x9A); // RTN
         }
 
@@ -398,10 +557,43 @@ impl Lh5801Backend {
             // ROM cuya preservación de registros no está documentada),
             // balanceada dentro de esta misma rutina — no interfiere con
             // el `SJP`/`RTN` que la envuelven.
+            //
+            // Bug real de `bombing.bas` reportado por el usuario y
+            // CONTRASTADO EN VIVO contra la calculadora/ROM original: el
+            // mensaje de la línea 380 (`"SPACE : drop bomb (1/time)."`,
+            // 27 caracteres = 162 puntos, 1 más que los 156 reales de la
+            // pantalla) se ve completo en el original, sin que la "S"
+            // inicial se corrompa. Primer intento de arreglo (comprobar
+            // `CURSOR_PTR` ANTES de cada `CHAR_OUT` y saltarse el
+            // carácter si no cabe) fue un diagnóstico incompleto:
+            // trazando la ejecución instrucción a instrucción se
+            // confirmó que `CURSOR_PTR` avanza limpio 0,6,...,150 (26
+            // caracteres) y LUEGO salta directamente a 0 — es decir, es
+            // el propio `CHAR_OUT` real de la ROM el que, al dibujar el
+            // carácter 26 (que SÍ cabe entero, columnas 150-155),
+            // detecta que el SIGUIENTE avance (150+6=156) se saldría de
+            // rango y resetea `CURSOR_PTR` a 0 como efecto colateral de
+            // ESE dibujo — no del siguiente. El carácter 27 (el punto
+            // final) entonces se dibuja con total normalidad en la
+            // posición YA RESETEADA (columna 0), pisando la "S". El
+            // intérprete real de `PRINT`/`PAUSE`, a diferencia de
+            // nuestro bucle character-por-character con `CHAR_OUT`
+            // directo, evidentemente DETECTA este reseteo y CORTA ahí
+            // el resto de la cadena en vez de seguir imprimiendo desde
+            // la posición reseteada (probablemente por pasar antes por
+            // `OUT_BUF` con su propio recorte, un camino que no
+            // replicamos). Arreglado sin reproducir ese camino completo:
+            // tras cada `CHAR_OUT`, comparar `CURSOR_PTR` antes/después
+            // — si el valor bajó (en vez de haber avanzado +6, señal
+            // inequívoca de que la propia ROM acaba de resetearlo por
+            // desbordamiento), se corta el bucle ahí mismo, dejando el
+            // resto de la cadena sin imprimir, en vez de continuar
+            // dibujando desde la columna 0 recién reseteada.
             self.define_label("__SHARED_SYSTEMOUTSTRING".to_string());
 
             let loop_label = self.new_local_label("PRINTSTR_LOOP");
             let done_label = self.new_local_label("PRINTSTR_DONE");
+            let cursor_before = system_memory::ARY;
 
             self.define_label(loop_label.clone());
             self.emit_byte(0x15); // LDA (Y)
@@ -412,11 +604,32 @@ impl Lh5801Backend {
             self.emit_label_placeholder(RefType::Absolute16);
 
             self.emit_byte(0x0A); // STA XL (guardar el carácter)
+
+            self.emit_byte(0xA5); self.emit_word(system_memory::CURSOR_PTR); // LDA (CURSOR_PTR)
+            self.emit_byte(0xAE); self.emit_word(cursor_before); // STA cursor_before
+
             self.emit_byte(0xFD); self.emit_byte(0x98); // PSH Y
             self.emit_byte(0x04); // LDA XL
             self.emit_call_char_out();
             self.emit_byte(0xFD); self.emit_byte(0x1A); // POP Y
 
+            // ¿CURSOR_PTR bajó en vez de avanzar (desbordamiento real
+            // detectado por la propia ROM al dibujar este carácter)?
+            self.emit_byte(0xA5); self.emit_word(system_memory::CURSOR_PTR); // LDA (CURSOR_PTR)
+            self.emit_byte(0x2A); // STA UL (para la resta de abajo)
+            self.emit_byte(0xA5); self.emit_word(cursor_before); // LDA cursor_before
+            self.emit_byte(0xFB); // SEC
+            self.emit_byte(0x20); // SBC UL  (cursor_before - CURSOR_PTR_actual)
+            self.emit_byte(0x83); self.emit_byte(0x03); // BCS +3 (si cursor_before>=actual, es decir bajó o igual: saltar el JMP)
+            self.emit_byte(0xBA); // JMP continue_loop (si actual>cursor_before: avanzó normal, seguir)
+            let continue_loop = self.new_local_label("PRINTSTR_CONTINUE");
+            self.add_label_ref(continue_loop.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+            self.emit_byte(0xBA); // JMP done (bajó: la ROM acaba de resetear el cursor, cortar aquí)
+            self.add_label_ref(done_label.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(continue_loop);
             self.emit_byte(0x54); // Y++
             self.emit_byte(0xBA); // JMP loop
             self.add_label_ref(loop_label, RefType::Absolute16);
@@ -680,6 +893,146 @@ impl Lh5801Backend {
         for i in 0..system_memory::DISPLAY_SYMBOLS_LEN {
             self.emit_byte(0xAE); // STA addr
             self.emit_word(system_memory::DISPLAY_SYMBOLS + i);
+        }
+
+        // 5. Reiniciar el "puntero RND" real de la ROM ($7B01-$7B07, ver
+        // `StackInstruction::CallRnd`) a su valor de arranque en frío —
+        // `0xFF` en los 7 bytes, el mismo con el que `MemoryBus::new()`
+        // rellena toda `standard_user_system_memory`. Sin esto, cargar el
+        // MISMO programa dos veces en la misma sesión del emulador (sin
+        // reiniciar la app — el flujo real de "Cargar" en la GUI) deja el
+        // puntero donde lo dejó la partida anterior, y `RND()` continúa
+        // esa secuencia en vez de repetirla: el mapa de `bathyscaph.bas`
+        // (`RESTORE 999+RND 16`, sin llamar nunca a `RANDOM`) saldría
+        // distinto en la segunda carga aunque el original siempre
+        // muestre el mismo mapa. Mismo bug, mismo remedio, que el que ya
+        // se arregló para `__RND_SEED` en `StackCodeGenerator::generate`
+        // (`mod.rs`) cuando `RND()` todavía usaba el LFSR mock — ahora
+        // ese reset de `__RND_SEED` ha quedado obsoleto para `RND()`
+        // (sigue siendo el que usa `RANDOM`, ver el comentario de
+        // `StackInstruction::Random`) y este lo sustituye para el
+        // mecanismo real. Incondicional para cualquier programa, no solo
+        // los que usan `RND`/`RESTORE`+`RND` — unos pocos bytes fijos de
+        // coste, igual que el resto de esta rutina.
+        // El "puntero RND" real de la ROM ($7B00-$7B07, símbolo `RND_VAL`
+        // en el desensamblado — ver `StackInstruction::CallRnd`) no
+        // arranca en `0xFF` puro para el primer `RND()` de un programa
+        // real: la propia secuencia de arranque de la ROM (`RESET_6`,
+        // ~$E07E) llama a `RAND_GEN_5` ($F61B) UNA vez, con `ARX`
+        // poblado por `BCMD_PI` ("cargar PI"), como parte de inicializar
+        // el sistema — antes de que cualquier programa BASIC del usuario
+        // ejecute nada. Escribir directamente el resultado de ESE avance
+        // en vez de replicar la llamada a `BCMD_PI` + `RAND_GEN_5`:
+        // `BCMD_PI` lee su constante desde `$7AF8` vía un mecanismo de
+        // acceso a memoria (posible mapeo ME1/sombra de ROM) que
+        // `ceres-core` no reproduce — en este emulador esa dirección es
+        // simplemente RAM sin inicializar (`0xFF×8`, confirmado
+        // leyéndola tras un arranque limpio), así que el resultado NO es
+        // el `PI` matemático real, sino un valor específico de este
+        // emulador — pero es exactamente ESE valor (no el `PI` real) el
+        // que determina el estado desde el que arranca `bathyscaph.bas`
+        // cuando se ejecuta de verdad en `ceres-core`, así que es ese el
+        // que hay que reproducir para que el mapa coincida.
+        //
+        // Confirmado en dos direcciones independientes: (1) un `Pc1500`
+        // recién creado, dejado arrancar 30 `step_frame()` SIN ninguna
+        // tecla (nada de esto depende de interacción del usuario — es
+        // arranque puro), da `RND_VAL=[FF,00,22,56,63,10,32,58]`; (2) la
+        // ejecución real de `bathyscaph.bas` tecleando RUN en la GUI
+        // (trazador temporal en `ceres-core`) muestra exactamente ese
+        // mismo valor como el estado desde el que arranca el primer
+        // `RESTORE 999+RND 16` del juego. Sin este arreglo, el mapa de
+        // la cueva salía determinista pero con una secuencia DISTINTA a
+        // la del original — el algoritmo de `RAND_GEN_3` en sí ya era
+        // correcto (verificado por separado: `RND(1)` siempre da 1), lo
+        // que faltaba era partir del mismo punto de la secuencia.
+        for (offset, byte) in [0xFFu8, 0x00, 0x22, 0x56, 0x63, 0x10, 0x32, 0x58].into_iter().enumerate() {
+            self.emit_byte(0xB5); // LDI A,#imm
+            self.emit_byte(byte);
+            self.emit_byte(0xAE); // STA addr
+            self.emit_word(0x7B00 + offset as u16);
+        }
+
+        // 7. Poner a 0 TODA la región de variables de usuario
+        // (`data_base`..`data_base+size`, fijada por `set_variable_region`
+        // — `None` para el arnés de test/backend suelto que no la usa,
+        // en cuyo caso este paso simplemente no emite nada).
+        //
+        // Bug real jugando bathyscaph.bas de verdad en la GUI (no en
+        // ningún test aislado): el botón "Cargar" de la GUI reutiliza el
+        // MISMO `Pc1500` para cargar un `.lh5` nuevo — `load_lh5_file`
+        // solo sobreescribe los bytes del CÓDIGO, nunca la región de
+        // variables. La primera partida tras pulsar "Cargar" arrancaba
+        // con `S`/`R`/`Q` (la estela del submarino) llenos de lo que
+        // hubiera en esa memoria de una ejecución anterior — un patrón
+        // con pinta de ruido, visible desde el primer submarino, que
+        // "se corregía solo" en la segunda partida porque el `CLEAR` de
+        // la subrutina "CRASH" (ya arreglado, ver `StackInstruction::Clear`)
+        // sí pone esas variables a 0 al primer choque, y de ahí en
+        // adelante se queda estable. Mismo diagnóstico y mismo remedio
+        // que ya se aplicó para `RND_VAL`/`__RND_SEED` (bug del mapa
+        // aleatorio) — incondicional para cualquier programa, no solo
+        // los que declaran variables, para no depender de un `CLEAR`
+        // explícito en el código fuente que además podría nunca
+        // alcanzar todas las variables (ver la limitación de una sola
+        // pasada documentada en `gen_clear`, `mod.rs`).
+        if let Some((data_base, size)) = self.variable_region {
+            if size > 0 {
+                self.emit_byte(0x48); self.emit_byte((data_base >> 8) as u8); // LDI XH
+                self.emit_byte(0x4A); self.emit_byte((data_base & 0xFF) as u8); // LDI XL
+                self.emit_byte(0x68); self.emit_byte((size >> 8) as u8); // LDI UH
+                self.emit_byte(0x6A); self.emit_byte((size & 0xFF) as u8); // LDI UL
+
+                let loop_label = self.new_local_label("INIT_VARS_LOOP");
+                let body_label = self.new_local_label("INIT_VARS_BODY");
+                let done_label = self.new_local_label("INIT_VARS_DONE");
+                let borrow_label = self.new_local_label("INIT_VARS_BORROW");
+
+                self.define_label(loop_label.clone());
+                // ¿UH==0 y UL==0? (cuenta agotada)
+                self.emit_byte(0xA4); // LDA UH
+                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si UH==0, saltar el JMP)
+                self.emit_byte(0xBA); // JMP body (si UH!=0)
+                self.add_label_ref(body_label.clone(), RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+                self.emit_byte(0x24); // LDA UL
+                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si UL==0, saltar el JMP: seguir a done)
+                self.emit_byte(0xBA); // JMP body (si UL!=0)
+                self.add_label_ref(body_label.clone(), RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+                self.emit_byte(0xBA); // JMP done (UH==0 y UL==0)
+                self.add_label_ref(done_label.clone(), RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+
+                self.define_label(body_label);
+                self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+                self.emit_byte(0x41); // SIN X (STA (X); X++)
+
+                // UL -= 1 (con acarreo hacia UH si hace falta).
+                self.emit_byte(0x24); // LDA UL
+                self.emit_byte(0xFB); // SEC
+                self.emit_byte(0xB1); self.emit_byte(0x01); // SBC A,#1
+                self.emit_byte(0x2A); // STA UL
+                self.emit_byte(0x83); self.emit_byte(0x03); // BCS +3 (si no hubo acarreo, saltar el JMP)
+                self.emit_byte(0xBA); // JMP borrow (si UL desbordó: UL era 0)
+                self.add_label_ref(borrow_label.clone(), RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+                self.emit_byte(0xBA); // JMP loop (sin acarreo)
+                self.add_label_ref(loop_label.clone(), RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+
+                self.define_label(borrow_label);
+                self.emit_byte(0xA4); // LDA UH
+                self.emit_byte(0xDF); // DEC A
+                self.emit_byte(0x28); // STA UH
+                self.emit_byte(0xBA); // JMP loop
+                self.add_label_ref(loop_label, RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+
+                self.define_label(done_label);
+            }
         }
     }
     
@@ -1460,6 +1813,67 @@ impl Lh5801Backend {
         self.define_label(tens_done);
     }
 
+    /// Extrae UN dígito decimal de un acumulador de 16 bits en `XH:XL`
+    /// por resta repetida de `place` (p.ej. 10000/1000/100/10), dejando
+    /// el resto en `XH:XL` para la siguiente llamada (con un `place`
+    /// menor) y el dígito (0-9) guardado en `digit_addr` — usado por
+    /// `SystemOutIntWord` para imprimir enteros de 16 bits. A diferencia
+    /// de `emit_extract_hundreds_tens_units` (que deja los dígitos en
+    /// `UH`/`UL`/`XL`, registros), este guarda DIRECTAMENTE en memoria:
+    /// con 5 dígitos posibles no hay suficientes registros libres para
+    /// mantenerlos todos intactos hasta el momento de imprimir, y
+    /// `CHAR_OUT` corrompe `X` (ver el comentario largo de
+    /// `SystemOutInt`/`SYSTEMOUTINT` sobre el bug real de bombing.bas que
+    /// esto ya causó una vez) — la memoria no tiene ese problema.
+    ///
+    /// Resta condicional de 16 bits: intenta `XH:XL - place` en `A`/`YL`
+    /// (tentativo, sin tocar `XH:XL` todavía); si el resultado no pide
+    /// préstamo (Carry=1 tras la resta del byte alto, encadenada sin
+    /// `SEC` — mismo convenio que `RestaWordWord`), confirma el resultado
+    /// en `XH:XL` y repite; si pide préstamo, para (la resta no cabía) y
+    /// guarda el contador de vueltas como el dígito.
+    fn emit_extract_word_digit(&mut self, place: u16, digit_addr: u16) {
+        let place_hi = (place >> 8) as u8;
+        let place_lo = (place & 0xFF) as u8;
+
+        let loop_label = self.new_local_label("EXTRACT_WORD_DIGIT_LOOP");
+        let done_label = self.new_local_label("EXTRACT_WORD_DIGIT_DONE");
+
+        self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+        self.emit_byte(0x2A); // STA UL (contador de dígito = 0)
+
+        self.define_label(loop_label.clone());
+        // Intento (tentativo, sin confirmar todavía): A = XL - place_lo.
+        self.emit_byte(0x04); // LDA XL
+        self.emit_byte(0xFB); // SEC
+        self.emit_byte(0xB1); self.emit_byte(place_lo); // SBC A,#place_lo
+        self.emit_byte(0x1A); // STA YL (byte bajo tentativo)
+        // A = XH - place_hi - préstamo del byte bajo (SIN SEC: encadenado).
+        self.emit_byte(0x84); // LDA XH
+        self.emit_byte(0xB1); self.emit_byte(place_hi); // SBC A,#place_hi
+        // Carry=0 (préstamo global, XH:XL < place): terminar sin confirmar.
+        self.emit_byte(0x83); self.emit_byte(0x03); // BCS +3 (si Carry=1, saltar el JMP y confirmar)
+        self.emit_byte(0xBA); // JMP done (si Carry=0)
+        self.add_label_ref(done_label.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        // Confirmar: XH = A (resultado alto ya calculado), XL = YL
+        // (resultado bajo tentativo), contador++, repetir.
+        self.emit_byte(0x08); // STA XH
+        self.emit_byte(0x14); // LDA YL
+        self.emit_byte(0x0A); // STA XL
+        self.emit_byte(0x24); // LDA UL
+        self.emit_byte(0xDD); // INC A
+        self.emit_byte(0x2A); // STA UL
+        self.emit_byte(0xBA); // JMP loop
+        self.add_label_ref(loop_label, RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(done_label);
+        self.emit_byte(0x24); // LDA UL
+        self.emit_byte(0xAE); self.emit_word(digit_addr); // STA digit_addr
+    }
+
     /// `A = A*10 + Mem[digit_addr]`, usando SOLO `A` y memoria como
     /// scratch (`temp1_addr`, `temp2_addr`) — a diferencia de
     /// `emit_a_times10_plus_ul`, no toca `X`/`Y`, para poder usarse
@@ -1618,6 +2032,151 @@ impl Lh5801Backend {
         self.emit_byte(0xBA); // JMP finish
         self.add_label_ref(finish.clone(), RefType::Absolute16);
         self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(finish);
+    }
+
+    /// Como `emit_int_a_to_bcd_arx`, pero para un entero SIN signo de 16
+    /// bits ya en el registro `X` (no en `A`) — necesario para `RND(n)`
+    /// auténtico, cuyo argumento `n` puede superar 255 (p. ej. `RND
+    /// 256`). Soporta 0-999 (3 dígitos decimales, igual límite que
+    /// `emit_int_a_to_bcd_arx`, solo que alcanzable ahora también con
+    /// `n` de 16 bits): extrae la cifra de las centenas por resta
+    /// repetida de 100 sobre el PAR de 16 bits (encadenando el acarreo
+    /// de `SBC` de `XL` a `XH`, convención estándar de resta
+    /// multi-byte), dejando en `X` un resto ya de 8 bits que delega en
+    /// `emit_extract_hundreds_tens_units` para decenas/unidades. Valores
+    /// de entrada >999 no están soportados por este backend (ningún
+    /// programa del corpus real necesita más — el único caso que se
+    /// acerca, `RND 1000` en `micromur.bas`, se clampa en tiempo de
+    /// compilación en `FunctionInner::Rnd`, `mod.rs`, antes de llegar
+    /// aquí) — si ocurriera en tiempo de ejecución con un valor
+    /// calculado dinámicamente, el bucle de extracción simplemente sigue
+    /// contando centenas más allá de 9, produciendo un dígito BCD
+    /// inválido (nibble >9) en `ARX`: no crashea, pero el resultado de
+    /// `RAND_GEN_3` sobre ese `ARX` queda indefinido.
+    fn emit_u16_x_to_bcd_arx(&mut self) {
+        let is_big = self.new_local_label("U16BCD_IS_BIG");
+        let loop_label = self.new_local_label("U16BCD_LOOP");
+        let done_extract = self.new_local_label("U16BCD_DONE_EXTRACT");
+        let case_hundreds = self.new_local_label("U16BCD_CASE_HUNDREDS");
+        let case_tens = self.new_local_label("U16BCD_CASE_TENS");
+        let finish = self.new_local_label("U16BCD_FINISH");
+
+        // Scratch temporal para la cifra real de centenas (0-9 en el
+        // rango soportado) — memoria, no un registro, porque
+        // `emit_extract_hundreds_tens_units` (llamado más abajo sobre el
+        // resto <100) reutiliza UH/UL/XL como registros de trabajo
+        // propios y los machacaría.
+        let hundreds_scratch = system_memory::ARY + 6;
+        self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+        self.emit_byte(0xAE); // STA addr (centenas = 0)
+        self.emit_word(hundreds_scratch);
+
+        self.define_label(loop_label.clone());
+        // ¿X >= 100? (XH!=0, o XH==0 y XL>=100)
+        self.emit_byte(0x84); // LDA XH
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si XH==0, saltar el JMP)
+        self.emit_byte(0xBA); // JMP is_big (si XH!=0: X>=256>100)
+        self.add_label_ref(is_big.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+        self.emit_byte(0x04); // LDA XL
+        self.emit_byte(0xB7); self.emit_byte(100); // CPI A,#100
+        self.emit_byte(0x83); self.emit_byte(0x03); // BCS +3 (si XL>=100, saltar el JMP)
+        self.emit_byte(0xBA); // JMP done_extract (si XL<100 y XH==0: resto encontrado)
+        self.add_label_ref(done_extract.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(is_big);
+        // X -= 100 (resta de 16 bits encadenando el acarreo de SBC:
+        // SEC+SBC en XL, luego SBC sin SEC en XH reutiliza el carry).
+        self.emit_byte(0x04); // LDA XL
+        self.emit_byte(0xFB); // SEC
+        self.emit_byte(0xB1); self.emit_byte(100); // SBC A,#100
+        self.emit_byte(0x0A); // STA XL
+        self.emit_byte(0x84); // LDA XH
+        self.emit_byte(0xB1); self.emit_byte(0x00); // SBC A,#0 (propaga el acarreo, sin SEC)
+        self.emit_byte(0x08); // STA XH
+        self.emit_byte(0xA5); // LDA addr (centenas)
+        self.emit_word(hundreds_scratch);
+        self.emit_byte(0xDD); // INC A
+        self.emit_byte(0xAE); // STA addr (centenas)
+        self.emit_word(hundreds_scratch);
+        self.emit_byte(0xBA); // JMP loop
+        self.add_label_ref(loop_label, RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.define_label(done_extract);
+        // X ya es el resto (0-99, XH==0): decenas/unidades vía el
+        // helper de 8 bits existente.
+        self.emit_byte(0x04); // LDA XL
+        self.emit_extract_hundreds_tens_units(); // -> UH=0 (descartado), UL=decenas, XL=unidades
+
+        // ARX a cero.
+        self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+        for offset in 0..8u16 {
+            self.emit_byte(0xAE);
+            self.emit_word(system_memory::ARX + offset);
+        }
+
+        self.emit_byte(0xA5); // LDA addr (centenas reales)
+        self.emit_word(hundreds_scratch);
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si centenas==0, saltar el JMP)
+        self.emit_byte(0xBA); // JMP case_hundreds (si centenas!=0)
+        self.add_label_ref(case_hundreds.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        self.emit_byte(0x24); // LDA UL (decenas)
+        self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+        self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si decenas==0, saltar el JMP)
+        self.emit_byte(0xBA); // JMP case_tens (si decenas!=0)
+        self.add_label_ref(case_tens.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        // Solo unidades: exponente=0 (ya en ARX+0), ARX+2 = unidades<<4.
+        self.emit_byte(0x04); // LDA XL (unidades)
+        self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); // SHL x4
+        self.emit_byte(0xAE); // STA addr (ARX+2)
+        self.emit_word(system_memory::ARX + 2);
+        self.emit_byte(0xBA); // JMP finish
+        self.add_label_ref(finish.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        // Decenas+unidades (centenas==0): exponente=1, ARX+2=(decenas<<4)|unidades.
+        self.define_label(case_tens);
+        self.emit_byte(0xB5); self.emit_byte(0x01); // LDI A,#1
+        self.emit_byte(0xAE); // STA addr (ARX+0, exponente)
+        self.emit_word(system_memory::ARX);
+        self.emit_byte(0x04); // LDA XL (unidades)
+        self.emit_byte(0x28); // STA UH (aparcar unidades)
+        self.emit_byte(0x24); // LDA UL (decenas)
+        self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); // SHL x4
+        self.emit_byte(0xF9); // REC
+        self.emit_byte(0xA2); // ADC UH
+        self.emit_byte(0xAE); // STA addr (ARX+2)
+        self.emit_word(system_memory::ARX + 2);
+        self.emit_byte(0xBA); // JMP finish
+        self.add_label_ref(finish.clone(), RefType::Absolute16);
+        self.emit_label_placeholder(RefType::Absolute16);
+
+        // Centenas+decenas+unidades: exponente=2, ARX+2=(centenas<<4)|decenas, ARX+3=unidades<<4.
+        self.define_label(case_hundreds);
+        self.emit_byte(0xB5); self.emit_byte(0x02); // LDI A,#2
+        self.emit_byte(0xAE); // STA addr (ARX+0, exponente)
+        self.emit_word(system_memory::ARX);
+        self.emit_byte(0xA5); // LDA addr (centenas)
+        self.emit_word(hundreds_scratch);
+        self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); // SHL x4
+        self.emit_byte(0xF9); // REC
+        self.emit_byte(0x22); // ADC UL (decenas)
+        self.emit_byte(0xAE); // STA addr (ARX+2)
+        self.emit_word(system_memory::ARX + 2);
+        self.emit_byte(0x04); // LDA XL (unidades)
+        self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); // SHL x4
+        self.emit_byte(0xAE); // STA addr (ARX+3)
+        self.emit_word(system_memory::ARX + 3);
 
         self.define_label(finish);
     }
@@ -2132,6 +2691,80 @@ impl Lh5801Backend {
                 self.emit_byte(0x84); // LDA XH
                 self.emit_push_a();
                 self.emit_byte(0x04); // LDA XL
+                self.emit_push_a();
+            }
+
+            StackInstruction::SumaWordWord => {
+                // Pop b (16 bits: alto luego bajo, el bajo queda encima),
+                // Pop a (igual), Push (a+b) de 16 bits. Mismo patrón de
+                // acarreo encadenado que SumaIntWord, pero ambos operandos
+                // de 16 bits — ver el comentario largo de
+                // `StackInstruction::SumaWordWord` en stack_instruction.rs.
+                self.emit_pop_a();
+                self.emit_byte(0x2A); // STA UL (b, byte bajo)
+                self.emit_pop_a();
+                self.emit_byte(0x28); // STA UH (b, byte alto)
+
+                self.emit_pop_a();
+                self.emit_byte(0x0A); // STA XL (a, byte bajo)
+                self.emit_pop_a();
+                self.emit_byte(0x08); // STA XH (a, byte alto)
+
+                self.emit_byte(0x04); // LDA XL
+                self.emit_byte(0xF9); // REC
+                self.emit_byte(0x22); // ADC UL -> byte bajo del resultado, Carry actualizado
+                self.emit_byte(0x0A); // STA XL
+
+                self.emit_byte(0x84); // LDA XH (no toca Carry)
+                self.emit_byte(0xA2); // ADC UH -> propaga el acarreo del byte bajo
+                self.emit_byte(0x08); // STA XH
+
+                self.emit_byte(0x84); // LDA XH
+                self.emit_push_a();
+                self.emit_byte(0x04); // LDA XL
+                self.emit_push_a();
+            }
+
+            StackInstruction::RestaWordWord => {
+                // Como SumaWordWord, pero resta: Pop b, Pop a, Push (a-b),
+                // ambos de 16 bits. SEC antes de la resta del byte bajo
+                // (no REC — ver la nota en RestaInt sobre por qué SBC
+                // necesita Carry=1 para una resta simple), luego SBC del
+                // byte alto SIN reiniciar Carry, propagando el préstamo
+                // igual que SumaWordWord propaga el acarreo.
+                self.emit_pop_a();
+                self.emit_byte(0x2A); // STA UL (b, byte bajo)
+                self.emit_pop_a();
+                self.emit_byte(0x28); // STA UH (b, byte alto)
+
+                self.emit_pop_a();
+                self.emit_byte(0x0A); // STA XL (a, byte bajo)
+                self.emit_pop_a();
+                self.emit_byte(0x08); // STA XH (a, byte alto)
+
+                self.emit_byte(0x04); // LDA XL
+                self.emit_byte(0xFB); // SEC
+                self.emit_byte(0x20); // SBC UL -> byte bajo del resultado, Carry = NOT préstamo
+                self.emit_byte(0x0A); // STA XL
+
+                self.emit_byte(0x84); // LDA XH (no toca Carry)
+                self.emit_byte(0xA0); // SBC UH -> propaga el préstamo del byte bajo
+                self.emit_byte(0x08); // STA XH
+
+                self.emit_byte(0x84); // LDA XH
+                self.emit_push_a();
+                self.emit_byte(0x04); // LDA XL
+                self.emit_push_a();
+            }
+
+            StackInstruction::TruncateWordToInt => {
+                // Pop valor de 16 bits (bajo encima), Push solo el byte
+                // bajo como entero de 8 bits — descarta el alto. Ver el
+                // comentario largo en stack_instruction.rs.
+                self.emit_pop_a();
+                self.emit_byte(0x2A); // STA UL (byte bajo, guardarlo)
+                self.emit_pop_a(); // descartar byte alto
+                self.emit_byte(0x24); // LDA UL
                 self.emit_push_a();
             }
 
@@ -2819,6 +3452,21 @@ impl Lh5801Backend {
                 self.emit_call_shared("SYSTEMOUTINT");
             }
 
+            StackInstruction::SystemOutIntWord => {
+                // PRINT de una variable "de palabra" (16 bits sin signo)
+                // — ver el comentario largo en stack_instruction.rs y la
+                // rutina compartida `SYSTEMOUTINTWORD`. Pop bajo (encima
+                // de la pila) a XL, pop alto a XH, antes del `SJP` (mismo
+                // motivo que `SystemOutInt`: la rutina compartida no
+                // puede tocar la pila hardware, la comparte con el
+                // `SJP`/`RTN`).
+                self.emit_pop_a();
+                self.emit_byte(0x0A); // STA XL
+                self.emit_pop_a();
+                self.emit_byte(0x08); // STA XH
+                self.emit_call_shared("SYSTEMOUTINTWORD");
+            }
+
             StackInstruction::SystemOutString => {
                 // PRINT de una cadena: pop puntero (Y), recorrer hasta el
                 // primer NUL, CHAR_OUT cada byte. Instrucción más
@@ -2840,7 +3488,53 @@ impl Lh5801Backend {
                 let total_len = 1
                     + *digits_before as u16
                     + if *digits_after > 0 { 1 + *digits_after as u16 } else { 0 };
-                self.emit_print_fixed_buffer_range(buf, buf + total_len);
+
+                if *forced_sign {
+                    self.emit_print_fixed_buffer_range(buf, buf + total_len);
+                } else {
+                    // Sin especificador de signo explícito (`+`) en el
+                    // patrón, la ROM real NO reserva columna de signo para
+                    // valores positivos — confirmado empíricamente
+                    // comparando `CURSOR 22:PRINT USING "####";99` entre
+                    // el programa original tokenizado (vía lhasm, cargado
+                    // en `ceres-core` igual que bathyscaph) y esta misma
+                    // sentencia compilada: el original imprime "99" en 2
+                    // columnas de caracteres, no " 99" en 3, dejando el
+                    // score exactamente en el borde derecho del display
+                    // (156 puntos = 26 columnas de texto). Reservar
+                    // siempre esa columna de más (como hacía este backend
+                    // antes) desplazaba el score 6 puntos de más hacia la
+                    // derecha, desbordando la columna 155 — lo que
+                    // `CHAR_OUT`/`INIT_MTRX` interpreta como "fin de
+                    // pantalla" y reinicia el cursor a la columna 0,
+                    // dibujando el último dígito ENCIMA de la trayectoria
+                    // del avión en bombing.bas: el bug de "el avión choca
+                    // contra el score" no era más que este único carácter
+                    // de más, mal colocado.
+                    //
+                    // El byte de signo que `emit_format_real_to_buffer`
+                    // dejó en `ARX+1` sigue intacto (nada lo toca durante
+                    // la extracción de dígitos), así que decidimos en
+                    // tiempo de EJECUCIÓN dónde empieza la impresión:
+                    // `buf+1` (sin el signo) si es positivo, `buf` (con
+                    // el '-') si es negativo.
+                    self.emit_byte(0xA5); self.emit_word(system_memory::ARX + 1); // LDA sign byte
+                    self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+                    let negative = self.new_local_label("USING_SIGN_NEG");
+                    let done = self.new_local_label("USING_SIGN_DONE");
+                    self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si Z/positivo, saltar el JMP)
+                    self.emit_byte(0xBA); // JMP negative (si signo!=0)
+                    self.add_label_ref(negative.clone(), RefType::Absolute16);
+                    self.emit_label_placeholder(RefType::Absolute16);
+                    // Positivo (cae aquí sin salto): sin columna de signo.
+                    self.emit_print_fixed_buffer_range(buf + 1, buf + total_len);
+                    self.emit_byte(0xBA); // JMP done
+                    self.add_label_ref(done.clone(), RefType::Absolute16);
+                    self.emit_label_placeholder(RefType::Absolute16);
+                    self.define_label(negative);
+                    self.emit_print_fixed_buffer_range(buf, buf + total_len);
+                    self.define_label(done);
+                }
             }
 
             StackInstruction::PrintRealNatural(buf) => {
@@ -2900,12 +3594,55 @@ impl Lh5801Backend {
                 }
             }
 
-            StackInstruction::Clear => {
-                // CLEAR real (DEL_STD_VARS) borra la tabla de variables
-                // del INTÉRPRETE de la ROM ($7650-$76FF/$77xx), que nunca
-                // usamos (nuestras variables viven en DATA_BASE,
-                // $5000+) — no-op deliberado, ver comentario en
-                // rom_routines.rs::DEL_STD_VARS.
+            StackInstruction::ClsIfNoCursor => {
+                // CLR_NO_CURSOR real: solo limpia pantalla + resetea
+                // CURSOR_PTR si CURSOR_ENA bit0=0 (ver el comentario largo
+                // de la instrucción en stack_instruction.rs). Es lo que
+                // llaman de verdad PRINT/PAUSE, no el Cls incondicional.
+                if let Some(addr) = self.rom_routines.address("CLR_NO_CURSOR") {
+                    self.emit_call_rom(addr);
+                } else {
+                    eprintln!("WARNING: Rutina ROM CLR_NO_CURSOR no encontrada");
+                }
+            }
+
+            StackInstruction::Clear(regions) => {
+                // CLEAR real (DEL_STD_VARS de la ROM borra la tabla de
+                // variables del INTÉRPRETE, que nunca usamos — nuestras
+                // variables viven en DATA_BASE) — en vez de eso, ponemos
+                // a 0 directamente cada región de memoria que ocupa una
+                // variable/array de usuario, calculadas por
+                // `gen_clear` en `mod.rs` (ver el comentario allí para
+                // qué se incluye y qué se excluye deliberadamente).
+                // Cada región usa X como puntero y UL como contador de 8
+                // bits (`gen_clear` trocea cualquier región >255 bytes).
+                for (addr, count) in regions {
+                    if *count == 0 {
+                        continue;
+                    }
+                    self.emit_byte(0x48); self.emit_byte((*addr >> 8) as u8); // LDI XH
+                    self.emit_byte(0x4A); self.emit_byte((*addr & 0xFF) as u8); // LDI XL
+                    self.emit_byte(0x6A); self.emit_byte(*count as u8); // LDI UL,#count (0 == 256)
+                    self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+
+                    let loop_label = self.new_local_label("CLEAR_REGION_LOOP");
+                    self.define_label(loop_label.clone());
+                    self.emit_byte(0x41); // SIN X (STA (X); X++)
+                    self.emit_byte(0x24); // LDA UL
+                    self.emit_byte(0xDF); // DEC A
+                    self.emit_byte(0x2A); // STA UL
+                    self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+                    self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si UL!=0, saltar el JMP)
+                    self.emit_byte(0xBA); // JMP fin del bucle (si UL==0)
+                    let loop_done = self.new_local_label("CLEAR_REGION_DONE");
+                    self.add_label_ref(loop_done.clone(), RefType::Absolute16);
+                    self.emit_label_placeholder(RefType::Absolute16);
+                    self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0 (SIN X lo destruyó)
+                    self.emit_byte(0xBA); // JMP loop_label
+                    self.add_label_ref(loop_label, RefType::Absolute16);
+                    self.emit_label_placeholder(RefType::Absolute16);
+                    self.define_label(loop_done);
+                }
             }
 
             StackInstruction::OnErrorGoto(_label) => {
@@ -2927,8 +3664,32 @@ impl Lh5801Backend {
                 // intérprete más tarde — no reutilizable directamente —
                 // así que se llama a la primitiva real que sí ejecuta la
                 // espera en el momento.
+                //
+                // Suelo mínimo (WAIT_MIN_TICKS): si `n` es menor que este
+                // valor, se sustituye por él antes de llamar a
+                // TIME_DELAY — aplicado SIEMPRE, a cualquier `WAIT` de
+                // cualquier programa, no solo a uno concreto. Motivo: el
+                // código nativo ejecuta la aritmética entera (H, G, P...)
+                // con instrucciones de CPU directas, mientras que el
+                // intérprete real de la ROM la hace SIEMPRE a través de
+                // sus rutinas BCD de coma flotante (incluso para lo que
+                // en el fuente parece un entero normal) — mucho más
+                // lentas. `WAIT` en sí ya es fiel (llama a la misma
+                // rutina real en los dos modelos), pero TODO lo demás
+                // alrededor corre órdenes de magnitud más rápido en
+                // nativo, así que cualquier `WAIT n` con `n` pequeño (o
+                // 0, el caso de un programa que nunca calibró un ritmo
+                // explícito porque el propio intérprete ya se lo daba
+                // gratis) deja el ritmo real muchísimo más rápido que el
+                // original. Calibrado empíricamente contra bathyscaph.bas
+                // (WAIT_MIN_TICKS=3, ≈47ms, confirmado por el usuario
+                // como el ritmo correcto) — el único dato real medido que
+                // tenemos; candidato a refinarse con más programas.
                 self.emit_pop_a();
-                self.emit_byte(0x2A); // STA UL (n)
+                self.emit_byte(0xB7); self.emit_byte(WAIT_MIN_TICKS); // CPI A,#WAIT_MIN_TICKS
+                self.emit_byte(0x83); self.emit_byte(0x02); // BCS +2 (si A>=suelo, saltar el LDI de abajo)
+                self.emit_byte(0xB5); self.emit_byte(WAIT_MIN_TICKS); // LDI A,#WAIT_MIN_TICKS (solo si A<suelo)
+                self.emit_byte(0x2A); // STA UL (n, ya con el suelo aplicado)
                 self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
                 self.emit_byte(0x28); // STA UH (parte alta de U-Reg a 0)
 
@@ -3185,60 +3946,42 @@ impl Lh5801Backend {
                 self.emit_call_shared("BEEP");
             }
 
-            StackInstruction::Random(seed_addr) => {
-                // RANDOM: mismo LFSR mock que RND() (ver CallRnd) —
-                // resembrar de verdad exigiría una fuente de entropía real
-                // (no hay ninguna verificada, ver historial de RAND_GEN en
-                // rom_routines.rs), así que aquí simplemente se avanza el
-                // LFSR un paso extra sobre la MISMA semilla compartida, con
-                // la misma guardia de "semilla==0 -> 1" por si RANDOM se
-                // llama antes que cualquier RND() (arranque en frío).
-                let seed_addr = *seed_addr as u16;
+            StackInstruction::Random(_seed_addr) => {
+                // RANDOM: AUTÉNTICO — llama a `RAND_GEN` ($F5EB, ver
+                // `StackInstruction::CallRnd` para la resolución completa
+                // de la tabla de vectores) únicamente por su efecto
+                // secundario: avanza de verdad el "puntero RND" real de
+                // la ROM en `$7B01-$7B07` (vía `RAND_GEN_5`/$F61B,
+                // llamada internamente por `RAND_GEN`), el MISMO estado
+                // persistente que ahora consume `RND()`. El resultado en
+                // `ARX` (una fracción cruda 0-1) se descarta — a
+                // diferencia de `CallRnd`, aquí no hace falta convertir
+                // nada a entero, solo perturbar el puntero para que la
+                // siguiente llamada a `RND()` dé un valor distinto.
+                //
+                // Simplificación deliberada y documentada: la `RANDOM`
+                // real de la ROM (`BCMD_RANDOM`/$F641) resiembra
+                // combinando el puntero actual con `TIME2ARX` (el
+                // contador de tiempo real del sistema) — no se ha
+                // investigado esa rutina todavía, así que esto NO
+                // reproduce esa mezcla con el tiempo, solo hace avanzar
+                // el generador congruencial un paso extra sobre sí mismo.
+                // Efecto observable: `RANDOM` sí cambia de verdad la
+                // secuencia de `RND()` que sigue (verificado con el
+                // oráculo), que es lo único que le importa a cualquier
+                // programa BASIC real que la usa (la inmensa mayoría del
+                // corpus la llama una vez al principio sin argumento).
+                self.emit_byte(0xFD); self.emit_byte(0x98); // PSH Y (preservar Y del llamador)
 
-                let seed_nonzero = self.new_local_label("RANDOM_SEED_NONZERO");
-                self.emit_byte(0xA5); // LDA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si semilla==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP seed_nonzero (si semilla!=0)
-                self.add_label_ref(seed_nonzero.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-                self.emit_byte(0xB5); self.emit_byte(0x01); // LDI A,#1
-                self.emit_byte(0xAE); // STA addr (semilla)
-                self.emit_word(seed_addr);
-                self.define_label(seed_nonzero);
+                self.emit_byte(0x48); self.emit_byte(0x7A); // LDI XH,#0x7A
+                self.emit_byte(0x4A); self.emit_byte(0x01); // LDI XL,#0x01
+                self.emit_byte(0x58); self.emit_byte(0x7A); // LDI YH,#0x7A
+                self.emit_byte(0x5A); self.emit_byte(0x01); // LDI YL,#0x01
 
-                // Avanzar LFSR un paso (mismo polinomio/máscara 0xB8 que
-                // CallRnd): UL = valor original, A = bit0 de una copia.
-                self.emit_byte(0xA5); // LDA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_byte(0x2A); // STA UL (valor original)
-                self.emit_byte(0xB9); self.emit_byte(0x01); // ANI A,#1 (bit0)
+                self.emit_byte(0xBE); // SJP RAND_GEN ($F5EB)
+                self.emit_word(0xF5EB);
 
-                let lfsr_odd = self.new_local_label("RANDOM_LFSR_ODD");
-                let lfsr_done = self.new_local_label("RANDOM_LFSR_DONE");
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si bit0==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP lfsr_odd (si bit0==1)
-                self.add_label_ref(lfsr_odd.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xD5); // SHR
-                self.emit_byte(0xAE); // STA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_byte(0xBA); // JMP lfsr_done
-                self.add_label_ref(lfsr_done.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.define_label(lfsr_odd);
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xD5); // SHR
-                self.emit_byte(0xBD); self.emit_byte(0xB8); // EOR A,#0xB8
-                self.emit_byte(0xAE); // STA addr (semilla)
-                self.emit_word(seed_addr);
-
-                self.define_label(lfsr_done);
+                self.emit_byte(0xFD); self.emit_byte(0x1A); // POP Y
             }
 
             // ===== OPERACIONES DE COMPARACIÓN =====
@@ -3937,161 +4680,108 @@ impl Lh5801Backend {
                 self.emit_push_a();
             }
 
-            StackInstruction::CallRnd(seed_addr) => {
-                // RND(n): sustituto deliberadamente NO auténtico — $F5EB
-                // ("RAND_GEN") resultó NO ser el punto de entrada general
-                // de la ROM para n>0 (ver historial: llamarlo directo con
-                // ARX poblado, mismo patrón que ADDIT/MULTIPLY, produjo
-                // escrituras a memoria no mapeada; el camino real con
-                // escalado pasa por varias subrutinas sin documentar
-                // — $F707, $F715, $F6B4, $F661, $F88F — pendientes de
-                // investigar). En su lugar: un LFSR de Galois de 8 bits
-                // autocontenido (polinomio x^8+x^6+x^5+x^4+1, máscara
-                // 0xB8, longitud máxima 255 antes de repetirse),
-                // documentado explícitamente como no auténtico.
+            StackInstruction::CallRnd(_seed_addr) => {
+                // RND(n): AUTÉNTICO — llama a la rutina real de la ROM
+                // `RAND_GEN_3` ($F5FB), la entrada CON escalado por `n`
+                // (no `RAND_GEN`/$F5EB directamente: esa es la ruta
+                // "cruda" sin escalar, solo alcanzable con `n` a través
+                // de `BCMD_RND`/$F5DD, el despachador del comando BASIC,
+                // que decide RAND_GEN_1/2/3 según bits de ARX que aquí no
+                // hace falta replicar — siempre queremos la ruta
+                // "escalada", RAND_GEN_3).
                 //
-                // `seed_addr` guarda el estado entre llamadas (asignado
-                // una vez por StackCodeGenerator, igual que el scratch de
-                // AND/OR). Cada llamada: (1) si la semilla es 0
-                // (arranque en frío), la fija a 1 — un LFSR con semilla 0
-                // se queda atascado en 0 para siempre; (2) avanza el LFSR
-                // un paso; (3) reduce el resultado módulo n (resta
-                // repetida, mismo patrón que DivInt) para devolver un
-                // valor en [0, n); n=0 empuja 0 directamente (caso sin
-                // rango, evita un bucle infinito restando 0).
-                let seed_addr = *seed_addr as u16;
-
-                let seed_nonzero = self.new_local_label("RND_SEED_NONZERO");
-                self.emit_byte(0xA5); // LDA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si semilla==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP seed_nonzero (si semilla!=0: ya vale, saltar la inicialización)
-                self.add_label_ref(seed_nonzero.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-                self.emit_byte(0xB5); self.emit_byte(0x01); // LDI A,#1 (semilla==0: fijar a 1)
-                self.emit_byte(0xAE); // STA addr (semilla)
-                self.emit_word(seed_addr);
-                self.define_label(seed_nonzero);
-
-                // Avanzar LFSR: UL = valor original (para el shift),
-                // A = bit0 de una copia (test sin destruir UL).
-                self.emit_byte(0xA5); // LDA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_byte(0x2A); // STA UL (valor original)
-                self.emit_byte(0xB9); self.emit_byte(0x01); // ANI A,#1 (bit0)
-
-                let lfsr_odd = self.new_local_label("RND_LFSR_ODD");
-                let lfsr_done = self.new_local_label("RND_LFSR_DONE");
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si bit0==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP lfsr_odd (si bit0==1)
-                self.add_label_ref(lfsr_odd.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // bit0==0: semilla >>= 1, sin XOR.
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xD5); // SHR
-                self.emit_byte(0xAE); // STA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_byte(0xBA); // JMP lfsr_done
-                self.add_label_ref(lfsr_done.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // bit0==1: semilla = (semilla >> 1) XOR 0xB8.
-                self.define_label(lfsr_odd);
-                self.emit_byte(0x24); // LDA UL
-                self.emit_byte(0xD5); // SHR
-                self.emit_byte(0xBD); self.emit_byte(0xB8); // EOR A,#0xB8
-                self.emit_byte(0xAE); // STA addr (semilla)
-                self.emit_word(seed_addr);
-
-                self.define_label(lfsr_done);
-
-                // Pop n (16 bits: alto primero al desapilar, mismo
-                // convenio que ApilaIntWord/DesapilaIndWord — ver el
-                // ajuste en FunctionInner::Rnd, mod.rs). SIEMPRE 16 bits
-                // ahora, nunca 8: bug real encontrado jugando
-                // bathyscaph.bas de verdad (no en ningún test aislado) —
-                // `RND 256-1` pasa n=256 (no cabe en 1 byte, así que se
-                // apilaba como 16 bits), pero aquí solo se hacía pop de 1
-                // byte; cada llamada dejaba 1 byte suelto en la pila, y
-                // tras las 31 vueltas del bucle de la subrutina "CRASH"
-                // eso desincronizaba lo bastante como para que el
-                // siguiente POKE# leyera basura como dirección.
+                // Reconstruido íntegramente desde el desensamblado real
+                // (`Sharp_PC-1500_ROM_Disassembly`, confirmado contra la
+                // ROM A04 que carga `ceres-core`, no la A03 del listado —
+                // difieren en algunos detalles de test aunque coinciden
+                // en este rango): RAND_GEN_3 guarda `n` en AR-S, llama
+                // recursivamente a RAND_GEN (ruta cruda) para obtener una
+                // fracción aleatoria 0-1 en AR-X a partir de un "puntero
+                // RND" persistente en `$7B01-$7B07` (7 bytes, un
+                // generador congruencial decimal que la propia
+                // `RAND_GEN_5`/$F61B hace avanzar en cada llamada — ver
+                // el volcado de la tabla de vectores en $FF00 para la
+                // resolución completa de subrutinas), multiplica esa
+                // fracción por `n` (MULTIPLY/$F01A vía la tabla de
+                // vectores) y le suma 1 (ADDIT/$EFBA) para dar un entero
+                // en [1,n]. Con `n=0` la propia ROM toma la rama cruda
+                // sin escalar (el bit de prueba `BII (ARX+2),$F0` de
+                // RAND_GEN_3 salta directo a RAND_GEN cuando `n` es 0),
+                // cuyo resultado (una fracción con exponente marcador
+                // $FF) `emit_bcd_arx_to_int_a` decodifica como 0 al no
+                // reconocer ese exponente — mismo comportamiento que el
+                // mock anterior para este caso, sin código extra.
+                //
+                // Verificado empíricamente contra la ROM real antes de
+                // integrarlo aquí (arnés `scratch_probe_real_rand_gen*`,
+                // eliminado tras confirmar): `RND(1)` siempre da 1 (el
+                // único valor posible en su rango — la comprobación más
+                // dura posible de que el escalado es correcto), y una
+                // secuencia de 14 `RND(16)` encadenados (el mismo patrón
+                // que `bathyscaph.bas` usa para dibujar la cueva) da una
+                // secuencia real, variada y determinista: `[9, 6, 4, 11,
+                // 14, 16, 9, 5, 8, 9, 12, 15, 16, 3]`.
+                //
+                // `$7B01-07` cae dentro de `standard_user_system_memory`
+                // en `ceres-core` (0x7600-0x7FFF, siempre inicializada a
+                // 0xFF por `MemoryBus::new()`) — mapeada y seguridad de
+                // escritura confirmadas; el intento anterior de llamar a
+                // esto directamente fallaba porque faltaba: (1) `S` sin
+                // inicializar (arranque en frío de un `Pc1500` fresco
+                // tiene S=0, y las llamadas anidadas de RAND_GEN_3
+                // desbordan la pila hardware casi al instante); (2) el
+                // invariante real X=Y=$7A01 (apuntando a ARX+1/ARY+1) que
+                // el intérprete mantiene durante TODA operación
+                // aritmética — sin fijar `Y` en concreto, la copia de "el
+                // valor actual de ARX" a "ARY" (dentro de RAND_GEN_5)
+                // escribe en la página que sea que Y traiga puesta, no
+                // necesariamente mapeada. `X` sí puede quedar en
+                // cualquier valor al entrar: `RND2ARX` ($F7A7, primera
+                // subrutina que llama RAND_GEN) fija `XH=$7B`
+                // explícitamente antes de usarlo.
+                //
+                // `n` se convierte a `ARX` con `emit_u16_x_to_bcd_arx`
+                // (no `emit_int_a_to_bcd_arx`, que solo admite 0-255: `n`
+                // puede superar 255, p. ej. `RND 256` en bathyscaph.bas
+                // línea 32) — soporta 0-999, cubre toda `n` del corpus
+                // real salvo el único `RND 1000` de micromur.bas
+                // (clampado en tiempo de compilación en
+                // `FunctionInner::Rnd`, `mod.rs`, antes de llegar aquí).
+                // El resultado (siempre ≤n) se decodifica con el
+                // `emit_bcd_arx_to_int_a` ya existente (compartido con
+                // `INT`) y se empuja como 1 byte — mismo ancho que el
+                // mock anterior, así que ningún llamador aguas abajo
+                // necesita cambios; para `n>255` el resultado real ya
+                // cabe SIEMPRE en 1 byte salvo exactamente `n=256`
+                // (único caso real: puede dar 256, que trunca a 0 al
+                // empujarse en 1 byte — mismo tipo de simplificación ya
+                // aceptada por el mock anterior, que para `n>=256`
+                // directamente no reducía módulo n).
                 self.emit_pop_a();
                 self.emit_byte(0x0A); // STA XL (n, byte bajo)
                 self.emit_pop_a();
                 self.emit_byte(0x08); // STA XH (n, byte alto)
 
-                let mod_zero = self.new_local_label("RND_MOD_ZERO");
-                let mod_loop = self.new_local_label("RND_MOD_LOOP");
-                let mod_done = self.new_local_label("RND_MOD_DONE");
-                let no_reduction = self.new_local_label("RND_NO_REDUCTION");
+                self.emit_u16_x_to_bcd_arx(); // ARX = n
 
-                // n>=256 (byte alto != 0): "módulo n" sobre una semilla
-                // que ya es de 8 bits (0-255) es un no-op (0-255 < 256
-                // siempre) — empujar la semilla ya avanzada tal cual, sin
-                // pasar por la reducción de abajo (que asume n de 8 bits
-                // en UL). Cubre exactamente `RND 256`.
-                self.emit_byte(0x84); // LDA XH
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
-                self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si XH==0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP no_reduction (si XH!=0, n>=256)
-                self.add_label_ref(no_reduction.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
+                // Preservar Y del llamador — X ya no hace falta
+                // preservarlo (el mock anterior tampoco lo hacía; nada
+                // aguas abajo puede depender de que sobreviva a CallRnd).
+                self.emit_byte(0xFD); self.emit_byte(0x98); // PSH Y
 
-                // XH==0: n cabe en 8 bits, copiar a UL y seguir con la
-                // lógica de reducción existente sin cambios.
-                self.emit_byte(0x04); // LDA XL (n, byte bajo)
-                self.emit_byte(0x2A); // STA UL (n)
+                self.emit_byte(0x48); self.emit_byte(0x7A); // LDI XH,#0x7A
+                self.emit_byte(0x4A); self.emit_byte(0x01); // LDI XL,#0x01
+                self.emit_byte(0x58); self.emit_byte(0x7A); // LDI YH,#0x7A
+                self.emit_byte(0x5A); self.emit_byte(0x01); // LDI YL,#0x01
 
-                self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0 (A todavía es n, recién copiado)
-                self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si n!=0, saltar el JMP)
-                self.emit_byte(0xBA); // JMP mod_zero (si n==0)
-                self.add_label_ref(mod_zero.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
+                self.emit_byte(0xBE); // SJP RAND_GEN_3 ($F5FB)
+                self.emit_word(0xF5FB);
 
-                // n != 0: reducir la semilla (ya avanzada) módulo n.
-                self.emit_byte(0xA5); // LDA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_byte(0x0A); // STA XL (valor a reducir)
+                self.emit_bcd_arx_to_int_a(); // A = resultado (1 byte)
 
-                self.define_label(mod_loop.clone());
-                self.emit_byte(0x04); // LDA XL
-                self.emit_byte(0xFB); // SEC
-                self.emit_byte(0x20); // SBC UL (A = XL - n)
-                self.emit_byte(0x83); self.emit_byte(0x03); // BCS +3 (si XL>=n, seguir)
-                self.emit_byte(0xBA); // JMP mod_done (si XL<n, underflow: XL ya es el resultado)
-                self.add_label_ref(mod_done.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-                self.emit_byte(0x0A); // STA XL (confirmar XL -= n)
-                self.emit_byte(0xBA); // JMP mod_loop
-                self.add_label_ref(mod_loop, RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
+                self.emit_byte(0xFD); self.emit_byte(0x1A); // POP Y
 
-                self.define_label(mod_done);
-                self.emit_byte(0x04); // LDA XL
                 self.emit_push_a();
-                self.emit_byte(0xBA); // JMP fin (saltar el caso n==0)
-                let rnd_end = self.new_local_label("RND_END");
-                self.add_label_ref(rnd_end.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                self.define_label(mod_zero);
-                self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
-                self.emit_push_a();
-                self.emit_byte(0xBA); // JMP rnd_end (saltar el caso n>=256)
-                self.add_label_ref(rnd_end.clone(), RefType::Absolute16);
-                self.emit_label_placeholder(RefType::Absolute16);
-
-                // n>=256: empujar la semilla (ya avanzada) sin reducir.
-                self.define_label(no_reduction);
-                self.emit_byte(0xA5); // LDA addr (semilla)
-                self.emit_word(seed_addr);
-                self.emit_push_a();
-
-                self.define_label(rnd_end);
             }
 
             StackInstruction::CallSgn => {
@@ -4569,6 +5259,100 @@ impl Default for Lh5801Backend {
 mod tests {
     use super::*;
 
+    /// El "puntero RND" real de la ROM (`RND_VAL`, `$7B00-$7B07`) que deja
+    /// el prólogo del compilador (ver `emit_initialization`) debe coincidir
+    /// EXACTO con el que deja el arranque real de `ceres-core` — no
+    /// cualquier valor determinista, sino ESE valor concreto, porque es
+    /// del que arranca el primer `RND()` de cualquier programa BASIC real
+    /// ejecutado de verdad en este emulador (confirmado en dos
+    /// direcciones independientes: un `Pc1500` recién creado, dejado
+    /// arrancar 30 `step_frame()` sin ninguna tecla —arranque puro, sin
+    /// depender de interacción del usuario—, da este mismo valor; y la
+    /// ejecución real de `bathyscaph.bas` tecleando RUN en la GUI, con un
+    /// trazador temporal en `ceres-core`, mostró exactamente este valor
+    /// como el estado desde el que arranca el primer `RESTORE 999+RND 16`
+    /// del juego). Sin este arreglo, `RND()` era determinista pero con una
+    /// secuencia DISTINTA a la real — el algoritmo de `RAND_GEN_3` en sí
+    /// ya era correcto (ver `test_oracle_rnd_lfsr_stays_in_range_and_advances_on_real_rom`),
+    /// lo que faltaba era partir del mismo punto de la secuencia.
+    #[test]
+    fn test_oracle_prologue_rnd_pointer_matches_real_rom_boot_sequence() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let code = compile_native("10 END\n");
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
+        let ptr: Vec<u8> = (0x7B00u32..=0x7B07).map(|a| pc1500.read_byte(a)).collect();
+        assert_eq!(
+            ptr,
+            vec![0xFF, 0x00, 0x22, 0x56, 0x63, 0x10, 0x32, 0x58],
+            "RND_VAL tras el prólogo debe coincidir EXACTO con el capturado en la ROM real tras el arranque, obtuvo {ptr:02X?}"
+        );
+    }
+
+    /// El botón "Cargar" de la GUI reutiliza el MISMO `Pc1500` para
+    /// cargar un `.lh5` nuevo — `load_lh5_file` solo sobreescribe los
+    /// bytes del código, nunca la región de variables. Bug real
+    /// encontrado jugando bathyscaph.bas de verdad en la GUI: la primera
+    /// partida tras pulsar "Cargar" mostraba un patrón de ruido cerca de
+    /// donde reaparece el submarino (`S`/`R`/`Q` con basura de una
+    /// ejecución anterior), que se corregía solo en la segunda partida.
+    /// Reproduce ESE flujo exacto (sin usar `test_oracle::load`, que
+    /// limpia toda la RAM y por tanto no puede detectar esto): un solo
+    /// `Pc1500`, cargar, ensuciar a mano la región de variables, cargar
+    /// otra vez el MISMO `.lh5` — el prólogo debe dejarlas a 0 igualmente.
+    #[test]
+    fn test_oracle_variable_region_resets_on_reload_without_restart_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, ORACLE_LOAD_ADDR};
+        use ceres_core::Pc1500;
+        use std::io::Write;
+
+        let source = "10 S=0:R=0:Q=0\n20 END\n";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let s_addr = *addrs.get("S").expect("S") as u32;
+        let r_addr = *addrs.get("R").expect("R") as u32;
+        let q_addr = *addrs.get("Q").expect("Q") as u32;
+
+        let mut bytes = Vec::with_capacity(4 + code.len());
+        bytes.extend_from_slice(&ORACLE_LOAD_ADDR.to_le_bytes());
+        bytes.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&code);
+        let mut file = tempfile::NamedTempFile::new().expect("crear .lh5 temporal");
+        file.write_all(&bytes).expect("escribir .lh5 temporal");
+        file.flush().expect("flush .lh5 temporal");
+
+        let mut pc1500 = Pc1500::new();
+        pc1500.load_lh5_file(file.path()).expect("cargar .lh5");
+        for _ in 0..11000 {
+            if pc1500.cpu().is_halted() {
+                break;
+            }
+            pc1500.step_cpu();
+        }
+        assert!(pc1500.cpu().is_halted(), "primera carga no terminó");
+
+        // Ensuciar la región de variables a mano, simulando lo que
+        // dejaría una partida anterior (p.ej. tras chocar a media
+        // cueva, con S/R/Q en valores reales de la partida).
+        pc1500.write_byte(s_addr, 111);
+        pc1500.write_byte(r_addr, 222);
+        pc1500.write_byte(q_addr, 200);
+
+        // "Cargar" otra vez el MISMO .lh5, sobre el MISMO Pc1500 — el
+        // flujo real del botón "Cargar" de la GUI.
+        pc1500.load_lh5_file(file.path()).expect("recargar .lh5");
+        for _ in 0..11000 {
+            if pc1500.cpu().is_halted() {
+                break;
+            }
+            pc1500.step_cpu();
+        }
+        assert!(pc1500.cpu().is_halted(), "segunda carga no terminó");
+
+        assert_eq!(pc1500.read_byte(s_addr), 0, "S debe estar a 0 tras recargar, no la basura de antes");
+        assert_eq!(pc1500.read_byte(r_addr), 0, "R debe estar a 0 tras recargar, no la basura de antes");
+        assert_eq!(pc1500.read_byte(q_addr), 0, "Q debe estar a 0 tras recargar, no la basura de antes");
+    }
+
     fn has_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
         if needle.is_empty() {
             return true;
@@ -4590,7 +5374,7 @@ mod tests {
     fn test_oracle_initialization_prologue_runs_on_real_rom() {
         use crate::codegen::test_oracle::{run_lh5, ORACLE_LOAD_ADDR};
 
-        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x5FFF);
+        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x47FF);
         let code = backend.generate(&[]);
 
         // El prólogo de inicialización son exactamente 15 instrucciones
@@ -4600,7 +5384,7 @@ mod tests {
         // destino no está garantizado aquí).
         let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 15);
 
-        assert_eq!(pc1500.cpu().s(), 0x5FFF, "S debe inicializarse a stack_top");
+        assert_eq!(pc1500.cpu().s(), 0x47FF, "S debe inicializarse a stack_top");
         assert!(pc1500.cpu().display_enabled(), "la pantalla debe quedar activada (DON) — si no, update_display_buffer() nunca pinta nada");
         assert_eq!(pc1500.read_byte(0x7874), 0x00, "CURSOR_ENA debe quedar a 0");
         assert_eq!(pc1500.read_byte(0x7875), 0x00, "CURSOR_PTR debe quedar a 0");
@@ -4617,40 +5401,47 @@ mod tests {
     /// caía en el catch-all (NOP) y esto nunca se ejecutaba.
     ///
     /// Programa: salta a MAIN, que llama a SUB (GOSUB); SUB escribe 0xAA en
-    /// 0x5000 y hace RETURN; si el RETURN funciona, la ejecución continúa
-    /// justo después del Call y escribe 0xBB en 0x5001. Si RETURN fuera un
+    /// 0x2314 y hace RETURN; si el RETURN funciona, la ejecución continúa
+    /// justo después del Call y escribe 0xBB en 0x2315. Si RETURN fuera un
     /// NOP, la ejecución seguiría dentro de SUB (que no tiene más código
-    /// que consumir aparte del propio NOP) y 0x5001 nunca se escribiría.
+    /// que consumir aparte del propio NOP) y 0x2315 nunca se escribiría.
     #[test]
     fn test_oracle_gosub_return_actually_returns_on_real_rom() {
-        use crate::codegen::test_oracle::{run_lh5, ORACLE_LOAD_ADDR};
+        use crate::codegen::test_oracle::{load, ORACLE_LOAD_ADDR};
 
-        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x5FFF);
+        let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x47FF);
         let instructions = vec![
             StackInstruction::IrA("MAIN".to_string()),
             StackInstruction::Label("SUB".to_string()),
-            StackInstruction::ApilaInt(0x5000),
+            StackInstruction::ApilaInt(0x2314),
             StackInstruction::ApilaInt(0xAA),
             StackInstruction::DesapilaInd,
             StackInstruction::IrInd, // RETURN
             StackInstruction::Label("MAIN".to_string()),
             StackInstruction::Call("SUB".to_string()), // GOSUB
-            StackInstruction::ApilaInt(0x5001),
+            StackInstruction::ApilaInt(0x2315),
             StackInstruction::ApilaInt(0xBB),
             StackInstruction::DesapilaInd,
         ];
         let code = backend.generate(&instructions);
 
-        // Prólogo (15) + IrA (1) + ApilaInt(0x5000) (4, >255) +
-        // ApilaInt(0xAA) (2) + DesapilaInd (8) + IrInd/RTN (1) + Call/SJP
-        // (1) + ApilaInt(0x5001) (4) + ApilaInt(0xBB) (2) + DesapilaInd (8)
-        // = 46 instrucciones para completar ambas escrituras, justo antes
-        // de la RTN del epílogo (cuyo destino no está garantizado aquí).
-        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 46);
+        // Nº de instrucciones del prólogo hasta aquí (`emit_initialization`)
+        // ya se ha recalibrado a mano dos veces en esta sesión al cambiar
+        // de tamaño — en vez de una tercera, esperar por condición real
+        // (con límite de seguridad) hasta que ambas escrituras ocurran,
+        // igual que ya se hizo para el test end-to-end de bathyscaph.
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+        for step in 0..500 {
+            if pc1500.read_byte(0x2314) == 0xAA && pc1500.read_byte(0x2315) == 0xBB {
+                break;
+            }
+            assert!(step < 499, "las dos escrituras no ocurrieron en 500 instrucciones (posible regresión)");
+            pc1500.step_cpu();
+        }
 
-        assert_eq!(pc1500.read_byte(0x5000), 0xAA, "SUB debe ejecutarse");
+        assert_eq!(pc1500.read_byte(0x2314), 0xAA, "SUB debe ejecutarse");
         assert_eq!(
-            pc1500.read_byte(0x5001), 0xBB,
+            pc1500.read_byte(0x2315), 0xBB,
             "tras el RETURN la ejecución debe continuar después del Call, no quedarse en SUB"
         );
     }
@@ -4665,26 +5456,26 @@ mod tests {
     fn test_oracle_for_next_descending_step_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        // @(21504)=0x5400 cuenta cuántas veces se ejecuta el cuerpo del
-        // bucle; @(21505)=0x5401 guarda el valor final de J. Se usan
-        // direcciones fijas (@) en zona libre (0x5400+) en vez de
+        // @(10004)=0x2714 cuenta cuántas veces se ejecuta el cuerpo del
+        // bucle; @(10005)=0x2715 guarda el valor final de J. Se usan
+        // direcciones fijas (@) en zona libre (0x2714+) en vez de
         // variables normales, para no depender de qué dirección les
         // asigne internamente el compilador — pero deben quedar fuera del
-        // área de variables auto-asignadas (DATA_BASE=0x5000+), o
+        // área de variables auto-asignadas (DATA_BASE=0x2314+), o
         // colisionan con el scratch del STEP/J y se corrompen entre sí.
-        let source = "10 @(21504)=0\n20 FOR J=3 TO 1 STEP -1\n30 @(21504)=@(21504)+1\n40 NEXT J\n50 @(21505)=J\n60 END\n";
+        let source = "10 @(10004)=0\n20 FOR J=3 TO 1 STEP -1\n30 @(10004)=@(10004)+1\n40 NEXT J\n50 @(10005)=J\n60 END\n";
         let code = compile_native(source);
 
         // El número exacto de instrucciones reales de un programa con
         // bucle es difícil de predecir a mano; se ejecuta hasta que el PC
         // sale de la región de código (justo tras la RTN final).
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
         assert_eq!(
-            pc1500.read_byte(0x5400), 3,
+            pc1500.read_byte(0x2714), 3,
             "el cuerpo debe ejecutarse 3 veces (J=3,2,1) con STEP -1"
         );
-        assert_eq!(pc1500.read_byte(0x5401), 0, "J debe terminar en 0 tras salir del bucle descendente");
+        assert_eq!(pc1500.read_byte(0x2715), 0, "J debe terminar en 0 tras salir del bucle descendente");
     }
 
     /// Complementa el test descendente: comprueba que el caso ascendente
@@ -4694,16 +5485,16 @@ mod tests {
     fn test_oracle_for_next_ascending_default_step_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 @(21504)=0\n20 FOR J=1 TO 3\n30 @(21504)=@(21504)+1\n40 NEXT J\n50 @(21505)=J\n60 END\n";
+        let source = "10 @(10004)=0\n20 FOR J=1 TO 3\n30 @(10004)=@(10004)+1\n40 NEXT J\n50 @(10005)=J\n60 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
         assert_eq!(
-            pc1500.read_byte(0x5400), 3,
+            pc1500.read_byte(0x2714), 3,
             "el cuerpo debe ejecutarse 3 veces (J=1,2,3) con STEP por defecto"
         );
-        assert_eq!(pc1500.read_byte(0x5401), 4, "J debe terminar en 4 tras salir del bucle ascendente");
+        assert_eq!(pc1500.read_byte(0x2715), 4, "J debe terminar en 4 tras salir del bucle ascendente");
     }
 
     /// Test end-to-end del "núcleo reducido": un programa que combina en
@@ -4722,27 +5513,211 @@ mod tests {
     /// formateo, este mismo test imprimía el BYTE de `expr` directamente
     /// como código de carácter (67='C', 88='X'); ahora imprime los
     /// dígitos "67"/"88" como texto, 2 caracteres cada uno.
+    /// Bug real reportado testeando invader-v2.bas: el mapa generado es
+    /// idéntico y extremadamente corto en AMBOS niveles del juego, pese a
+    /// que el nivel 2 debería recorrer un bucle de terreno mucho más
+    /// largo (`FOR Z=1 TO 6:FOR D=1 TO B:FOR I=1 TO 18:GOSUB "SP":NEXT
+    /// I:...:NEXT D:...:NEXT Z`, con `B` una VARIABLE que vale 0 en
+    /// nivel 1 y 3 en nivel 2). Que el resultado sea igual en ambos
+    /// niveles apunta a que el bucle triplemente anidado con un `GOSUB`
+    /// (con su propio `RETURN`) en el nivel más interno se rompe SIEMPRE
+    /// de la misma forma, independientemente de `B` — este test
+    /// reproduce esa misma estructura (FOR constante / FOR de límite
+    /// VARIABLE / FOR constante, con un GOSUB+RETURN en el cuerpo más
+    /// interno) a menor escala para poder verificar el recuento total de
+    /// iteraciones contra la ROM real.
+    /// Reproduce el patrón EXACTO de la subrutina `"SP"` de
+    /// invader-v2.bas: un `GOSUB` a una etiqueta que, tras algo de
+    /// trabajo, hace `GOTO "*"+INKEY$` — un GOTO calculado por
+    /// concatenación de cadena (`gen_computed_string_goto`) hacia una de
+    /// varias etiquetas candidatas (`"*9"`, `"*="`, `"*"`, `"* "`), todas
+    /// reconvergiendo en un `RETURN` común. Llamado repetidamente en
+    /// bucle (como hace `FOR I=1 TO 18:GOSUB "SP":NEXT I`), sin ninguna
+    /// tecla pulsada (`INKEY$` siempre devuelve `""` en este arnés
+    /// headless) — el candidato que debería coincidir SIEMPRE es el de
+    /// sufijo vacío (`"*"`).
     #[test]
-    fn test_oracle_core_subset_end_to_end_on_real_rom() {
+    fn test_oracle_computed_string_goto_cascade_called_repeatedly_via_gosub_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 A=65\n20 B=2\n30 C=A+B\n40 IF C=67 THEN PRINT C;\n50 FOR I=1 TO 2\n60 GOSUB 100\n70 NEXT I\n80 @(21600)=99\n90 END\n100 PRINT 88;\n110 RETURN\n";
+        let source = "\
+10 N=0\n\
+20 FOR I=1 TO 5\n\
+30 GOSUB \"SP\"\n\
+40 NEXT I\n\
+50 @(10900)=N\n\
+60 END\n\
+100 \"SP\"N=N+1\n\
+110 GOTO \"*\"+INKEY$\n\
+120 \"*9\"N=N+10:GOTO 140\n\
+130 \"*=\"N=N+20\n\
+140 \"*\"RETURN\n\
+150 \"* \"N=N+30:GOTO 140\n\
+";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        // @(21600) solo se escribe tras salir del FOR y volver de las dos
+        // 10900 = 0x2A94
+        assert_eq!(
+            pc1500.read_byte(0x2A94), 5,
+            "5 GOSUB \"SP\" con INKEY$ siempre \"\" deben terminar todas en el candidato de sufijo vacío \
+             (\"*\", RETURN inmediato) y sumar solo 1 cada vez (N=5), no acumular las otras ramas ni \
+             romperse a medio camino"
+        );
+    }
+
+    /// Root-cause confirmado del mapa cortísimo (idéntico en ambos
+    /// niveles) de invader-v2.bas: el programa declara `DIM ...,B(5)`
+    /// (línea 6) Y TAMBIÉN usa `B` como variable ESCALAR independiente
+    /// (`B=L-4` línea 95, `B=L` línea 130, controlando cuántas vueltas da
+    /// `FOR D=1 TO B`, el bucle que genera/desplaza el terreno) — un
+    /// patrón perfectamente válido y común en BASIC real, donde `B`
+    /// (escalar) y `B(n)` (array) son SIEMPRE variables completamente
+    /// independientes (la sintaxis ya las distingue por los paréntesis).
+    /// Antes del fix, `B=7` (escalar) corrompía en silencio `B(0)` —
+    /// confirmado con un test aislado que primero reprodujo el bug
+    /// (`DIM B(5):B(0)=99:B=7:...` dejaba `B(0)` en 7, no en 99) y ahora,
+    /// arreglado, lo verifica en sentido contrario. Dos bugs
+    /// encadenados, ambos arreglados: (1) `get_or_create_array_address`
+    /// compartía el mismo `HashMap<String, usize>` que
+    /// `get_or_create_variable_address` sin namespace propio; (2)
+    /// `gen_lvalue_address` (`Array1DAccess`/`Array2DAccess`, caso de
+    /// tamaño constante) ni siquiera usaba el `base_addr` que `gen_dim`
+    /// ya había calculado — volvía a llamar a
+    /// `get_or_create_variable_address` en cada ACCESO al array, que era
+    /// la colisión real con la variable escalar del mismo nombre.
+    #[test]
+    fn test_oracle_scalar_and_array_with_same_letter_name_stay_independent_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "\
+10 DIM B(5)\n\
+20 B(0)=99\n\
+30 B=7\n\
+40 @(10900)=B(0)\n\
+50 @(10901)=B\n\
+60 END\n\
+";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 10000);
+
+        // 10900 = 0x2A94, 10901 = 0x2A95
+        assert_eq!(
+            pc1500.read_byte(0x2A94), 99,
+            "B(0) (array) debe seguir valiendo 99 tras asignar la variable ESCALAR B=7 — son variables \
+             independientes en BASIC real, no deben compartir dirección"
+        );
+        assert_eq!(
+            pc1500.read_byte(0x2A95), 7,
+            "la variable escalar B debe valer 7"
+        );
+    }
+
+    #[test]
+    fn test_oracle_triple_nested_for_with_gosub_in_innermost_body_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Mismo patrón que invader-v2.bas (Z constante / D variable / I
+        // constante, GOSUB+RETURN en el cuerpo de I), a escala reducida
+        // para que el contador quepa en un byte: 3*2*4 = 24 llamadas a
+        // la subrutina esperadas.
+        let source = "\
+10 B=2\n\
+20 N=0\n\
+30 FOR Z=1 TO 3\n\
+40 FOR D=1 TO B\n\
+50 FOR I=1 TO 4\n\
+60 GOSUB 200\n\
+70 NEXT I\n\
+80 NEXT D\n\
+90 NEXT Z\n\
+100 @(10900)=N\n\
+110 END\n\
+200 N=N+1\n\
+210 RETURN\n\
+";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
+
+        // 10900 = 0x2A94
+        assert_eq!(
+            pc1500.read_byte(0x2A94), 24,
+            "FOR Z=1 TO 3:FOR D=1 TO 2:FOR I=1 TO 4:GOSUB 200:NEXT I:NEXT D:NEXT Z debe llamar a la \
+             subrutina 3*2*4=24 veces en total"
+        );
+    }
+
+    #[test]
+    /// `SystemOutIntWord` (impresión de una variable "de palabra", 16
+    /// bits) — verifica el recuento de dígitos (sin ceros a la
+    /// izquierda) vía `CURSOR_PTR` (mismo convenio ya usado para
+    /// `SystemOutInt`) en los límites de cada tramo de dígitos (9/10,
+    /// 99/100, 999/1000, 9999/10000), en los extremos (0, 65535) y en
+    /// los valores reales de invader-v2.bas (299, 317) — y que la pila
+    /// vuelve limpia a `stack_top` en todos los casos.
+    #[test]
+    fn test_oracle_system_out_int_word_digit_counts_on_real_rom() {
+        use crate::codegen::test_oracle::{run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        for &(value, expected_digits) in &[
+            (0u16, 1u8), (5, 1), (9, 1),
+            (10, 2), (99, 2),
+            (100, 3), (999, 3),
+            (1000, 4), (9999, 4),
+            (10000, 5), (65535, 5),
+            (299, 3), (317, 3),
+        ] {
+            let instrs = vec![
+                StackInstruction::ApilaIntWord(value as i64),
+                StackInstruction::SystemOutIntWord,
+                StackInstruction::Stop,
+            ];
+            let mut backend = Lh5801Backend::new();
+            let code = backend.generate(&instrs);
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 10000);
+            assert_eq!(
+                pc1500.read_byte(0x7875), expected_digits * 6,
+                "PRINT de {value} debe imprimir {expected_digits} dígitos (sin ceros a la izquierda)"
+            );
+            assert_eq!(
+                pc1500.cpu().s(), ORACLE_STACK_TOP,
+                "S debe volver a stack_top tras SystemOutIntWord({value}), sin fugas de pila"
+            );
+        }
+    }
+
+    #[test]
+    fn test_oracle_core_subset_end_to_end_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 A=65\n20 B=2\n30 C=A+B\n40 IF C=67 THEN PRINT C;\n50 FOR I=1 TO 2\n60 GOSUB 100\n70 NEXT I\n80 @(10100)=99\n90 END\n100 PRINT 88;\n110 RETURN\n";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
+
+        // @(10100) solo se escribe tras salir del FOR y volver de las dos
         // GOSUB — confirma que todo el programa se ejecutó hasta el final,
         // no que se colgó o saltó a mitad.
-        assert_eq!(pc1500.read_byte(0x5460), 99, "el programa debe llegar hasta el final (línea 80)");
+        assert_eq!(pc1500.read_byte(0x2774), 99, "el programa debe llegar hasta el final (línea 80)");
 
         // CHAR_OUT avanza CURSOR_PTR ($7875) en 6 columnas por carácter
-        // impreso (ancho de glifo). Se imprimen 6 caracteres en total:
-        // "67" (línea 40, A+B=67=igualdad exacta) y "88" dos veces (una
-        // por iteración GOSUB) = 2+2+2 dígitos.
+        // impreso (ancho de glifo). `PRINT` real (confirmado contra la
+        // ROM real comparando la pantalla final de bombing.bas contra el
+        // programa original tokenizado) limpia la pantalla ENTERA antes
+        // de imprimir cada vez — comparte rutina con `PAUSE`, que ya
+        // tenía este mismo comportamiento confirmado — así que cada una
+        // de las 3 sentencias `PRINT` de este programa (línea 40 y las 2
+        // llamadas a la línea 100 vía GOSUB) resetea el cursor a 0 antes
+        // de escribir sus propios 2 dígitos: el CURSOR_PTR final solo
+        // refleja el ÚLTIMO `PRINT` ("88", 2 dígitos), no la suma de
+        // los tres.
         assert_eq!(
-            pc1500.read_byte(0x7875), 36,
-            "CURSOR_PTR debe avanzar 6*6=36 tras imprimir \"67\"+\"88\"+\"88\" (6 dígitos) vía CHAR_OUT"
+            pc1500.read_byte(0x7875), 12,
+            "CURSOR_PTR tras el último PRINT (\"88\", 2 dígitos) debe ser 2*6=12 — cada PRINT limpia la \
+             pantalla y resetea el cursor antes de escribir, así que no se acumula con los PRINT anteriores"
         );
 
         // Comprueba que CHAR_OUT realmente dibujó píxeles (no solo movió
@@ -4764,14 +5739,14 @@ mod tests {
     fn test_oracle_array_1d_constant_size_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 DIM A(5)\n20 A(0)=11\n30 A(1)=22\n40 A(5)=99\n50 @(21600)=A(0)\n60 @(21601)=A(1)\n70 @(21602)=A(5)\n80 END\n";
+        let source = "10 DIM A(5)\n20 A(0)=11\n30 A(1)=22\n40 A(5)=99\n50 @(10100)=A(0)\n60 @(10101)=A(1)\n70 @(10102)=A(5)\n80 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        assert_eq!(pc1500.read_byte(0x5460), 11, "A(0)");
-        assert_eq!(pc1500.read_byte(0x5461), 22, "A(1)");
-        assert_eq!(pc1500.read_byte(0x5462), 99, "A(5), el índice límite de DIM A(5)");
+        assert_eq!(pc1500.read_byte(0x2774), 11, "A(0)");
+        assert_eq!(pc1500.read_byte(0x2775), 22, "A(1)");
+        assert_eq!(pc1500.read_byte(0x2776), 99, "A(5), el índice límite de DIM A(5)");
     }
 
     /// Fase 2: `DIM B(2,2)` (3x3 elementos, índices 0..=2 en cada
@@ -4783,15 +5758,15 @@ mod tests {
     fn test_oracle_array_2d_constant_size_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 DIM B(2,2)\n20 B(0,0)=1\n30 B(1,1)=2\n40 B(2,2)=3\n50 @(21610)=B(0,0)\n60 @(21611)=B(1,1)\n70 @(21612)=B(2,2)\n80 END\n";
+        let source = "10 DIM B(2,2)\n20 B(0,0)=1\n30 B(1,1)=2\n40 B(2,2)=3\n50 @(10110)=B(0,0)\n60 @(10111)=B(1,1)\n70 @(10112)=B(2,2)\n80 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        // 21610/21611/21612 = 0x546A/0x546B/0x546C
-        assert_eq!(pc1500.read_byte(0x546A), 1, "B(0,0)");
-        assert_eq!(pc1500.read_byte(0x546B), 2, "B(1,1)");
-        assert_eq!(pc1500.read_byte(0x546C), 3, "B(2,2), la esquina opuesta");
+        // 10110/10111/10112 = 0x277E/0x277F/0x2780
+        assert_eq!(pc1500.read_byte(0x277E), 1, "B(0,0)");
+        assert_eq!(pc1500.read_byte(0x277F), 2, "B(1,1)");
+        assert_eq!(pc1500.read_byte(0x2780), 3, "B(2,2), la esquina opuesta");
     }
 
     /// `DIM A(N)` con `N` una variable (no una constante en tiempo de
@@ -4811,7 +5786,7 @@ mod tests {
     fn test_oracle_dim_dynamic_size_1d_array_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 N=5:DIM A(N)\n20 A(0)=11:A(3)=44:A(5)=99\n30 @(21620)=A(0)\n40 @(21621)=A(3)\n50 @(21622)=A(5)\n60 END\n";
+        let source = "10 N=5:DIM A(N)\n20 A(0)=11:A(3)=44:A(5)=99\n30 @(10120)=A(0)\n40 @(10121)=A(3)\n50 @(10122)=A(5)\n60 END\n";
         let (code, addrs) = compile_native_with_addresses(source);
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
 
@@ -4822,17 +5797,17 @@ mod tests {
             pc1500.cpu().s()
         );
 
-        // 21620/21621/21622 = 0x5474/0x5475/0x5476
-        assert_eq!(pc1500.read_byte(0x5474), 11, "A(0) tras DIM A(N) con N=5 dinámico");
-        assert_eq!(pc1500.read_byte(0x5475), 44, "A(3)");
-        assert_eq!(pc1500.read_byte(0x5476), 99, "A(5), el índice límite de DIM A(N) con N=5");
+        // 10120/10121/10122 = 0x2788/0x2789/0x278A
+        assert_eq!(pc1500.read_byte(0x2788), 11, "A(0) tras DIM A(N) con N=5 dinámico");
+        assert_eq!(pc1500.read_byte(0x2789), 44, "A(3)");
+        assert_eq!(pc1500.read_byte(0x278A), 99, "A(5), el índice límite de DIM A(N) con N=5");
 
         // El propio heap dinámico debe haber avanzado exactamente (N+1)*1
         // = 6 bytes desde __ARRAY_HEAP (element_size=1 para un array
         // numérico) — confirma que el cálculo en tiempo de ejecución de
         // `(size_expr+1)*element_size` es correcto, no solo que los 3
         // valores de arriba coincidieron por casualidad de solapamiento.
-        let heap_base = *addrs.get("__ARRAY_HEAP").expect("__ARRAY_HEAP") as u32;
+        let heap_base = *addrs.get("ARRAY:__ARRAY_HEAP").expect("__ARRAY_HEAP") as u32;
         let heap_ptr_addr = *addrs.get("__ARRAY_HEAP_PTR").expect("__ARRAY_HEAP_PTR") as u32;
         let heap_ptr = ((pc1500.read_byte(heap_ptr_addr) as u32) << 8) | pc1500.read_byte(heap_ptr_addr + 1) as u32;
         assert_eq!(heap_ptr, heap_base + 6, "__ARRAY_HEAP_PTR debe haber avanzado (N+1)*element_size = 6 bytes");
@@ -4858,7 +5833,11 @@ mod tests {
 
         let source = "10 DIM D(9)\n20 FOR I=0 TO 9\n30 D(I)=I\n40 NEXT I\n50 FOR I=0 TO 9\n60 GOSUB 100\n70 NEXT I\n80 END\n100 PRINT D(I);\n110 RETURN\n";
         let (code, addrs) = compile_native_with_addresses(source);
-        let d_addr = *addrs.get("D").expect("dirección de D no encontrada") as u32;
+        // Los arrays viven bajo la clave namespaced "ARRAY:<nombre>" en
+        // `variable_addresses` desde el fix del bug de invader-v2.bas
+        // (array y escalar del mismo nombre aliasados) — ver
+        // `get_or_create_array_address`.
+        let d_addr = *addrs.get("ARRAY:D").expect("dirección de D no encontrada") as u32;
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
@@ -4871,11 +5850,15 @@ mod tests {
             );
         }
 
-        // CHAR_OUT avanza CURSOR_PTR en 6 columnas por carácter; 10
-        // dígitos de un solo carácter cada uno impresos (D(I) va de 0 a
-        // 9, uno por invocación de GOSUB 100 dentro del segundo bucle)
-        // -> 60.
-        assert_eq!(pc1500.read_byte(0x7875), 60, "CURSOR_PTR tras imprimir los 10 dígitos");
+        // CHAR_OUT avanza CURSOR_PTR en 6 columnas por carácter — pero
+        // cada `PRINT` real limpia la pantalla entera y resetea el
+        // cursor antes de escribir (mismo comportamiento que `PAUSE`,
+        // confirmado contra la ROM real comparando bombing.bas contra
+        // el original — ver el comentario largo de `gen_print`), así
+        // que las 10 invocaciones de `PRINT D(I);` (una por vuelta del
+        // segundo bucle, vía GOSUB 100) NO se acumulan: el CURSOR_PTR
+        // final solo refleja el ÚLTIMO dígito impreso (1 carácter) -> 6.
+        assert_eq!(pc1500.read_byte(0x7875), 6, "CURSOR_PTR tras el último PRINT (1 dígito) debe ser 6, no acumulado");
 
         let display_touched = (0x7600..0x7600 + 60).any(|addr| pc1500.read_byte(addr) != 0x00);
         assert!(display_touched, "CHAR_OUT debe haber escrito píxeles reales en el buffer de pantalla");
@@ -4899,7 +5882,7 @@ mod tests {
         let b_addr = *addrs.get("B$").expect("dirección de B$ no encontrada") as u32;
         let c_addr = *addrs.get("C$").expect("dirección de C$ no encontrada") as u32;
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
         // Lee el contenido de una variable de cadena escalar directamente
         // de su propia dirección — desde que una variable escalar copia
@@ -4936,9 +5919,9 @@ mod tests {
 
         let source = "10 DIM A$(0)*20\n20 READ A$(0)\n30 END\n1000 DATA \"7163470F1F0F47637160\"\n";
         let (code, addrs) = compile_native_with_addresses(source);
-        let a_addr = *addrs.get("A$").expect("dirección de A$ no encontrada") as u32;
+        let a_addr = *addrs.get("ARRAY:A$").expect("dirección de A$ no encontrada") as u32;
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
         let expected = "7163470F1F0F47637160";
         let actual: String = (0..20).map(|i| pc1500.read_byte(a_addr + i) as char).collect();
@@ -4961,15 +5944,15 @@ mod tests {
     fn test_oracle_string_equality_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 A$=\"HI\"\n20 B$=\"HI\"\n30 C$=\"BYE\"\n40 D$=\"\"\n50 @(21700)=0\n60 @(21701)=0\n70 @(21702)=0\n80 @(21703)=0\n90 IF A$=B$ THEN 130\n100 IF A$=C$ THEN 140\n110 IF D$=\"\" THEN 150\n120 IF A$<>C$ THEN 160\n125 GOTO 170\n130 @(21700)=1\n135 GOTO 100\n140 @(21701)=1\n145 GOTO 110\n150 @(21702)=1\n155 GOTO 120\n160 @(21703)=1\n165 GOTO 125\n170 END\n";
+        let source = "10 A$=\"HI\"\n20 B$=\"HI\"\n30 C$=\"BYE\"\n40 D$=\"\"\n50 @(10200)=0\n60 @(10201)=0\n70 @(10202)=0\n80 @(10203)=0\n90 IF A$=B$ THEN 130\n100 IF A$=C$ THEN 140\n110 IF D$=\"\" THEN 150\n120 IF A$<>C$ THEN 160\n125 GOTO 170\n130 @(10200)=1\n135 GOTO 100\n140 @(10201)=1\n145 GOTO 110\n150 @(10202)=1\n155 GOTO 120\n160 @(10203)=1\n165 GOTO 125\n170 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        assert_eq!(pc1500.read_byte(0x54C4), 1, "\"HI\"=\"HI\" (contenido igual, punteros distintos) debe ser cierto");
-        assert_eq!(pc1500.read_byte(0x54C5), 0, "\"HI\"=\"BYE\" debe ser falso");
-        assert_eq!(pc1500.read_byte(0x54C6), 1, "\"\"=\"\" (ambas vacías) debe ser cierto");
-        assert_eq!(pc1500.read_byte(0x54C7), 1, "\"HI\"<>\"BYE\" debe ser cierto");
+        assert_eq!(pc1500.read_byte(0x27D8), 1, "\"HI\"=\"HI\" (contenido igual, punteros distintos) debe ser cierto");
+        assert_eq!(pc1500.read_byte(0x27D9), 0, "\"HI\"=\"BYE\" debe ser falso");
+        assert_eq!(pc1500.read_byte(0x27DA), 1, "\"\"=\"\" (ambas vacías) debe ser cierto");
+        assert_eq!(pc1500.read_byte(0x27DB), 1, "\"HI\"<>\"BYE\" debe ser cierto");
     }
 
     /// `ASC Z$` — necesario para `H=H-SGN(ASC Z$-10.5)` en bathyscaph.bas.
@@ -4977,13 +5960,13 @@ mod tests {
     fn test_oracle_asc_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 Z$=\"A\"\n20 @(21800)=ASC Z$\n30 END\n";
+        let source = "10 Z$=\"A\"\n20 @(10300)=ASC Z$\n30 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        // 21800 = 0x5528
-        assert_eq!(pc1500.read_byte(0x5528), b'A', "ASC(\"A\") debe ser 65");
+        // 10300 = 0x283C
+        assert_eq!(pc1500.read_byte(0x283C), b'A', "ASC(\"A\") debe ser 65");
     }
 
     /// `AND`/`OR` bit a bit — el patrón exacto de bathyscaph.bas
@@ -4994,15 +5977,15 @@ mod tests {
     fn test_oracle_and_or_int_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 @(21900)=5 AND 3\n20 @(21901)=5 OR 2\n30 @(21902)=12 AND 10\n40 END\n";
+        let source = "10 @(10400)=5 AND 3\n20 @(10401)=5 OR 2\n30 @(10402)=12 AND 10\n40 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        // 21900 = 0x558C, 21901 = 0x558D, 21902 = 0x558E
-        assert_eq!(pc1500.read_byte(0x558C), 1, "5 AND 3 debe ser 1 (bit a bit, no booleano)");
-        assert_eq!(pc1500.read_byte(0x558D), 7, "5 OR 2 debe ser 7 (bit a bit, no booleano)");
-        assert_eq!(pc1500.read_byte(0x558E), 8, "12 AND 10 debe ser 8 (bit a bit, no booleano)");
+        // 10400 = 0x28A0, 10401 = 0x28A1, 10402 = 0x28A2
+        assert_eq!(pc1500.read_byte(0x28A0), 1, "5 AND 3 debe ser 1 (bit a bit, no booleano)");
+        assert_eq!(pc1500.read_byte(0x28A1), 7, "5 OR 2 debe ser 7 (bit a bit, no booleano)");
+        assert_eq!(pc1500.read_byte(0x28A2), 8, "12 AND 10 debe ser 8 (bit a bit, no booleano)");
     }
 
     /// `^` (exponenciación entera) — necesario para `2^H` en
@@ -5013,16 +5996,16 @@ mod tests {
     fn test_oracle_pow_int_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 @(21950)=2^5\n20 @(21951)=3^3\n30 @(21952)=7^0\n40 @(21953)=2^1\n50 END\n";
+        let source = "10 @(10450)=2^5\n20 @(10451)=3^3\n30 @(10452)=7^0\n40 @(10453)=2^1\n50 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        // 21950 = 0x55BE, 21951 = 0x55BF, 21952 = 0x55C0, 21953 = 0x55C1
-        assert_eq!(pc1500.read_byte(0x55BE), 32, "2^5 debe ser 32");
-        assert_eq!(pc1500.read_byte(0x55BF), 27, "3^3 debe ser 27");
-        assert_eq!(pc1500.read_byte(0x55C0), 1, "7^0 debe ser 1 (caso borde exponente=0)");
-        assert_eq!(pc1500.read_byte(0x55C1), 2, "2^1 debe ser 2");
+        // 10450 = 0x28D2, 10451 = 0x28D3, 10452 = 0x28D4, 10453 = 0x28D5
+        assert_eq!(pc1500.read_byte(0x28D2), 32, "2^5 debe ser 32");
+        assert_eq!(pc1500.read_byte(0x28D3), 27, "3^3 debe ser 27");
+        assert_eq!(pc1500.read_byte(0x28D4), 1, "7^0 debe ser 1 (caso borde exponente=0)");
+        assert_eq!(pc1500.read_byte(0x28D5), 2, "2^1 debe ser 2");
     }
 
     /// Ejemplos textuales del Sharp PC-1500 Technical Manual, §5-3-1
@@ -5060,17 +6043,17 @@ mod tests {
     fn test_oracle_real_arithmetic_sgn_int_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 @(21960)=SGN (5-10.5)\n20 @(21961)=SGN (15-10.5)\n30 @(21962)=INT (2^3+.5)\n40 @(21963)=INT (2^5+.5)\n50 @(21964)=INT (2^7+.5)\n60 END\n";
+        let source = "10 @(10460)=SGN (5-10.5)\n20 @(10461)=SGN (15-10.5)\n30 @(10462)=INT (2^3+.5)\n40 @(10463)=INT (2^5+.5)\n50 @(10464)=INT (2^7+.5)\n60 END\n";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        // 21960 = 0x55C8 .. 21964 = 0x55CC
-        assert_eq!(pc1500.read_byte(0x55C8), 0xFF, "SGN(5-10.5)=SGN(-5.5) debe ser -1 (0xFF)");
-        assert_eq!(pc1500.read_byte(0x55C9), 1, "SGN(15-10.5)=SGN(4.5) debe ser 1");
-        assert_eq!(pc1500.read_byte(0x55CA), 8, "INT(2^3+.5)=INT(8.5) debe ser 8 (1 dígito)");
-        assert_eq!(pc1500.read_byte(0x55CB), 32, "INT(2^5+.5)=INT(32.5) debe ser 32 (2 dígitos)");
-        assert_eq!(pc1500.read_byte(0x55CC), 128, "INT(2^7+.5)=INT(128.5) debe ser 128 (3 dígitos)");
+        // 10460 = 0x28DC .. 10464 = 0x28E0
+        assert_eq!(pc1500.read_byte(0x28DC), 0xFF, "SGN(5-10.5)=SGN(-5.5) debe ser -1 (0xFF)");
+        assert_eq!(pc1500.read_byte(0x28DD), 1, "SGN(15-10.5)=SGN(4.5) debe ser 1");
+        assert_eq!(pc1500.read_byte(0x28DE), 8, "INT(2^3+.5)=INT(8.5) debe ser 8 (1 dígito)");
+        assert_eq!(pc1500.read_byte(0x28DF), 32, "INT(2^5+.5)=INT(32.5) debe ser 32 (2 dígitos)");
+        assert_eq!(pc1500.read_byte(0x28E0), 128, "INT(2^7+.5)=INT(128.5) debe ser 128 (3 dígitos)");
     }
 
     /// Verificación combinada de TODO lo añadido en esta sesión en un
@@ -5108,17 +6091,17 @@ mod tests {
 170 GOTO 190\n\
 180 V=1\n\
 190 GOSUB 300\n\
-200 @(21500)=D(0)\n\
-210 @(21501)=D(1)\n\
-220 @(21502)=D(2)\n\
-230 @(21503)=D(3)\n\
-240 @(21504)=G\n\
-250 @(21505)=R\n\
-260 @(21506)=S\n\
-270 @(21507)=T\n\
-280 @(21508)=U\n\
-290 @(21509)=V\n\
-291 @(21510)=W\n\
+200 @(10000)=D(0)\n\
+210 @(10001)=D(1)\n\
+220 @(10002)=D(2)\n\
+230 @(10003)=D(3)\n\
+240 @(10004)=G\n\
+250 @(10005)=R\n\
+260 @(10006)=S\n\
+270 @(10007)=T\n\
+280 @(10008)=U\n\
+290 @(10009)=V\n\
+291 @(10010)=W\n\
 292 END\n\
 300 W=99\n\
 310 RETURN\n\
@@ -5127,18 +6110,18 @@ mod tests {
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 30000);
 
-        // 21500 = 0x53FC .. 21510 = 0x5406
-        assert_eq!(pc1500.read_byte(0x53FC), 0, "D(0) = 0*0");
-        assert_eq!(pc1500.read_byte(0x53FD), 1, "D(1) = 1*1");
-        assert_eq!(pc1500.read_byte(0x53FE), 4, "D(2) = 2*2");
-        assert_eq!(pc1500.read_byte(0x53FF), 9, "D(3) = 3*3");
-        assert_eq!(pc1500.read_byte(0x5400), 8, "G = INT(2^3+.5) = 8");
-        assert_eq!(pc1500.read_byte(0x5401), 1, "R = 1 ((8 AND 8)>0 es cierto)");
-        assert_eq!(pc1500.read_byte(0x5402), 0xFF, "S = SGN(5-10.5) = -1");
-        assert_eq!(pc1500.read_byte(0x5403), 1, "T = SGN(15-10.5) = 1");
-        assert_eq!(pc1500.read_byte(0x5404), 32, "U = 2^5 = 32");
-        assert_eq!(pc1500.read_byte(0x5405), 1, "V = 1 (Z$=\"OK\" tras READ es cierto)");
-        assert_eq!(pc1500.read_byte(0x5406), 99, "W = 99 (asignado en la subrutina de GOSUB 300)");
+        // 10000 = 0x2710 .. 10010 = 0x271A
+        assert_eq!(pc1500.read_byte(0x2710), 0, "D(0) = 0*0");
+        assert_eq!(pc1500.read_byte(0x2711), 1, "D(1) = 1*1");
+        assert_eq!(pc1500.read_byte(0x2712), 4, "D(2) = 2*2");
+        assert_eq!(pc1500.read_byte(0x2713), 9, "D(3) = 3*3");
+        assert_eq!(pc1500.read_byte(0x2714), 8, "G = INT(2^3+.5) = 8");
+        assert_eq!(pc1500.read_byte(0x2715), 1, "R = 1 ((8 AND 8)>0 es cierto)");
+        assert_eq!(pc1500.read_byte(0x2716), 0xFF, "S = SGN(5-10.5) = -1");
+        assert_eq!(pc1500.read_byte(0x2717), 1, "T = SGN(15-10.5) = 1");
+        assert_eq!(pc1500.read_byte(0x2718), 32, "U = 2^5 = 32");
+        assert_eq!(pc1500.read_byte(0x2719), 1, "V = 1 (Z$=\"OK\" tras READ es cierto)");
+        assert_eq!(pc1500.read_byte(0x271A), 99, "W = 99 (asignado en la subrutina de GOSUB 300)");
     }
 
     /// `CLS`, `CURSOR`, `GCURSOR`, `POKE#` y `CLEAR` (no-op) — el patrón
@@ -5155,21 +6138,92 @@ mod tests {
 30 CLS\n\
 40 CURSOR 5\n\
 50 GCURSOR 42\n\
-60 POKE# 22000,123\n\
+60 POKE# 10500,123\n\
 70 CLEAR \n\
 80 END\n\
 ";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
         // 30208 = 0x7600 (primer byte del buffer de pantalla).
         assert_eq!(pc1500.read_byte(0x7600), 0, "CLS debe poner a 0 el buffer de pantalla");
         // Tras CURSOR 5, CURSOR_PTR = 5*6 = 30; tras GCURSOR 42, CURSOR_PTR = 42.
         assert_eq!(pc1500.read_byte(0x7875), 42, "GCURSOR 42 debe dejar CURSOR_PTR = 42 (sin *6)");
         assert_eq!(pc1500.read_byte(0x7874) & 0x01, 1, "CURSOR_ENA bit0 debe quedar activado");
-        // 22000 = 0x55F0
-        assert_eq!(pc1500.read_byte(0x55F0), 123, "POKE# escribe directamente en memoria absoluta");
+        // 10500 = 0x2904
+        assert_eq!(pc1500.read_byte(0x2904), 123, "POKE# escribe directamente en memoria absoluta");
+    }
+
+    /// Bug real encontrado testeando invader-v2.bas: `CURSOR n:PRINT ...`
+    /// debe conservar tanto la posición (`CURSOR_PTR`) como el contenido
+    /// de pantalla ya dibujado (p.ej. por un `GPRINT` anterior en la
+    /// misma secuencia de líneas) — la ROM real llama a `CLR_NO_CURSOR`
+    /// antes de imprimir, que solo limpia cuando `CURSOR_ENA` bit0=0 (ver
+    /// `StackInstruction::ClsIfNoCursor`), no al `Cls` incondicional que
+    /// este backend usaba antes (heredado del fix de bombing.bas, que
+    /// nunca probó el caso con un `CURSOR` inmediatamente antes).
+    #[test]
+    fn test_oracle_cursor_then_print_preserves_position_and_screen_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // `PRINT "X";` (con `;` final): sin el `;` un `PRINT` de una sola
+        // expresión añade un salto de línea implícito al final
+        // (`PrintSeparator::None` -> `StackInstruction::Newline`), que sí
+        // resetea `CURSOR_PTR` a 0 vía `INIT_MTRX` — comportamiento
+        // correcto y NO relacionado con este fix (simula el "vuelta al
+        // margen" de una LCD de una sola línea). Ese reset posterior no
+        // borra los píxeles ya dibujados, pero sí haría que este test
+        // comprobara la cosa equivocada si no se usa `;` aquí.
+        let source = "10 GCURSOR 0\n20 GPRINT \"7F\"\n30 CURSOR 5\n40 PRINT \"X\";\n50 END\n";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
+
+        let recon = |adr: u32| -> u8 {
+            (pc1500.read_byte(adr) & 0x0F) | ((pc1500.read_byte(adr + 1) & 0x0F) << 4)
+        };
+        assert_eq!(
+            recon(0x7600), 0x7F,
+            "el GPRINT \"7F\" de la columna 0 no debe borrarse al llegar el PRINT posterior"
+        );
+        assert_eq!(
+            pc1500.read_byte(0x7875), 30 + 6,
+            "CURSOR 5 deja CURSOR_PTR=30; PRINT \"X\"; (1 carácter, sin salto de línea) debe seguir desde ahí, no desde 0"
+        );
+    }
+
+    /// Contraparte del test anterior: sin ningún `CURSOR` previo,
+    /// `PRINT`/`PAUSE` deben seguir limpiando la pantalla y reseteando el
+    /// cursor a 0 como siempre (comportamiento confirmado con
+    /// bombing.bas) — `ClsIfNoCursor` no debe convertirse en un no-op
+    /// general, solo debe respetar un `CURSOR` explícito.
+    #[test]
+    fn test_oracle_print_without_prior_cursor_still_clears_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // 30224 = 0x7610, lejos de las columnas 0-5 donde `PRINT "X";`
+        // dibuja su propio glifo — para no confundir "LCD_CLR limpió
+        // esto" con "CHAR_OUT lo sobrescribió imprimiendo la X".
+        // Ensuciarlo vía `POKE#` directo, NO vía `GCURSOR`/`GPRINT`/
+        // `CURSOR`: esas sentencias TAMBIÉN activan `CURSOR_ENA` bit0 (el
+        // mismo mecanismo real que `CURSOR`, ver `BCMD_GCURSOR`
+        // reutilizando la cola de `BCMD_CURSOR_2`), así que usarlas aquí
+        // invalidaría el escenario que este test quiere aislar: "sin
+        // ningún `CURSOR` previo".
+        let source = "10 POKE# 30224,127\n20 PRINT \"X\";\n30 END\n";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
+
+        assert_eq!(
+            pc1500.read_byte(0x7610), 0,
+            "sin CURSOR previo, PRINT debe seguir limpiando la pantalla entera (CURSOR_ENA bit0=0)"
+        );
+        assert_eq!(
+            pc1500.read_byte(0x7875), 6,
+            "sin CURSOR previo, PRINT \"X\"; debe empezar en la columna 0 (6 tras 1 carácter)"
+        );
     }
 
     /// `WAIT n` llama a `TIME_DELAY` real, que sondea el bit de la señal
@@ -5242,7 +6296,7 @@ mod tests {
 
         for source in cases {
             let code = compile_native(source);
-            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+            let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
             let cursor_ptr = pc1500.read_byte(0x7875);
             assert_eq!(
                 cursor_ptr, 0,
@@ -5250,6 +6304,130 @@ mod tests {
                 source.lines().next().unwrap()
             );
         }
+    }
+
+    /// Root-cause confirmado del mapa cortísimo (idéntico en ambos
+    /// niveles) de invader-v2.bas, DISTINTO del bug de aliasing
+    /// escalar/array (ver
+    /// `test_oracle_scalar_and_array_with_same_letter_name_stay_independent_on_real_rom`)
+    /// — ambos afectaban al mismo bucle real (`FOR Z=1 TO 6:FOR D=1 TO
+    /// B:...:NEXT D:B=L,C=C+3:NEXT Z`, línea 130) y hubo que arreglar
+    /// los dos para que el terreno se generase con la extensión real.
+    /// `gen_next` encontraba el contexto de un `FOR` ya cerrado (el de
+    /// `D`, tras su propio `NEXT D`) pero nunca lo quitaba de
+    /// `for_stack` (solo `.clone()`) — un `NEXT` de un bucle EXTERIOR
+    /// posterior (`NEXT Z`) lo volvía a encontrar como si fuera un bucle
+    /// interior huérfano (nunca cerrado) y le emitía una etiqueta
+    /// `loop_end` DUPLICADA justo al lado de la genuina. Con dos
+    /// etiquetas iguales en el flujo, la resolución de etiquetas del
+    /// backend se quedaba con la ÚLTIMA definición, así que el salto de
+    /// salida real del bucle interior (`D>límite`) aterrizaba en la
+    /// copia duplicada, saltándose CUALQUIER código entre el `NEXT`
+    /// interior y el exterior — en este caso concreto, `B=L` (línea
+    /// 130) nunca se ejecutaba a partir de la 2ª vuelta de `FOR Z` en
+    /// adelante, dejando `B` congelado con el valor de la 1ª vuelta para
+    /// siempre y acortando drásticamente el terreno generado. Reducido a
+    /// mínimo aquí: `FOR D=1 TO B` cuyo límite `B` cambia entre vueltas
+    /// del `FOR Z` exterior — sin el fix, el bucle interior se queda
+    /// para siempre con el límite de la primera vuelta.
+    #[test]
+    fn test_oracle_inner_for_loop_reflects_new_bound_after_outer_reentry_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "\
+10 N=0\n\
+20 B=2\n\
+30 FOR Z=1 TO 3\n\
+40 FOR D=1 TO B\n\
+50 N=N+1\n\
+60 NEXT D\n\
+70 B=5\n\
+80 NEXT Z\n\
+90 @(10900)=N\n\
+100 END\n\
+";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
+
+        // 10900 = 0x2A94. Esperado: Z=1 usa B=2 (2 vueltas de D), luego
+        // B=5 para Z=2 y Z=3 (5 vueltas cada una) — total 2+5+5=12. Sin
+        // el fix, "B=5" nunca se ejecutaba tras la 1ª vuelta de Z, así
+        // que el resultado se quedaba en algo menor (6 en la
+        // investigación real, dependiendo de dónde cayera la etiqueta
+        // duplicada).
+        assert_eq!(
+            pc1500.read_byte(0x2A94), 12,
+            "FOR D=1 TO B debe usar el valor de B actualizado (5) en la 2ª y 3ª vuelta de FOR Z, no quedarse \
+             congelado en el valor de la 1ª vuelta (2)"
+        );
+    }
+
+    /// Tercer y último root-cause del mapa siempre-igual de
+    /// invader-v2.bas (los otros dos: aliasing escalar/array, ver
+    /// `test_oracle_scalar_and_array_with_same_letter_name_stay_independent_on_real_rom`;
+    /// duplicación de etiqueta `NEXT`, ver
+    /// `test_oracle_inner_for_loop_reflects_new_bound_after_outer_reentry_on_real_rom`):
+    /// `C=299` (literal >255) seguido de `C=C+3` (acumulador) y
+    /// `RESTORE C+RND 3` — antes de `word_variables`, CUALQUIER literal
+    /// >255 asignado a una variable escalar normal desincronizaba la
+    /// pila (`ApilaInt` empuja 2 bytes para el literal, pero
+    /// `DesapilaInd`/`ApilaInd` siempre asumen 1), así que `C` nunca
+    /// llegaba a valer realmente 299 y `RESTORE` siempre apuntaba casi
+    /// al mismo sitio — de ahí que el terreno generado fuera siempre el
+    /// mismo tramo. Reproduce el patrón completo: asignación de un
+    /// literal grande, acumulación (`+=`), uso como base de `RESTORE`
+    /// dinámico, y una SEGUNDA variable "de palabra" (`S`) que además se
+    /// imprime (`PRINT`, el otro consumidor real del corpus,
+    /// `S=S+5000:PRINT ...;S;...` en invader-v2.bas).
+    #[test]
+    fn test_oracle_word_variable_assignment_arithmetic_restore_and_print_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "\
+5 DIM A$(0)*20\n\
+10 C=299\n\
+20 C=C+3\n\
+30 RESTORE C\n\
+40 READ A$(0)\n\
+50 S=0\n\
+60 S=S+5000\n\
+70 PRINT S;\n\
+80 END\n\
+302 DATA \"ZZZZZZZZZZZZZZZZZZZZ\"\n\
+";
+        let (code, addrs) = compile_native_with_addresses(source);
+        let c_addr = *addrs.get("C").expect("dirección de C no encontrada") as u32;
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
+
+        // `C` cabe en un byte hasta 255, pero 299 y 302 no — hay que leer
+        // los 2 bytes reales (alto, luego bajo, mismo convenio
+        // big-endian que `ApilaIntWord`/`DesapilaIndWord`).
+        let read_word = |pc1500: &ceres_core::Pc1500, addr: u32| -> u16 {
+            ((pc1500.read_byte(addr) as u16) << 8) | pc1500.read_byte(addr + 1) as u16
+        };
+        assert_eq!(
+            read_word(&pc1500, c_addr), 302,
+            "C=299 seguido de C=C+3 debe dar 302 de verdad (aritmética de 16 bits, sin truncar a 8 bits)"
+        );
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente, sin desincronizar la pila");
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S (registro) debe volver a stack_top: sin esto, cualquier LET con un literal >255 dejaba la pila \
+             descuadrada para el resto del programa"
+        );
+
+        // RESTORE C (=302) debe leer el DATA de la línea 302 ("ZZ"), no
+        // el primero disponible (que es a lo que caía sin el fix, dado
+        // que C nunca llegaba a valer más de su byte bajo).
+        let a_addr = *addrs.get("ARRAY:A$").expect("dirección de A$ no encontrada") as u32;
+        assert_eq!(pc1500.read_byte(a_addr), b'Z', "RESTORE C debe apuntar a la línea 302 real (\"ZZ\"), no a la primera DATA");
+        assert_eq!(pc1500.read_byte(a_addr + 1), b'Z');
+
+        // PRINT S (S=5000, "de palabra") debe imprimir sus 4 dígitos
+        // reales, no desincronizar la pila al llegar a SystemOutIntWord.
+        assert_eq!(pc1500.read_byte(0x7875), 4 * 6, "PRINT S (S=5000) debe imprimir 4 dígitos: \"5000\"");
     }
 
     /// `GPRINT` de un valor numérico (1 byte = 1 columna) y de una cadena
@@ -5271,7 +6449,7 @@ mod tests {
         let source = "10 DIM A$(0)*2\n20 A$(0)=\"3C\"\n30 GCURSOR 0\n40 GPRINT 5\n50 GPRINT 3\n60 GCURSOR 39\n70 GPRINT \"AB\"\n80 GCURSOR 78\n90 GPRINT A$(0)\n100 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
         let recon = |adr: u32| -> u8 {
             (pc1500.read_byte(adr) & 0x0F) | ((pc1500.read_byte(adr + 1) & 0x0F) << 4)
@@ -5316,7 +6494,7 @@ mod tests {
         let source = "10 GCURSOR 0\n20 GPRINT \"12345678AB\"\n30 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
         assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
         assert_eq!(
@@ -5356,21 +6534,80 @@ mod tests {
 60 GPRINT 100\n\
 70 GCURSOR 155\n\
 80 GPRINT 15\n\
-90 @(22100)=POINT 0\n\
-100 @(22101)=POINT 39\n\
-110 @(22102)=POINT 78\n\
-120 @(22103)=POINT 155\n\
+90 @(10600)=POINT 0\n\
+100 @(10601)=POINT 39\n\
+110 @(10602)=POINT 78\n\
+120 @(10603)=POINT 155\n\
 130 END\n\
 ";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 8000);
 
-        // 22100 = 0x5654 .. 22103 = 0x5657
-        assert_eq!(pc1500.read_byte(0x5654), 42, "POINT(0): base par, nibble bajo");
-        assert_eq!(pc1500.read_byte(0x5655), 85, "POINT(39): base impar, nibble bajo");
-        assert_eq!(pc1500.read_byte(0x5656), 100, "POINT(78): base par, nibble alto");
-        assert_eq!(pc1500.read_byte(0x5657), 15, "POINT(155): base impar, nibble alto");
+        // 10600 = 0x2968 .. 10603 = 0x296B
+        assert_eq!(pc1500.read_byte(0x2968), 42, "POINT(0): base par, nibble bajo");
+        assert_eq!(pc1500.read_byte(0x2969), 85, "POINT(39): base impar, nibble bajo");
+        assert_eq!(pc1500.read_byte(0x296A), 100, "POINT(78): base par, nibble alto");
+        assert_eq!(pc1500.read_byte(0x296B), 15, "POINT(155): base impar, nibble alto");
+    }
+
+    /// Bug real reportado testeando invader-v2.bas: el mapa/terreno no se
+    /// desplaza durante la partida (se ve el mapa completo estático de
+    /// golpe, y el juego "termina" cuando la nave llega al final en vez
+    /// de ir generándose el terreno sobre la marcha). invader-v2.bas
+    /// implementa el scroll con una rutina de código máquina propia
+    /// POKEada en `&7050` ("Shift right half-screen 1 pixel to the
+    /// left", documentada en el propio listado, líneas 129-165 del
+    /// fichero fuente) invocada vía `CALL &7050` (línea 180). Este test
+    /// reproduce EXACTAMENTE esos mismos `POKE`/`CALL` (mismos bytes,
+    /// misma dirección) para verificar, contra la ROM real, si nuestro
+    /// `CALL <dirección constante>` (`StackInstruction::CallAddr`, un
+    /// `SJP` directo) ejecuta esta rutina de la misma forma que lo haría
+    /// el `CALL` real del intérprete.
+    #[test]
+    fn test_oracle_invader_scroll_routine_shifts_screen_left_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // La rutina de scroll de invader-v2.bas opera SOLO sobre el
+        // NIBBLE ALTO de cada par de bytes en 0x7600-0x764D/0x7700-
+        // 0x774D — que es, por el propio direccionamiento nibble-
+        // partido de la LCD real (ver `recon_high`/columna 78 en
+        // `test_oracle_gprint_numeric_and_string_on_real_rom`), la mitad
+        // de columnas 78-155, NO la 0-77 (nibble bajo). El propio juego
+        // dibuja el terreno/nave ahí a propósito (`GCURSOR 92`/`GCURSOR
+        // 138`/`GCURSOR 150`, todas >=78) para poder desplazarlas sin
+        // tocar el texto/marcador de la mitad baja (columnas 0-77). Un
+        // primer intento de este test usando `GCURSOR 0/1/2` (nibble
+        // bajo) no detectaba ningún cambio — no porque la rutina no
+        // hiciera nada, sino porque estaba mirando la mitad de memoria
+        // equivocada.
+        let source = "\
+10 GCURSOR 78:GPRINT \"11\"\n\
+20 GCURSOR 79:GPRINT \"22\"\n\
+30 GCURSOR 80:GPRINT \"33\"\n\
+40 POKE &7050,&58,&76,&5A,&00,&FD,&18,&50,&50,&49,&0F,&15,&B9,&F0,&0B,&0E,&50,&40\n\
+50 POKE &7061,&5E,&4E,&99,&0D,&5C,&77,&8B,&19,&FD,&50,&5A,&00,&49,&0F,&15,&B9,&F0\n\
+60 POKE &7072,&0B,&0E,&40,&50,&4E,&4E,&99,&0D,&FD,&40,&4A,&00,&5A,&02,&9E,&2A,&49\n\
+70 POKE &7083,&0F,&40,&49,&0F,&9A\n\
+80 CALL &7050\n\
+90 END\n\
+";
+        let code = compile_native(source);
+
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
+
+        let recon_high = |adr: u32| -> u8 {
+            ((pc1500.read_byte(adr) >> 4) & 0x0F) | (((pc1500.read_byte(adr + 1) >> 4) & 0x0F) << 4)
+        };
+
+        assert_eq!(
+            recon_high(0x7600), 0x22,
+            "tras CALL &7050 (shift 1 col a la izquierda), la columna 78 debe tener lo que antes tenía la columna 79 (0x22)"
+        );
+        assert_eq!(
+            recon_high(0x7602), 0x33,
+            "tras CALL &7050, la columna 79 debe tener lo que antes tenía la columna 80 (0x33)"
+        );
     }
 
     /// `BEEP a,b,c` — el patrón exacto de bathyscaph.bas (`BEEP 1,0,1`).
@@ -5384,13 +6621,13 @@ mod tests {
     fn test_oracle_beep_returns_cleanly_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 BEEP 2,1,1\n20 @(22200)=1\n30 END\n";
+        let source = "10 BEEP 2,1,1\n20 @(10700)=1\n30 END\n";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 500_000);
 
-        // 22200 = 0x56B8
-        assert_eq!(pc1500.read_byte(0x56B8), 1, "el programa debe seguir tras BEEP (llama a BEEP 2 veces y vuelve limpiamente)");
+        // 10700 = 0x29CC
+        assert_eq!(pc1500.read_byte(0x29CC), 1, "el programa debe seguir tras BEEP (llama a BEEP 2 veces y vuelve limpiamente)");
     }
 
     /// `BEEP ON`/`BEEP OFF`: encontradas YA implementadas como no-op
@@ -5432,15 +6669,15 @@ mod tests {
     fn test_oracle_multi_assignment_and_time_identifier_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 TIME =0,H=3,G=8\n20 @(22400)=H\n30 @(22401)=G\n40 @(22402)=TIME \n50 END\n";
+        let source = "10 TIME =0,H=3,G=8\n20 @(10900)=H\n30 @(10901)=G\n40 @(10902)=TIME \n50 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        // 22400 = 0x5780, 22401 = 0x5781, 22402 = 0x5782
-        assert_eq!(pc1500.read_byte(0x5780), 3, "H=3 (segunda asignación de la línea multi-asignación)");
-        assert_eq!(pc1500.read_byte(0x5781), 8, "G=8 (tercera asignación)");
-        assert_eq!(pc1500.read_byte(0x5782), 0, "TIME=0 (primera asignación, TIME tratado como variable normal)");
+        // 10900 = 0x2A94, 10901 = 0x2A95, 10902 = 0x2A96
+        assert_eq!(pc1500.read_byte(0x2A94), 3, "H=3 (segunda asignación de la línea multi-asignación)");
+        assert_eq!(pc1500.read_byte(0x2A95), 8, "G=8 (tercera asignación)");
+        assert_eq!(pc1500.read_byte(0x2A96), 0, "TIME=0 (primera asignación, TIME tratado como variable normal)");
     }
 
     /// Exploratorio (no de regresión estricta): compila el bathyscaph.bas
@@ -5472,7 +6709,7 @@ mod tests {
 
         let pc = pc1500.cpu().p();
         assert!(
-            (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+            (0x0100..=0x47FF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
             "tras 300 frames el PC debería seguir en memoria de usuario o ROM, no en {pc:#06X} (posible corrupción/salto a memoria inválida)"
         );
     }
@@ -5602,17 +6839,17 @@ mod tests {
         use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
         use ceres_core::Key;
 
-        let source = "10 WAIT \n20 @(21700)=1\n30 GOTO 30\n";
+        let source = "10 WAIT \n20 @(10200)=1\n30 GOTO 30\n";
         let code = compile_native(source);
         let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
 
         // Sin ninguna tecla pulsada: debe quedarse esperando, sin
-        // llegar a escribir @(21700)=1, durante muchos frames.
+        // llegar a escribir @(10200)=1, durante muchos frames.
         for _ in 0..50 {
             pc1500.step_frame();
         }
         assert_eq!(
-            pc1500.read_byte(21700), 0,
+            pc1500.read_byte(10200), 0,
             "WAIT sin argumento no debería continuar sin ninguna tecla pulsada"
         );
 
@@ -5623,7 +6860,7 @@ mod tests {
         }
         pc1500.release(Key::Five);
         assert_eq!(
-            pc1500.read_byte(21700), 1,
+            pc1500.read_byte(10200), 1,
             "WAIT sin argumento debería desbloquearse en cuanto se pulsa una tecla"
         );
     }
@@ -5657,9 +6894,17 @@ mod tests {
         // El `;` final del segundo PRINT suprime SU PROPIO salto de
         // línea automático, para poder comprobar dónde empezó a
         // imprimirse sin que se resetee otra vez antes del END.
+        //
+        // Ahora, además, cada `PRINT` llama a `Cls` (ver el comentario
+        // largo de `gen_print`) — `LCD_CLR` es un bucle ROM real sobre
+        // los ~154 bytes de las dos páginas de pantalla, bastante más
+        // caro que el resto del programa junto; el presupuesto de
+        // instrucciones subió de 5.000 a 40.000 para que el programa
+        // (ahora con DOS `Cls` completos) siga llegando a HALT dentro
+        // del límite, no solo a mitad del segundo PRINT.
         let source = "10 PRINT \" **** BOMBARDEMENTS ****\"\n20 PRINT \"HI\";\n30 END\n";
         let code = compile_native(source);
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
 
         assert_eq!(
             pc1500.read_byte(0x7875), 2 * 6,
@@ -5769,7 +7014,7 @@ mod tests {
             );
             let pc = pc1500.cpu().p();
             assert!(
-                (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+                (0x0100..=0x47FF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
                 "frame {frame}: PC salió a memoria inválida: {pc:#06X}"
             );
         }
@@ -5802,7 +7047,7 @@ mod tests {
             );
             let pc = pc1500.cpu().p();
             assert!(
-                (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+                (0x0100..=0x47FF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
                 "frame {frame}: PC salió a memoria inválida: {pc:#06X}"
             );
         }
@@ -5838,7 +7083,7 @@ mod tests {
         let (false_code, false_addrs) = compile_native_with_addresses(false_source);
         let a_addr = *false_addrs.get("A").expect("dirección de A no encontrada") as u32;
         let b_addr = *false_addrs.get("B").expect("dirección de B no encontrada") as u32;
-        let pc1500_false = run_lh5_until_exit(ORACLE_LOAD_ADDR, &false_code, ORACLE_STACK_TOP, 5000);
+        let pc1500_false = run_lh5_until_exit(ORACLE_LOAD_ADDR, &false_code, ORACLE_STACK_TOP, 11000);
         assert_eq!(pc1500_false.read_byte(a_addr), 0, "condición falsa: A no debe tocarse");
         assert_eq!(
             pc1500_false.read_byte(b_addr), 0,
@@ -5850,7 +7095,7 @@ mod tests {
         let (true_code, true_addrs) = compile_native_with_addresses(true_source);
         let a_addr2 = *true_addrs.get("A").expect("dirección de A no encontrada") as u32;
         let b_addr2 = *true_addrs.get("B").expect("dirección de B no encontrada") as u32;
-        let pc1500_true = run_lh5_until_exit(ORACLE_LOAD_ADDR, &true_code, ORACLE_STACK_TOP, 5000);
+        let pc1500_true = run_lh5_until_exit(ORACLE_LOAD_ADDR, &true_code, ORACLE_STACK_TOP, 11000);
         assert_eq!(pc1500_true.read_byte(a_addr2), 7, "condición verdadera: A=7 (primera sentencia) debe ejecutarse");
         assert_eq!(pc1500_true.read_byte(b_addr2), 8, "condición verdadera: B=8 (segunda sentencia) también debe ejecutarse");
     }
@@ -5925,19 +7170,19 @@ mod tests {
 20 FOR I=1TO5\n\
 30 B=B+.5\n\
 40 NEXT I\n\
-50 IF B=2.5 THEN @(21700)=1\n\
-60 IF B<>2.5 THEN @(21701)=1\n\
-70 IF B>2 THEN @(21702)=1\n\
-80 IF B<2 THEN @(21703)=1\n\
+50 IF B=2.5 THEN @(10200)=1\n\
+60 IF B<>2.5 THEN @(10201)=1\n\
+70 IF B>2 THEN @(10202)=1\n\
+80 IF B<2 THEN @(10203)=1\n\
 90 END\n\
 ";
         let code = compile_native(source);
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        assert_eq!(pc1500.read_byte(21700), 1, "B debe ser exactamente 2.5 tras 5 vueltas de B=B+.5");
-        assert_eq!(pc1500.read_byte(21701), 0, "B<>2.5 debe ser falso (B es exactamente 2.5)");
-        assert_eq!(pc1500.read_byte(21702), 1, "B>2 (2.5>2) debe ser cierto, con el entero 2 promocionado a real");
-        assert_eq!(pc1500.read_byte(21703), 0, "B<2 debe ser falso (2.5 no es menor que 2)");
+        assert_eq!(pc1500.read_byte(10200), 1, "B debe ser exactamente 2.5 tras 5 vueltas de B=B+.5");
+        assert_eq!(pc1500.read_byte(10201), 0, "B<>2.5 debe ser falso (B es exactamente 2.5)");
+        assert_eq!(pc1500.read_byte(10202), 1, "B>2 (2.5>2) debe ser cierto, con el entero 2 promocionado a real");
+        assert_eq!(pc1500.read_byte(10203), 0, "B<2 debe ser falso (2.5 no es menor que 2)");
 
         assert_eq!(
             pc1500.cpu().s(), ORACLE_STACK_TOP,
@@ -6003,21 +7248,21 @@ mod tests {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
         let source = "\
-10 @(22500)=RND (16)\n\
-20 @(22501)=RND (16)\n\
-30 @(22502)=RND (16)\n\
-40 @(22503)=RND (0)\n\
+10 @(11000)=RND (16)\n\
+20 @(11001)=RND (16)\n\
+30 @(11002)=RND (16)\n\
+40 @(11003)=RND (0)\n\
 50 END\n\
 ";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 10000);
 
-        // 22500 = 0x57E4 .. 22503 = 0x57E7
-        let a = pc1500.read_byte(0x57E4);
-        let b = pc1500.read_byte(0x57E5);
-        let c = pc1500.read_byte(0x57E6);
-        let zero_case = pc1500.read_byte(0x57E7);
+        // 11000 = 0x2AF8 .. 11003 = 0x2AFB
+        let a = pc1500.read_byte(0x2AF8);
+        let b = pc1500.read_byte(0x2AF9);
+        let c = pc1500.read_byte(0x2AFA);
+        let zero_case = pc1500.read_byte(0x2AFB);
 
         assert!(a < 16, "RND(16) debe dar un valor < 16, dio {a}");
         assert!(b < 16, "RND(16) debe dar un valor < 16, dio {b}");
@@ -6027,6 +7272,91 @@ mod tests {
             "llamadas consecutivas a RND no deberían dar SIEMPRE el mismo valor (el LFSR debe avanzar): {a}, {b}, {c}"
         );
         assert_eq!(zero_case, 0, "RND(0) debe dar 0 (caso sin rango), no colgarse");
+    }
+
+    /// Regresión del bug real encontrado en bathyscaph.bas (2026-08-27):
+    /// el mapa de la cueva (`RESTORE 999+RND 16`, sin llamar nunca a
+    /// `RANDOM`) salía distinto cada vez que se cargaba el `.lh5` en el
+    /// emulador real, aunque el original tokenizado siempre muestra el
+    /// mismo mapa. Causa: `Pc1500::load_lh5_file` solo sobrescribe los
+    /// bytes del código al cargar, nunca limpia la región de variables —
+    /// así que cargar el MISMO programa dos veces en la misma sesión del
+    /// emulador (sin reiniciar la app, el flujo real de "Cargar" en la
+    /// GUI) deja `__RND_SEED` con el valor donde lo dejó la partida
+    /// anterior. Arreglado: el prólogo del programa ahora fija
+    /// `__RND_SEED` a un valor conocido de forma incondicional en cada
+    /// arranque, no solo si detecta que está a 0.
+    ///
+    /// En vez de depender de lo que el LFSR "deje" tras una partida real
+    /// (que para pocas llamadas puede coincidir por casualidad con el
+    /// punto de partida — comprobado empíricamente al verificar este
+    /// mismo test), se fuerza un valor deliberadamente distinto y
+    /// arbitrario en `__RND_SEED` justo antes de la segunda carga — así
+    /// se prueba el mecanismo real del arreglo (el prólogo SIEMPRE
+    /// sobrescribe lo que hubiera antes) sin ambigüedad.
+    #[test]
+    fn test_oracle_rnd_seed_resets_deterministically_across_repeated_loads_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, compile_native_with_addresses};
+        use ceres_core::Pc1500;
+        use std::io::Write;
+
+        let source = "10 @(11000)=RND (16):@(11001)=RND (16):@(11002)=RND (16)\n20 END\n";
+        let code = compile_native(source);
+        let (_, addrs) = compile_native_with_addresses(source);
+        let seed_addr = *addrs.get("__RND_SEED").expect("__RND_SEED debe tener dirección asignada") as u32;
+        let load_addr: u16 = 0x0100;
+
+        let mut bytes = Vec::with_capacity(4 + code.len());
+        bytes.extend_from_slice(&load_addr.to_le_bytes());
+        bytes.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&code);
+
+        let mut file = tempfile::NamedTempFile::new().expect("crear .lh5 temporal");
+        file.write_all(&bytes).expect("escribir .lh5 temporal");
+        file.flush().expect("flush .lh5 temporal");
+
+        let mut pc1500 = Pc1500::new();
+
+        // Primera carga y partida completa.
+        pc1500.load_lh5_file(file.path()).expect("primera carga");
+        for _ in 0..10_000u32 {
+            if pc1500.cpu().is_halted() {
+                break;
+            }
+            pc1500.step_cpu();
+        }
+        let first_run = [
+            pc1500.read_byte(0x2AF8),
+            pc1500.read_byte(0x2AF9),
+            pc1500.read_byte(0x2AFA),
+        ];
+
+        // Forzar un valor arbitrario y muy distinto en __RND_SEED antes
+        // de la segunda carga — simula "lo que fuera que hubiera
+        // quedado ahí" de la forma más inequívoca posible.
+        pc1500.write_byte(seed_addr, 200);
+        assert_eq!(pc1500.read_byte(seed_addr), 200, "el valor forzado debe quedar escrito antes de la segunda carga");
+
+        // Segunda carga del MISMO archivo, sobre el MISMO Pc1500 — sin
+        // limpiar memoria entre medias, igual que el botón "Cargar" real.
+        pc1500.load_lh5_file(file.path()).expect("segunda carga");
+        for _ in 0..10_000u32 {
+            if pc1500.cpu().is_halted() {
+                break;
+            }
+            pc1500.step_cpu();
+        }
+        let second_run = [
+            pc1500.read_byte(0x2AF8),
+            pc1500.read_byte(0x2AF9),
+            pc1500.read_byte(0x2AFA),
+        ];
+
+        assert_eq!(
+            first_run, second_run,
+            "RND debe dar la MISMA secuencia en cada carga fresca del programa, incluso si __RND_SEED tenía un valor arbitrario (200) justo antes de cargar: primera vez {:?}, segunda vez {:?}",
+            first_run, second_run
+        );
     }
 
     /// `IF cond THEN <asignación sin LET>` — bug de parser preexistente
@@ -6039,18 +7369,18 @@ mod tests {
     fn test_oracle_if_then_assignment_without_let_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 X=1\n20 IF 1=1THEN X=5\n30 IF 1=2THEN X=9\n40 @(21600)=X\n50 END\n";
+        let source = "10 X=1\n20 IF 1=1THEN X=5\n30 IF 1=2THEN X=9\n40 @(10100)=X\n50 END\n";
         let code = compile_native(source);
 
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
 
-        // 21600 = 0x5460 (dentro de standard_user_memory, 0x3800-0x5FFF
+        // 10100 = 0x2774 (dentro de standard_user_memory, 0x0100-0x47FF
         // con la expansión CE-155 — 22600/0x5848, usado en un intento
         // anterior de este test, excedía el tope de la época, 0x57FF con
         // la expansión CE-151; sería válido con el rango actual, pero
-        // 21600 sigue funcionando igual de bien y no hace falta tocarlo).
+        // 10100 sigue funcionando igual de bien y no hace falta tocarlo).
         assert_eq!(
-            pc1500.read_byte(0x5460), 5,
+            pc1500.read_byte(0x2774), 5,
             "IF 1=1 THEN X=5 (condición cierta) debe asignar 5; IF 1=2 THEN X=9 (falsa) no debe ejecutarse"
         );
     }
@@ -6065,27 +7395,27 @@ mod tests {
 
         let source = "\
 10 A$=\"HELLO WORLD\"\n\
-20 @(21700)=LEN A$\n\
-30 @(21701)=ASC LEFT$ (A$,5)\n\
-40 @(21702)=ASC RIGHT$ (A$,5)\n\
-50 @(21703)=ASC MID$ (A$,7,5)\n\
-60 @(21704)=ASC STR$ (42)\n\
-70 @(21705)=VAL (\"123\")\n\
-80 @(21706)=LEN LEFT$ (A$,5)\n\
+20 @(10200)=LEN A$\n\
+30 @(10201)=ASC LEFT$ (A$,5)\n\
+40 @(10202)=ASC RIGHT$ (A$,5)\n\
+50 @(10203)=ASC MID$ (A$,7,5)\n\
+60 @(10204)=ASC STR$ (42)\n\
+70 @(10205)=VAL (\"123\")\n\
+80 @(10206)=LEN LEFT$ (A$,5)\n\
 90 END\n\
 ";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        // 21700 = 0x54C4 .. 21706 = 0x54CA
-        assert_eq!(pc1500.read_byte(0x54C4), 11, "LEN(\"HELLO WORLD\") = 11");
-        assert_eq!(pc1500.read_byte(0x54C5), b'H', "LEFT$(A$,5) = \"HELLO\", primer carácter 'H'");
-        assert_eq!(pc1500.read_byte(0x54C6), b'W', "RIGHT$(A$,5) = \"WORLD\", primer carácter 'W'");
-        assert_eq!(pc1500.read_byte(0x54C7), b'W', "MID$(A$,7,5) = \"WORLD\", primer carácter 'W'");
-        assert_eq!(pc1500.read_byte(0x54C8), b'4', "STR$(42) = \"42\", primer carácter '4'");
-        assert_eq!(pc1500.read_byte(0x54C9), 123, "VAL(\"123\") = 123");
-        assert_eq!(pc1500.read_byte(0x54CA), 5, "LEN(LEFT$(A$,5)) = 5 (anidamiento de funciones distintas)");
+        // 10200 = 0x27D8 .. 10206 = 0x27DE
+        assert_eq!(pc1500.read_byte(0x27D8), 11, "LEN(\"HELLO WORLD\") = 11");
+        assert_eq!(pc1500.read_byte(0x27D9), b'H', "LEFT$(A$,5) = \"HELLO\", primer carácter 'H'");
+        assert_eq!(pc1500.read_byte(0x27DA), b'W', "RIGHT$(A$,5) = \"WORLD\", primer carácter 'W'");
+        assert_eq!(pc1500.read_byte(0x27DB), b'W', "MID$(A$,7,5) = \"WORLD\", primer carácter 'W'");
+        assert_eq!(pc1500.read_byte(0x27DC), b'4', "STR$(42) = \"42\", primer carácter '4'");
+        assert_eq!(pc1500.read_byte(0x27DD), 123, "VAL(\"123\") = 123");
+        assert_eq!(pc1500.read_byte(0x27DE), 5, "LEN(LEFT$(A$,5)) = 5 (anidamiento de funciones distintas)");
     }
 
     /// Funciones de cadena sobre un elemento de array de cadena de ancho
@@ -6100,25 +7430,25 @@ mod tests {
         let source = "\
 10 DIM S$(0)*5\n\
 20 S$(0)=\"ABCDE\"\n\
-30 @(21710)=LEN S$(0)\n\
-40 @(21711)=ASC LEFT$ (S$(0),2)\n\
-50 @(21712)=ASC RIGHT$ (S$(0),2)\n\
-60 @(21713)=ASC MID$ (S$(0),3,2)\n\
-70 @(21714)=LEN LEFT$ (S$(0),100)\n\
-80 @(21715)=LEN RIGHT$ (S$(0),100)\n\
+30 @(10210)=LEN S$(0)\n\
+40 @(10211)=ASC LEFT$ (S$(0),2)\n\
+50 @(10212)=ASC RIGHT$ (S$(0),2)\n\
+60 @(10213)=ASC MID$ (S$(0),3,2)\n\
+70 @(10214)=LEN LEFT$ (S$(0),100)\n\
+80 @(10215)=LEN RIGHT$ (S$(0),100)\n\
 90 END\n\
 ";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        // 21710 = 0x54CE .. 21715 = 0x54D3
-        assert_eq!(pc1500.read_byte(0x54CE), 5, "LEN(S$(0)) = 5 (ancho fijo declarado, sin NUL)");
-        assert_eq!(pc1500.read_byte(0x54CF), b'A', "LEFT$(S$(0),2) = \"AB\", primer carácter 'A'");
-        assert_eq!(pc1500.read_byte(0x54D0), b'D', "RIGHT$(S$(0),2) = \"DE\", primer carácter 'D'");
-        assert_eq!(pc1500.read_byte(0x54D1), b'C', "MID$(S$(0),3,2) = \"CD\", primer carácter 'C'");
-        assert_eq!(pc1500.read_byte(0x54D2), 5, "LEFT$(S$(0),100) debe recortarse (clamp) a los 5 disponibles");
-        assert_eq!(pc1500.read_byte(0x54D3), 5, "RIGHT$(S$(0),100) debe recortarse (clamp) a los 5 disponibles");
+        // 10210 = 0x27E2 .. 10215 = 0x27E7
+        assert_eq!(pc1500.read_byte(0x27E2), 5, "LEN(S$(0)) = 5 (ancho fijo declarado, sin NUL)");
+        assert_eq!(pc1500.read_byte(0x27E3), b'A', "LEFT$(S$(0),2) = \"AB\", primer carácter 'A'");
+        assert_eq!(pc1500.read_byte(0x27E4), b'D', "RIGHT$(S$(0),2) = \"DE\", primer carácter 'D'");
+        assert_eq!(pc1500.read_byte(0x27E5), b'C', "MID$(S$(0),3,2) = \"CD\", primer carácter 'C'");
+        assert_eq!(pc1500.read_byte(0x27E6), 5, "LEFT$(S$(0),100) debe recortarse (clamp) a los 5 disponibles");
+        assert_eq!(pc1500.read_byte(0x27E7), 5, "RIGHT$(S$(0),100) debe recortarse (clamp) a los 5 disponibles");
     }
 
     /// `RESTORE <constante> + <expresión>` — el patrón exacto de
@@ -6138,7 +7468,7 @@ mod tests {
 20 X=1\n\
 30 RESTORE 1000+X\n\
 40 READ A$\n\
-50 @(21600)=ASC A$\n\
+50 @(10100)=ASC A$\n\
 60 END\n\
 1000 DATA \"DDDD\"\n\
 1001 DATA \"EEEE\"\n\
@@ -6147,9 +7477,9 @@ mod tests {
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        // 21600 = 0x5460
+        // 10100 = 0x2774
         assert_eq!(
-            pc1500.read_byte(0x5460), b'E',
+            pc1500.read_byte(0x2774), b'E',
             "RESTORE 1000+X (X=1) -> línea 1001 -> READ A$ debe dar \"EEEE\" (primer carácter 'E')"
         );
     }
@@ -6167,15 +7497,15 @@ mod tests {
         let source = "\
 10 D=30\n\
 20 GOTO D\n\
-25 @(21600)=1\n\
+25 @(10100)=1\n\
 26 GOTO 50\n\
-30 @(21600)=2\n\
+30 @(10100)=2\n\
 40 E=100\n\
 41 GOSUB E\n\
-42 @(21601)=X\n\
+42 @(10101)=X\n\
 43 F=190\n\
 44 GOSUB F+10\n\
-45 @(21602)=Y\n\
+45 @(10102)=Y\n\
 50 END\n\
 100 X=42\n\
 110 RETURN\n\
@@ -6186,10 +7516,10 @@ mod tests {
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 30000);
 
-        // 21600 = 0x5460, 21601 = 0x5461, 21602 = 0x5462
-        assert_eq!(pc1500.read_byte(0x5460), 2, "GOTO D (D=30) debe saltar a la línea 30, no ejecutar la 25");
-        assert_eq!(pc1500.read_byte(0x5461), 42, "GOSUB E (E=100) debe llamar a la línea 100 (X=42) y volver");
-        assert_eq!(pc1500.read_byte(0x5462), 77, "GOSUB F+10 (F=190 -> línea 200) debe llamar a la línea 200 (Y=77) y volver");
+        // 10100 = 0x2774, 10101 = 0x2775, 10102 = 0x2776
+        assert_eq!(pc1500.read_byte(0x2774), 2, "GOTO D (D=30) debe saltar a la línea 30, no ejecutar la 25");
+        assert_eq!(pc1500.read_byte(0x2775), 42, "GOSUB E (E=100) debe llamar a la línea 100 (X=42) y volver");
+        assert_eq!(pc1500.read_byte(0x2776), 77, "GOSUB F+10 (F=190 -> línea 200) debe llamar a la línea 200 (Y=77) y volver");
     }
 
     /// Un mismo `FOR` con DOS `NEXT` textuales en el código fuente,
@@ -6212,19 +7542,19 @@ mod tests {
 110 NEXT J\n\
 120 GOTO 500\n\
 200 NEXT J\n\
-500 @(21610)=A\n\
-510 @(21611)=B\n\
-520 @(21612)=J\n\
+500 @(10110)=A\n\
+510 @(10111)=B\n\
+520 @(10112)=J\n\
 530 END\n\
 ";
         let code = compile_native(source);
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        // 21610 = 0x546A, 21611 = 0x546B, 21612 = 0x546C
-        assert_eq!(pc1500.read_byte(0x546A), 2, "A debe incrementarse en J=1 y J=3 (el NEXT J de la línea 200)");
-        assert_eq!(pc1500.read_byte(0x546B), 1, "B debe incrementarse solo en J=2 (el NEXT J de la línea 110)");
-        assert_eq!(pc1500.read_byte(0x546C), 4, "J debe terminar en 4 (bucle 1..3 completo, ambos NEXT avanzan el mismo bucle)");
+        // 10110 = 0x277E, 10111 = 0x277F, 10112 = 0x2780
+        assert_eq!(pc1500.read_byte(0x277E), 2, "A debe incrementarse en J=1 y J=3 (el NEXT J de la línea 200)");
+        assert_eq!(pc1500.read_byte(0x277F), 1, "B debe incrementarse solo en J=2 (el NEXT J de la línea 110)");
+        assert_eq!(pc1500.read_byte(0x2780), 4, "J debe terminar en 4 (bucle 1..3 completo, ambos NEXT avanzan el mismo bucle)");
     }
 
     #[test]
@@ -6243,8 +7573,8 @@ mod tests {
     #[test]
     fn test_initialization() {
         let backend = Lh5801Backend::new();
-        assert_eq!(backend.start_address, 0x3800);
-        assert_eq!(backend.stack_top, 0x5FFF);
+        assert_eq!(backend.start_address, 0x0100);
+        assert_eq!(backend.stack_top, 0x47FF);
     }
 
     #[test]
@@ -6459,20 +7789,20 @@ mod tests {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
         let source = "\
-10 @(21700)=ASC CHR$ (65)\n\
+10 @(10200)=ASC CHR$ (65)\n\
 20 A=3:B=8\n\
-30 @(21701)=ABS (A-B)\n\
-40 @(21702)=ABS (B-A)\n\
-50 @(21703)=ABS (A-A)\n\
+30 @(10201)=ABS (A-B)\n\
+40 @(10202)=ABS (B-A)\n\
+50 @(10203)=ABS (A-A)\n\
 60 END\n\
 ";
         let code = compile_native(source);
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        assert_eq!(pc1500.read_byte(0x54C4), b'A', "CHR$(65) = \"A\"");
-        assert_eq!(pc1500.read_byte(0x54C5), 5, "ABS(3-8) = 5");
-        assert_eq!(pc1500.read_byte(0x54C6), 5, "ABS(8-3) = 5");
-        assert_eq!(pc1500.read_byte(0x54C7), 0, "ABS(3-3) = 0");
+        assert_eq!(pc1500.read_byte(0x27D8), b'A', "CHR$(65) = \"A\"");
+        assert_eq!(pc1500.read_byte(0x27D9), 5, "ABS(3-8) = 5");
+        assert_eq!(pc1500.read_byte(0x27DA), 5, "ABS(8-3) = 5");
+        assert_eq!(pc1500.read_byte(0x27DB), 0, "ABS(3-3) = 0");
     }
 
     /// `RANDOM` debe perturbar de verdad el estado del LFSR mock
@@ -6485,14 +7815,14 @@ mod tests {
     fn test_oracle_random_perturbs_shared_rnd_seed_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let without_random = compile_native("10 @(21700)=RND (200)\n20 END\n");
-        let with_random = compile_native("10 RANDOM\n20 @(21700)=RND (200)\n30 END\n");
+        let without_random = compile_native("10 @(10200)=RND (200)\n20 END\n");
+        let with_random = compile_native("10 RANDOM\n20 @(10200)=RND (200)\n30 END\n");
 
         let pc_without = run_lh5_until_exit(ORACLE_LOAD_ADDR, &without_random, ORACLE_STACK_TOP, 20000);
         let pc_with = run_lh5_until_exit(ORACLE_LOAD_ADDR, &with_random, ORACLE_STACK_TOP, 20000);
 
-        let value_without = pc_without.read_byte(0x54C4);
-        let value_with = pc_with.read_byte(0x54C4);
+        let value_without = pc_without.read_byte(0x27D8);
+        let value_with = pc_with.read_byte(0x27D8);
         assert_ne!(
             value_without, value_with,
             "RANDOM debería cambiar el resultado del siguiente RND() (sin: {value_without}, con: {value_with})"
@@ -6520,6 +7850,401 @@ mod tests {
         );
     }
 
+    /// Regresión directa del bug real de `bombing.bas`: `INPUT
+    /// "Explanations (Y/N) ? ";A$` deja `CURSOR_PTR` en una posición NO
+    /// nula (el final del prompt + lo que haya tecleado el usuario), y
+    /// la `PAUSE "Destroying large blocs..."` que sigue (línea 340,
+    /// llamada solo si responde "Y") heredaba esa posición sucia en vez
+    /// de empezar en la columna 0 — con el mensaje empezando cerca del
+    /// borde derecho, desbordaba a mitad de frase y se envolvía a la
+    /// columna 0, mostrando "troying..." con "Des" fuera de sitio en el
+    /// extremo derecho. Confirmado contra el desensamblado real de la
+    /// ROM: `BCMD_PAUSE_4` ($E6C1) hace `SJP (INIT_CURS)` como PRIMER
+    /// paso, antes de imprimir nada — `StackInstruction::Newline` ya
+    /// resetea el cursor DESPUÉS de imprimir (test de arriba), pero
+    /// nada lo hacía ANTES.
+    ///
+    /// Aquí se deja el cursor sucio a propósito (`CURSOR 20`, columna
+    /// 120) con un mensaje CORTO ("HI", 12 puntos) que cabe entero
+    /// tanto empezando en 0 como en 120 SIN desbordar — a propósito,
+    /// para no confundir "el mensaje se dibuja donde toca" con "el
+    /// mensaje se envuelve y por eso aparece algo de tinta cerca de la
+    /// columna 0 de todas formas" (un mensaje largo como el real de
+    /// bombing.bas SÍ se envuelve incluso sin el fix, así que parte de
+    /// él cae cerca de la columna 0 en ambos casos — se comprobó a
+    /// mano que ese primer diseño de test no distinguía nada). Con
+    /// "HI" la tinta debe caer EXACTAMENTE en la columna 120 sin el
+    /// fix, y EXACTAMENTE en la columna 0 con él — sin solape posible.
+    ///
+    /// Actualización: el bug real de bombing.bas deja `CURSOR_PTR` sucio
+    /// vía `INPUT` (que NO activa `CURSOR_ENA` bit0 — solo `CURSOR`/
+    /// `GCURSOR` reales lo hacen, confirmado contra `BCMD_CURSOR`/
+    /// `BCMD_GCURSOR`), no vía una sentencia `CURSOR` explícita. Este
+    /// test usaba `CURSOR 20` solo como atajo cómodo para ensuciar
+    /// `CURSOR_PTR` — pero `CURSOR` real TAMBIÉN activa ese bit, y con el
+    /// fix de invader-v2.bas (`ClsIfNoCursor`/`CLR_NO_CURSOR` reales, que
+    /// respetan un `CURSOR` recién ejecutado en vez de limpiar siempre)
+    /// eso cambia el escenario que se está probando. Se añade un
+    /// `POKE# 30836,0` (`CURSOR_ENA`=0x7874) justo después para simular
+    /// fielmente "la posición quedó sucia sin que nada la haya
+    /// posicionado a propósito justo antes" — el mismo estado que deja
+    /// `INPUT` de verdad.
+    #[test]
+    fn test_oracle_pause_resets_cursor_before_printing_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5, ORACLE_LOAD_ADDR};
+
+        // `PAUSE` no termina sola en un presupuesto corto de pasos (inicia
+        // una pausa real, `TIME_DELAY`, ver `test_oracle_pause_prints_then_delays_on_real_rom`
+        // más arriba) — pero imprimir ocurre ANTES de esa pausa, así que
+        // el texto ya está dibujado en pantalla mucho antes de agotar
+        // este presupuesto, sin necesidad de llegar a `END`/HALT.
+        let source = "10 CLS :CURSOR 20:POKE# 30836,0:PAUSE \"HI\"\n20 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 20_000);
+
+        let display = pc1500.display();
+        let buf = display.rgba_buffer();
+        let mut lit_cols = Vec::new();
+        for x in 0..ceres_core::display::DISPLAY_WIDTH {
+            let mut any = false;
+            for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                let idx = (y * ceres_core::display::DISPLAY_WIDTH + x) * 4;
+                if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                lit_cols.push(x);
+            }
+        }
+
+        let first_lit = *lit_cols.first().expect("PAUSE debería haber dibujado algo");
+        assert!(
+            first_lit < 12,
+            "la tinta de \"HI\" debería empezar dentro de las 2 primeras celdas de carácter (columna < 12, \
+             cursor reseteado a 0 por INIT_CURS antes de imprimir), pero la primera columna con tinta fue \
+             la {first_lit} — indica que el mensaje sigue heredando la posición sucia de CURSOR 20 (columna \
+             120) en vez de empezar en 0: columnas encendidas = {lit_cols:?}"
+        );
+    }
+
+    /// Segundo bug real de `bombing.bas` de la misma familia, encontrado
+    /// por el usuario jugando la versión ya corregida (`InitCursor`
+    /// arreglaba SOLO la posición, no bastaba): entre los sucesivos
+    /// `PAUSE "..."` de la secuencia de explicaciones (líneas 340-380),
+    /// quedaban restos visuales del mensaje ANTERIOR en las columnas que
+    /// el mensaje nuevo (más corto) no llegaba a tocar — sobre todo en
+    /// el extremo derecho. Confirmado contra el desensamblado real:
+    /// `BCMD_PAUSE` alcanza `CLR_NO_CURSOR` ($EC9C) tras forzar
+    /// `CURSOR_ENA` bit0 a 0, y esa rutina llama a `LCD_CLR` (vector
+    /// `$F2`) cuando ese bit está a 0 — PAUSE limpia la pantalla
+    /// ENTERA, no solo el cursor. Aquí se dibuja algo en el extremo
+    /// derecho ANTES del `PAUSE` (`GCURSOR 150:GPRINT 255`, una columna
+    /// sólida) y se comprueba que un `PAUSE "HI"` posterior (que ni
+    /// siquiera se acerca a esa zona) la borra igualmente.
+    ///
+    /// Actualización: `GCURSOR` real activa `CURSOR_ENA` bit0 igual que
+    /// `CURSOR` (mismo mecanismo, `BCMD_GCURSOR` reutiliza la cola de
+    /// `BCMD_CURSOR_2`) — con `ClsIfNoCursor`/`CLR_NO_CURSOR` reales eso
+    /// haría que el `PAUSE` de después NO limpiase, cambiando lo que este
+    /// test comprueba. Se fuerza `CURSOR_ENA`=0 (`POKE# 30836,0`) tras el
+    /// `GCURSOR`/`GPRINT` para simular "algo se dibujó antes, pero nada
+    /// posicionó el cursor justo antes del PAUSE" — el escenario real de
+    /// bombing.bas.
+    #[test]
+    fn test_oracle_pause_clears_whole_screen_not_just_cursor_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5, ORACLE_LOAD_ADDR};
+
+        let source = "10 CLS :GCURSOR 150:GPRINT 255:POKE# 30836,0\n20 PAUSE \"HI\"\n30 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 20_000);
+
+        let display = pc1500.display();
+        let buf = display.rgba_buffer();
+        let mut lit_cols = Vec::new();
+        for x in 0..ceres_core::display::DISPLAY_WIDTH {
+            let mut any = false;
+            for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                let idx = (y * ceres_core::display::DISPLAY_WIDTH + x) * 4;
+                if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                lit_cols.push(x);
+            }
+        }
+
+        assert!(
+            !lit_cols.iter().any(|&c| c >= 100),
+            "no debería quedar ninguna columna encendida por encima de 100 (la marca dejada por \
+             GCURSOR 150:GPRINT 255 antes del PAUSE) — PAUSE debería haber limpiado toda la pantalla \
+             antes de imprimir \"HI\": columnas encendidas = {lit_cols:?}"
+        );
+    }
+
+    /// Regresión directa del bug real de `bombing.bas` reportado por el
+    /// usuario con una captura de la pantalla final del juego:
+    /// `"*** SCORE *** :5T"` con restos de la ciudad y del marcador
+    /// antiguo visibles en el extremo derecho. Confirmado con el
+    /// oráculo que `SystemOutInt`/la secuencia de impresión de la
+    /// propia línea NO tiene ningún bug (aislado con `CLS` antes: sale
+    /// perfecto) — el problema es que `bombing.bas` no llama a `CLS` en
+    /// ningún punto entre el choque y esta pantalla final, así que
+    /// quedan visibles restos de dibujos anteriores. Confirmado con una
+    /// captura real del propio usuario contra el programa ORIGINAL
+    /// tokenizado que la pantalla final del original SÍ aparece sobre
+    /// fondo limpio — y con el desensamblado que `BCMD_PRINT` comparte
+    /// literalmente la misma rutina de bajo nivel que `BCMD_PAUSE`
+    /// (`JMP BCMD_PAUSE_2` en su rama de salida a display), así que un
+    /// `PRINT` normal (sin `USING` activo) también limpia la pantalla
+    /// entera antes de escribir. Mismo patrón de test que el de PAUSE
+    /// de arriba: dibuja una marca en el extremo derecho, comprueba que
+    /// un `PRINT` posterior (que ni se acerca a esa zona) la borra.
+    ///
+    /// Actualización: mismo ajuste que en el test de PAUSE de arriba —
+    /// `GCURSOR` activa `CURSOR_ENA` bit0, así que se fuerza a 0 con
+    /// `POKE# 30836,0` antes del `PRINT` para no confundirlo con un
+    /// `CURSOR`/`GCURSOR` recién ejecutado (que `ClsIfNoCursor` sí debe
+    /// respetar, ver invader-v2.bas).
+    #[test]
+    fn test_oracle_print_clears_whole_screen_like_pause_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5, ORACLE_LOAD_ADDR};
+
+        let source = "10 CLS :GCURSOR 150:GPRINT 255:POKE# 30836,0\n20 PRINT \"HI\"\n30 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 20_000);
+
+        let display = pc1500.display();
+        let buf = display.rgba_buffer();
+        let mut lit_cols = Vec::new();
+        for x in 0..ceres_core::display::DISPLAY_WIDTH {
+            let mut any = false;
+            for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                let idx = (y * ceres_core::display::DISPLAY_WIDTH + x) * 4;
+                if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                lit_cols.push(x);
+            }
+        }
+
+        assert!(
+            !lit_cols.iter().any(|&c| c >= 100),
+            "no debería quedar ninguna columna encendida por encima de 100 (la marca dejada por \
+             GCURSOR 150:GPRINT 255 antes del PRINT) — PRINT debería haber limpiado toda la pantalla \
+             antes de imprimir \"HI\": columnas encendidas = {lit_cols:?}"
+        );
+    }
+
+    /// Regresión de que `PRINT USING` (a diferencia de `PRINT` normal)
+    /// NO debe limpiar la pantalla — confirmado por el propio
+    /// comportamiento observado del juego real: el marcador de
+    /// `bombing.bas` (`CURSOR 22:PRINT USING "####";W`) se actualiza
+    /// repetidas veces DURANTE la partida y permanece visible sobre el
+    /// resto de la pantalla (ciudad, avión) en todo momento — si
+    /// limpiase la pantalla en cada acierto, borraría el juego entero.
+    #[test]
+    fn test_oracle_print_using_does_not_clear_screen_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5, ORACLE_LOAD_ADDR};
+
+        let source = "10 CLS :GCURSOR 20:GPRINT 255\n20 CURSOR 15:PRINT USING \"####\";42\n30 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 20_000);
+
+        let display = pc1500.display();
+        let buf = display.rgba_buffer();
+        let mut lit_cols = Vec::new();
+        for x in 0..ceres_core::display::DISPLAY_WIDTH {
+            let mut any = false;
+            for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                let idx = (y * ceres_core::display::DISPLAY_WIDTH + x) * 4;
+                if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                lit_cols.push(x);
+            }
+        }
+
+        assert!(
+            lit_cols.contains(&20),
+            "la marca dejada por GCURSOR 20:GPRINT 255 (columna 20 exacta, GCURSOR no multiplica por 6) \
+             debería seguir visible tras el PRINT USING — PRINT USING no comparte la rutina de \
+             PRINT/PAUSE que limpia pantalla en la ROM real, así que no debe borrar nada: \
+             columnas encendidas = {lit_cols:?}"
+        );
+    }
+
+    /// Regresión directa del bug real de `bombing.bas` reportado por el
+    /// usuario y reproducido/confirmado por él mismo jugando varias
+    /// partidas: cualquier puntuación de 2 CIFRAS se mostraba con el
+    /// dígito de las unidades sustituido siempre por 'T' (`12` → `1T`,
+    /// `54` → `5T`...) — nunca con puntuaciones de 1 cifra. Causa raíz
+    /// (confirmada leyendo `rom_routines.rs`, no adivinada): `CHAR_OUT`
+    /// no tiene ningún registro preservado documentado
+    /// (`preserved: "Ninguno documentado"`) y usa `X` internamente para
+    /// traducir `CURSOR_PTR` a una dirección de pantalla — así que
+    /// `SystemOutInt` imprimiendo el dígito de las decenas (que llama a
+    /// `CHAR_OUT`) ANTES de leer `XL` (unidades, calculado por
+    /// `emit_extract_hundreds_tens_units`) corrompía `XL` antes de
+    /// poder leerlo: `LDA XL` para las unidades leía lo que `CHAR_OUT`
+    /// hubiera dejado ahí como efecto colateral, SIEMPRE el mismo byte
+    /// (0x54 = 'T') sin importar el dígito real — confirmado probando
+    /// 10 valores de 2 cifras distintos con el oráculo, todos con el
+    /// mismo patrón de píxeles corrupto en la posición de unidades.
+    /// Arreglado guardando las unidades ya convertidas a ASCII en
+    /// memoria (`ARX`, libre — `SystemOutInt` imprime enteros, nunca
+    /// corre a la vez que aritmética real) ANTES de imprimir cualquier
+    /// otro dígito.
+    ///
+    /// Verificación por FORMA de glifo, no solo por columnas con tinta
+    /// (una "4" y una "T" ocupan las mismas columnas): compara el
+    /// patrón de 7 bits por columna del dígito de unidades de un número
+    /// de 2 cifras contra el mismo dígito impreso SOLO (referencia
+    /// conocida), deben ser bit a bit idénticos.
+    #[test]
+    fn test_oracle_multi_digit_print_units_digit_matches_single_digit_reference_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        fn char_out_glyph_pattern(source: &str, col_start: u16) -> Vec<u8> {
+            let code = compile_native(source);
+            let mut pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+            let display = pc1500.display();
+            let buf = display.rgba_buffer();
+            (col_start..col_start + 6)
+                .map(|x| {
+                    let mut bits = 0u8;
+                    for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                        let idx = (y * ceres_core::display::DISPLAY_WIDTH + x as usize) * 4;
+                        if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                            bits |= 1 << y;
+                        }
+                    }
+                    bits
+                })
+                .collect()
+        }
+
+        // Referencia: "4" solo (dígito único, columnas 90-95 tras los
+        // 15 caracteres fijos de cabecera).
+        let reference_4 = char_out_glyph_pattern(
+            "10 W=4\n20 CLS :USING :PRINT \"*** SCORE *** :\";W\n30 END\n",
+            90,
+        );
+        // Caso real reportado: W=54 → unidades en columnas 96-101.
+        let units_of_54 = char_out_glyph_pattern(
+            "10 W=54\n20 CLS :USING :PRINT \"*** SCORE *** :\";W\n30 END\n",
+            96,
+        );
+        assert_eq!(
+            units_of_54, reference_4,
+            "el dígito de unidades de \"54\" debería ser una '4' idéntica a la de referencia (impresa \
+             sola) — si no coincide, CHAR_OUT ha vuelto a corromper XL antes de imprimir las unidades"
+        );
+
+        // Caso de 3 cifras (mismo bug, mismo arreglo): W=124 (SystemOutInt
+        // imprime con signo, bit7 aparte — 124 es el mayor valor de 3
+        // cifras que sigue siendo positivo) → columnas 90-95='1',
+        // 96-101='2', 102-107='4' (unidades).
+        let units_of_124 = char_out_glyph_pattern(
+            "10 W=124\n20 CLS :USING :PRINT \"*** SCORE *** :\";W\n30 END\n",
+            102,
+        );
+        assert_eq!(
+            units_of_124, reference_4,
+            "el dígito de unidades de \"124\" (3 cifras) también debería ser una '4' idéntica a la de \
+             referencia — el mismo bug afecta a la rama de 3 dígitos (centenas Y decenas se imprimen \
+             antes de leer XL)"
+        );
+    }
+
+    /// Regresión directa del bug real de `bombing.bas` reportado por
+    /// el usuario y CONTRASTADO EN VIVO contra la calculadora/ROM
+    /// original (capturas de pantalla del programa tokenizado real): el
+    /// mensaje de la línea 380 (`PAUSE "SPACE : drop bomb (1/time)."`,
+    /// 27 caracteres = 162 puntos, 1 más que los 156 reales de la
+    /// pantalla) se ve completo en el original ("SPACE : drop bomb
+    /// (1/time)", 26 caracteres — el punto final simplemente no
+    /// aparece), sin que la "S" inicial se corrompa.
+    ///
+    /// Causa raíz, encontrada trazando la ejecución real instrucción a
+    /// instrucción (no adivinada): un primer intento de arreglo
+    /// (comprobar `CURSOR_PTR` ANTES de cada `CHAR_OUT` y saltarse el
+    /// carácter si no cabe, asumiendo que el carácter 27 desbordaba) no
+    /// cambió nada — porque el desbordamiento real lo dispara el
+    /// carácter 26 (que SÍ cabe entero, columnas 150-155): `CURSOR_PTR`
+    /// avanza limpio 0,6,...,150 y LUEGO salta directamente a 0 en vez
+    /// de a 156 — la propia rutina `CHAR_OUT` de la ROM, tras dibujar
+    /// el carácter 26 con normalidad, detecta que el SIGUIENTE avance
+    /// (150+6=156) se saldría de rango y resetea `CURSOR_PTR` a 0 como
+    /// efecto colateral de ESE dibujo. El carácter 27 (el punto final)
+    /// se dibuja entonces con total normalidad en la posición YA
+    /// RESETEADA (columna 0), pisando la "S". El intérprete real de
+    /// `PRINT`/`PAUSE`, a diferencia de nuestro bucle
+    /// character-por-character con `CHAR_OUT` directo, evidentemente
+    /// DETECTA este reseteo y CORTA ahí el resto de la cadena en vez de
+    /// seguir imprimiendo desde la posición reseteada.
+    ///
+    /// Arreglado sin reproducir el camino completo del intérprete real
+    /// (probablemente vía `OUT_BUF` con su propio recorte de ancho):
+    /// `SystemOutString` ahora compara `CURSOR_PTR` antes y después de
+    /// cada `CHAR_OUT` — si el valor bajó en vez de avanzar (señal
+    /// inequívoca de que la ROM acaba de resetearlo por desbordamiento),
+    /// corta el bucle ahí mismo en vez de continuar dibujando desde la
+    /// columna 0 recién reseteada.
+    #[test]
+    fn test_oracle_pause_message_exceeding_display_width_truncates_instead_of_wrapping_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5, ORACLE_LOAD_ADDR};
+
+        let message = "SPACE : drop bomb (1/time).";
+        assert_eq!(message.len(), 27, "el mensaje real de bombing.bas debe seguir midiendo 27 caracteres");
+
+        let source = format!("10 CLS :PAUSE \"{message}\"\n20 END\n");
+        let code = compile_native(&source);
+        let mut pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 40_000);
+
+        let glyph_at = |pc1500: &mut ceres_core::Pc1500, col_start: u16| -> Vec<u8> {
+            let display = pc1500.display();
+            let buf = display.rgba_buffer();
+            (col_start..col_start + 6)
+                .map(|x| {
+                    let mut bits = 0u8;
+                    for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                        let idx = (y * ceres_core::display::DISPLAY_WIDTH + x as usize) * 4;
+                        if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                            bits |= 1 << y;
+                        }
+                    }
+                    bits
+                })
+                .collect()
+        };
+
+        // La "S" inicial (columnas 0-5) debe seguir siendo una "S"
+        // real, idéntica a la de referencia (impresa sola) — no un ".".
+        let s_glyph = glyph_at(&mut pc1500, 0);
+        let ref_code = compile_native("10 CLS :PRINT \"S\";\n20 END\n");
+        let mut ref_pc1500 = run_lh5(ORACLE_LOAD_ADDR, &ref_code, 40_000);
+        let reference_s = glyph_at(&mut ref_pc1500, 0);
+        assert_eq!(
+            s_glyph, reference_s,
+            "la 'S' inicial del mensaje no debería corromperse — si esto falla, el corte por \
+             desbordamiento ha dejado de funcionar y el punto final vuelve a envolverse a la columna 0"
+        );
+
+        // CURSOR_PTR final: tras el corte, la Newline automática de
+        // PAUSE debe seguir reseteándolo a 0 con normalidad.
+        assert_eq!(pc1500.read_byte(0x7875), 0, "CURSOR_PTR debe volver a 0 tras el salto de línea automático de PAUSE");
+    }
+
     /// `ON ERROR GOTO`: antes de esta corrección, el target evaluado en
     /// tiempo de ejecución se descartaba sin usar (fuga de pila) y se
     /// emitía una etiqueta fija ("ERROR_HANDLER") que nunca se definía en
@@ -6533,11 +8258,11 @@ mod tests {
     fn test_oracle_on_error_goto_compiles_and_continues_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
 
-        let source = "10 ON ERROR GOTO 999\n20 @(21700)=42\n30 END\n999 @(21700)=99\n1000 END\n";
+        let source = "10 ON ERROR GOTO 999\n20 @(10200)=42\n30 END\n999 @(10200)=99\n1000 END\n";
         let code = compile_native(source);
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
 
-        assert_eq!(pc1500.read_byte(0x54C4), 42, "sin detección de errores real, el flujo normal (línea 20) debe ejecutarse, no el handler (línea 999)");
+        assert_eq!(pc1500.read_byte(0x27D8), 42, "sin detección de errores real, el flujo normal (línea 20) debe ejecutarse, no el handler (línea 999)");
     }
 
     /// `INPUT`: simula pulsaciones reales de teclado (`Pc1500::press`/
@@ -6576,12 +8301,59 @@ mod tests {
     ///   mismo (`GOTO <su propia línea>`) en vez de `END` — así no hay
     ///   ningún `RTN` sin llamador que temer y sobra hacer stepping fino
     ///   con guardas de salida.
+    /// Medición de referencia para el análisis de velocidad
+    /// nativo-vs-interpretado (ver memoria de sesión): mismo programa
+    /// lógico mínimo (`A=0:FOR I=1 TO 50:A=A+1:NEXT I:POKE# 30200,1:END`)
+    /// compilado a código máquina, midiendo ciclos REALES de CPU
+    /// (`get_ticks()`, calibrados a 1.3MHz real en este emulador —
+    /// `add_state()` en cada instrucción de `ceres-core` refleja el
+    /// coste ciclo a ciclo real del LH5801, no un número inventado).
+    /// Sin necesidad de teclado: el código nativo arranca directo en
+    /// `ORACLE_LOAD_ADDR`, sin pasar por el arranque interactivo de la
+    /// ROM (que si hace falta para medir el lado INTERPRETADO del mismo
+    /// programa — intentado vía teclado simulado, pero la ROM real no
+    /// llega nunca a un estado estable de "esperando comando" con
+    /// `press`/`release`+`step_frame()` por sí solo: se queda dando
+    /// vueltas en la zona $E2AA sin registrar ninguna tecla, ni con
+    /// `Key::On` primero — la medición cuantitativa del lado
+    /// interpretado se obtuvo en su lugar contando ciclos reales de
+    /// despacho (`vector()` en `lh5801.rs`: 17 ciclos por cada llamada
+    /// vectorizada VEJ/VMJ) directamente sobre el desensamblado de
+    /// `BASIC_INT`/`BCMD_LET`/`BCMD_FOR`/`BCMD_NEXT`/`VAR_ON_BSTK`).
+    #[test]
+    fn test_oracle_native_reference_loop_tick_count_for_speed_analysis() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
+
+        let source = "10 A=0\n20 FOR I=1 TO 50\n30 A=A+1\n40 NEXT I\n50 POKE# 30200,1\n60 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        let ticks_before = pc1500.cpu().get_ticks();
+        let mut steps = 0u32;
+        while !pc1500.cpu().is_halted() && steps < 100_000 {
+            pc1500.step_cpu();
+            steps += 1;
+        }
+        let ticks_after = pc1500.cpu().get_ticks();
+
+        assert_eq!(pc1500.read_byte(30200), 1, "el programa nativo debe completar y escribir la señal de fin");
+        // Cifra de referencia documentada (medida 2026-09-07): ~54 855
+        // ticks — no se fija como valor exacto (cualquier cambio futuro
+        // del backend puede moverlo un poco), solo se acota un rango
+        // amplio para detectar una regresión de rendimiento grande.
+        let ticks = ticks_after - ticks_before;
+        assert!(
+            (10_000..150_000).contains(&ticks),
+            "ticks fuera del rango esperado para este bucle de referencia: {ticks} (referencia original: ~54 855)"
+        );
+    }
+
     #[test]
     fn test_oracle_input_numeric_and_string_via_simulated_keypresses_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
         use ceres_core::Key;
 
-        let source = "10 INPUT A\n20 INPUT B$\n30 @(21700)=A\n40 @(21701)=ASC B$\n50 GOTO 50\n";
+        let source = "10 INPUT A\n20 INPUT B$\n30 @(10200)=A\n40 @(10201)=ASC B$\n50 GOTO 50\n";
         let code = compile_native(source);
         let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
 
@@ -6608,8 +8380,8 @@ mod tests {
         // infinito sobre sí misma, a propósito — ver nota de arriba).
         pc1500.step_frame();
 
-        assert_eq!(pc1500.read_byte(0x54C4), 5, "INPUT A tras teclear \"5\"+ENTER");
-        assert_eq!(pc1500.read_byte(0x54C5), b'O', "INPUT B$ tras teclear \"O\"+ENTER");
+        assert_eq!(pc1500.read_byte(0x27D8), 5, "INPUT A tras teclear \"5\"+ENTER");
+        assert_eq!(pc1500.read_byte(0x27D9), b'O', "INPUT B$ tras teclear \"O\"+ENTER");
     }
 
     /// `INKEY$`: a diferencia de `INPUT`, es un sondeo NO bloqueante y
@@ -6625,7 +8397,7 @@ mod tests {
         use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
         use ceres_core::Key;
 
-        let source = "10 @(21700)=LEN (INKEY$)\n20 GOTO 10\n";
+        let source = "10 @(10200)=LEN (INKEY$)\n20 GOTO 10\n";
         let code = compile_native(source);
         let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
 
@@ -6633,7 +8405,7 @@ mod tests {
         for _ in 0..3 {
             pc1500.step_frame();
         }
-        assert_eq!(pc1500.read_byte(0x54C4), 0, "INKEY$ sin tecla pulsada debe ser \"\" (longitud 0)");
+        assert_eq!(pc1500.read_byte(0x27D8), 0, "INKEY$ sin tecla pulsada debe ser \"\" (longitud 0)");
         assert_eq!(pc1500.read_byte(0x7875), 0, "CURSOR_PTR no debe moverse: INKEY$ no hace eco");
 
         // Con una tecla mantenida pulsada: longitud 1, y sigue sin eco.
@@ -6641,7 +8413,7 @@ mod tests {
         for _ in 0..3 {
             pc1500.step_frame();
         }
-        assert_eq!(pc1500.read_byte(0x54C4), 1, "INKEY$ con una tecla pulsada debe tener longitud 1");
+        assert_eq!(pc1500.read_byte(0x27D8), 1, "INKEY$ con una tecla pulsada debe tener longitud 1");
         assert_eq!(pc1500.read_byte(0x7875), 0, "CURSOR_PTR sigue sin moverse con una tecla pulsada: INKEY$ no hace eco");
         pc1500.release(Key::Five);
     }
@@ -6653,7 +8425,7 @@ mod tests {
         use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
         use ceres_core::Key;
 
-        let source = "10 @(21700)=ASC (INKEY$)\n20 GOTO 10\n";
+        let source = "10 @(10200)=ASC (INKEY$)\n20 GOTO 10\n";
         let code = compile_native(source);
         let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
 
@@ -6661,7 +8433,7 @@ mod tests {
         for _ in 0..3 {
             pc1500.step_frame();
         }
-        assert_eq!(pc1500.read_byte(0x54C4), b'5', "ASC(INKEY$) con \"5\" pulsada debe ser el código ASCII de '5'");
+        assert_eq!(pc1500.read_byte(0x27D8), b'5', "ASC(INKEY$) con \"5\" pulsada debe ser el código ASCII de '5'");
         pc1500.release(Key::Five);
     }
 
@@ -6758,7 +8530,7 @@ mod tests {
             );
             let pc = pc1500.cpu().p();
             assert!(
-                (0x3800..=0x5FFF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
+                (0x0100..=0x47FF).contains(&pc) || (0xC000..=0xFFFF).contains(&pc),
                 "frame {frame}: PC salió a memoria inválida: {pc:#06X}"
             );
         }
@@ -6814,10 +8586,37 @@ mod tests {
     /// eso se comprueba `P > 0` en vez de un valor exacto — sigue
     /// verificando "el bucle de juego ha arrancado de verdad", sin
     /// depender de en qué ciclo preciso cae ese frame.
+    ///
+    /// Los dos tramos de espera (dibujo de la cueva → arranque del bucle
+    /// de juego) se hacen con un bucle "hasta que se cumpla la
+    /// condición", no con un nº de `step_frame()` fijado a mano: el nº
+    /// exacto de frames que tarda cada fase depende de cuántos ciclos de
+    /// CPU consume el código generado, y por tanto cambia con cada
+    /// optimización de tamaño/velocidad (ya ha ocurrido dos veces en esta
+    /// sesión — antes al desenrollar `GPrintString`, después al añadir el
+    /// suelo mínimo de `WAIT_MIN_TICKS`). Un límite de seguridad
+    /// (`MAX_FRAMES`) sigue detectando una regresión real (el bucle que
+    /// nunca arranca) sin exigir recalibrar números mágicos cada vez.
     #[test]
     fn test_oracle_bathyscaph_end_to_end_gameplay_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native_with_addresses, load, ORACLE_LOAD_ADDR};
-        use ceres_core::Key;
+        use ceres_core::{Key, Pc1500};
+
+        const MAX_FRAMES: u32 = 80;
+
+        // Avanza `pc1500` frame a frame hasta que `condition` se cumpla,
+        // deteniéndose en el PRIMER frame en que se cumple (sin margen
+        // extra) — el resto del test depende de partir de ese instante
+        // exacto (p. ej. "2 frames tras arrancar, P sigue <10").
+        fn wait_until(pc1500: &mut Pc1500, max_frames: u32, what: &str, mut condition: impl FnMut(&mut Pc1500) -> bool) {
+            for frame in 0..=max_frames {
+                if condition(pc1500) {
+                    return;
+                }
+                assert!(frame < max_frames, "{what} no ocurrió en {max_frames} frames (posible regresión de timing)");
+                pc1500.step_frame();
+            }
+        }
 
         let source = std::fs::read_to_string("test/basic/bathyscaph.bas")
             .expect("no se pudo leer test/basic/bathyscaph.bas");
@@ -6827,23 +8626,16 @@ mod tests {
 
         // --- Fase de dibujo de la cueva, sin ninguna tecla pulsada ---
         let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
-        for _ in 0..11 {
-            pc1500.step_frame();
-        }
+        wait_until(&mut pc1500, MAX_FRAMES, "la cueva no terminó de dibujarse", |pc| {
+            (0x7600..0x7600 + 160).filter(|&a| pc.read_byte(a) != 0).count() > 100
+        });
 
-        let touched_bytes = (0x7600..0x7600 + 160).filter(|&a| pc1500.read_byte(a) != 0).count();
-        assert!(
-            touched_bytes > 100,
-            "la cueva (14 segmentos DATA vía RESTORE+READ+GPRINT) debe haber tocado bien más de 100 bytes del buffer de pantalla, tocó {touched_bytes}"
-        );
-
-        // Unos pocos frames más: el bucle de juego arranca (P>0) y H se
-        // inicializa a 3. Ver el comentario de la función sobre por qué
-        // `P` se comprueba como `>0`, no un valor exacto.
-        for _ in 0..3 {
-            pc1500.step_frame();
-        }
-        assert!(pc1500.read_byte(p_addr) > 0, "el bucle de juego debe haber arrancado (P>0)");
+        // El bucle de juego arranca (P>0) y H se inicializa a 3. Ver el
+        // comentario de la función sobre por qué `P` se comprueba como
+        // `>0`, no un valor exacto.
+        wait_until(&mut pc1500, MAX_FRAMES, "el bucle de juego no arrancó (P>0)", |pc| {
+            pc.read_byte(p_addr) > 0
+        });
         assert_eq!(pc1500.read_byte(h_addr), 3, "H debe estar inicializada a 3 (línea 41: TIME=0,H=3,G=8)");
 
         // --- Control real del jugador: Up debe BAJAR H ---
@@ -6860,9 +8652,9 @@ mod tests {
 
         // --- Control real del jugador: Down debe SUBIR H (partida limpia) ---
         let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
-        for _ in 0..12 {
-            pc1500.step_frame();
-        }
+        wait_until(&mut pc1500, MAX_FRAMES, "el bucle de juego no arrancó (P>0)", |pc| {
+            pc.read_byte(p_addr) > 0
+        });
         pc1500.press(Key::Down);
         pc1500.step_frame();
         pc1500.step_frame();
@@ -6895,7 +8687,12 @@ mod tests {
 
         let source = "10 FOR I=0TO 30:POKE# 64000,RND 256-1:NEXT I\n20 GOTO 20\n";
         let code = compile_native(source);
-        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 3000);
+        // RND(n) ya no es un LFSR casi instantáneo: llama a la rutina
+        // BCD real de la ROM (`RAND_GEN_3`, ver `StackInstruction::CallRnd`),
+        // varios órdenes de magnitud más cara — el presupuesto de 3000
+        // instrucciones de cuando esto era un mock ni siquiera basta
+        // para completar una sola de las 31 llamadas.
+        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 3_000_000);
 
         assert_eq!(
             pc1500.cpu().s(), ORACLE_STACK_TOP,
@@ -7179,6 +8976,59 @@ mod tests {
         s
     }
 
+    /// Regresión directa del bug "el avión choca contra el score" en
+    /// `bombing.bas` (línea 260: `CURSOR 22:PRINT USING "####";W`).
+    /// `PRINT USING "####"` sin especificador de signo (`+`) explícito NO
+    /// reserva columna de signo en la ROM real — confirmado tokenizando
+    /// el original con `lhasm`, cargándolo en `ceres-core` exactamente
+    /// como `bathyscaph.bin`, saltando a `BCMD_RUN` ($C8B4) y comparando
+    /// las columnas de píxel encendidas contra esta misma sentencia
+    /// compilada. Antes de este fix, este backend reservaba SIEMPRE una
+    /// columna de signo (' ' para positivos), desplazando el score 6
+    /// puntos de más hacia la derecha — al partir de `CURSOR 22` (columna
+    /// 132) con 5 caracteres en vez de 4, el último dígito caía en la
+    /// columna 156 (fuera de rango, máximo 155), y `CHAR_OUT`/`INIT_MTRX`
+    /// reiniciaba el cursor a la columna 0, dibujando ese dígito encima
+    /// de la trayectoria del avión.
+    #[test]
+    fn test_oracle_using_no_sign_matches_original_interpreted_columns_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let source = "10 CLS :CURSOR 22:PRINT USING \"####\";99\n20 END\n";
+        let (code, _addrs) = compile_native_with_addresses(source);
+        let mut pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
+        assert!(pc1500.cpu().is_halted());
+
+        let display = pc1500.display();
+        let buf = display.rgba_buffer();
+        let mut lit_cols = Vec::new();
+        for x in 0..ceres_core::display::DISPLAY_WIDTH {
+            let mut any = false;
+            for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                let idx = (y * ceres_core::display::DISPLAY_WIDTH + x) * 4;
+                if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                lit_cols.push(x);
+            }
+        }
+
+        // Columnas obtenidas del programa ORIGINAL tokenizado (lhasm),
+        // ejecutado vía BCMD_RUN en ceres-core, para la sentencia
+        // idéntica `CURSOR 22:PRINT USING "####";99` — ver el comentario
+        // de esta función. Ningún desbordamiento a la columna 0.
+        let expected_original_columns = vec![144, 145, 146, 147, 148, 150, 151, 152, 153, 154];
+        assert_eq!(
+            lit_cols, expected_original_columns,
+            "las columnas encendidas por el código nativo deben coincidir EXACTAMENTE con las del programa \
+             original interpretado (si aparecen columnas bajas como 0-4, el score se está desbordando hacia \
+             la izquierda otra vez)"
+        );
+    }
+
     /// Regresión directa de `PRINT USING`: antes, `PRINT USING
     /// <patrón>;valor` era un TODO que no generaba ningún código (ni
     /// siquiera consumía el valor de la pila), y `USING` suelta emitía
@@ -7203,7 +9053,7 @@ mod tests {
             let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
             assert!(pc1500.cpu().is_halted(), "\"####\": debe llegar a END/HALT limpiamente");
             assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "\"####\": S debe volver a stack_top");
-            let buf = *addrs.get("__USING_BUF").expect("__USING_BUF") as u32;
+            let buf = *addrs.get("ARRAY:__USING_BUF").expect("__USING_BUF") as u32;
             assert_eq!(read_cstr(&pc1500, buf, 10), "   42", "PRINT USING \"####\";42 incorrecto");
         }
 
@@ -7215,7 +9065,7 @@ mod tests {
             let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
             assert!(pc1500.cpu().is_halted(), "\"*+###\": debe llegar a END/HALT limpiamente");
             assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "\"*+###\": S debe volver a stack_top");
-            let buf = *addrs.get("__USING_BUF").expect("__USING_BUF") as u32;
+            let buf = *addrs.get("ARRAY:__USING_BUF").expect("__USING_BUF") as u32;
             assert_eq!(read_cstr(&pc1500, buf, 10), "+**7", "PRINT USING \"*+###\";7 incorrecto");
         }
 
@@ -7226,7 +9076,7 @@ mod tests {
             let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
             assert!(pc1500.cpu().is_halted(), "\"##.##\": debe llegar a END/HALT limpiamente");
             assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "\"##.##\": S debe volver a stack_top");
-            let buf = *addrs.get("__USING_BUF").expect("__USING_BUF") as u32;
+            let buf = *addrs.get("ARRAY:__USING_BUF").expect("__USING_BUF") as u32;
             assert_eq!(read_cstr(&pc1500, buf, 10), " 12.50", "PRINT USING \"##.##\";12.5 incorrecto");
         }
     }
@@ -7256,7 +9106,7 @@ mod tests {
             pc1500.cpu().s()
         );
 
-        let buf = *addrs.get("__PRINT_REAL_BUF").expect("__PRINT_REAL_BUF") as u32;
+        let buf = *addrs.get("ARRAY:__PRINT_REAL_BUF").expect("__PRINT_REAL_BUF") as u32;
         assert_eq!(
             read_cstr(&pc1500, buf, 15), "       2.500000",
             "el buffer sin recortar (ancho fijo 7+6) debe contener el valor exacto antes de recortar"
@@ -7282,7 +9132,7 @@ mod tests {
         use crate::codegen::test_oracle::{compile_native_with_addresses, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
         let source = "10 A=5:B=NOT A:C=NOT 0\n20 END\n";
         let (code, addrs) = compile_native_with_addresses(source);
-        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5000);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 11000);
         assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
         assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top");
         let b = *addrs.get("B").expect("B") as u32;
@@ -7309,12 +9159,12 @@ mod tests {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
         let source = "\
 10 A=16:B=SQR A\n\
-20 IF B=4 THEN @(21700)=1\n\
+20 IF B=4 THEN @(10200)=1\n\
 30 C=SQR 2\n\
-40 IF C>1.41 THEN @(21701)=1\n\
-50 IF C<1.42 THEN @(21702)=1\n\
+40 IF C>1.41 THEN @(10201)=1\n\
+50 IF C<1.42 THEN @(10202)=1\n\
 60 D=SQR 0\n\
-70 IF D=0 THEN @(21703)=1\n\
+70 IF D=0 THEN @(10203)=1\n\
 80 END\n\
 ";
         let code = compile_native(source);
@@ -7325,10 +9175,10 @@ mod tests {
             "S debe volver a stack_top tras 3 llamadas a SQR: S={:#06X}",
             pc1500.cpu().s()
         );
-        assert_eq!(pc1500.read_byte(21700), 1, "SQR(16) debe ser exactamente 4");
-        assert_eq!(pc1500.read_byte(21701), 1, "SQR(2) debe ser mayor que 1.41");
-        assert_eq!(pc1500.read_byte(21702), 1, "SQR(2) debe ser menor que 1.42");
-        assert_eq!(pc1500.read_byte(21703), 1, "SQR(0) debe ser exactamente 0 (caso especial en gen_sqr_routine)");
+        assert_eq!(pc1500.read_byte(10200), 1, "SQR(16) debe ser exactamente 4");
+        assert_eq!(pc1500.read_byte(10201), 1, "SQR(2) debe ser mayor que 1.41");
+        assert_eq!(pc1500.read_byte(10202), 1, "SQR(2) debe ser menor que 1.42");
+        assert_eq!(pc1500.read_byte(10203), 1, "SQR(0) debe ser exactamente 0 (caso especial en gen_sqr_routine)");
     }
 
     /// `GOTO`/`GOSUB` a una etiqueta de cadena CALCULADA en tiempo de
@@ -7352,24 +9202,24 @@ mod tests {
         let source_9 = "\
 10 K$=\"9\"\n\
 20 GOTO \"*\"+K$\n\
-30 \"*9\"@(21700)=1:GOTO 60\n\
-40 \"*=\"@(21700)=2:GOTO 60\n\
-50 \"*\"@(21700)=3:GOTO 60\n\
-55 \"* \"@(21700)=4:GOTO 60\n\
+30 \"*9\"@(10200)=1:GOTO 60\n\
+40 \"*=\"@(10200)=2:GOTO 60\n\
+50 \"*\"@(10200)=3:GOTO 60\n\
+55 \"* \"@(10200)=4:GOTO 60\n\
 60 END\n\
 ";
         let code_9 = compile_native(source_9);
         let pc1500_9 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code_9, ORACLE_STACK_TOP, 40_000);
         assert!(pc1500_9.cpu().is_halted(), "debe llegar a END/HALT limpiamente (sufijo \"9\")");
         assert_eq!(pc1500_9.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top (sufijo \"9\")");
-        assert_eq!(pc1500_9.read_byte(21700), 1, "K$=\"9\" -> \"*\"+K$=\"*9\" debe saltar a la etiqueta \"*9\"");
+        assert_eq!(pc1500_9.read_byte(10200), 1, "K$=\"9\" -> \"*\"+K$=\"*9\" debe saltar a la etiqueta \"*9\"");
 
         let source_eq = source_9.replacen("K$=\"9\"", "K$=\"=\"", 1);
         let code_eq = compile_native(&source_eq);
         let pc1500_eq = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code_eq, ORACLE_STACK_TOP, 40_000);
         assert!(pc1500_eq.cpu().is_halted(), "debe llegar a END/HALT limpiamente (sufijo \"=\")");
         assert_eq!(pc1500_eq.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top (sufijo \"=\")");
-        assert_eq!(pc1500_eq.read_byte(21700), 2, "K$=\"=\" -> \"*\"+K$=\"*=\" debe saltar a la etiqueta \"*=\"");
+        assert_eq!(pc1500_eq.read_byte(10200), 2, "K$=\"=\" -> \"*\"+K$=\"*=\" debe saltar a la etiqueta \"*=\"");
     }
 
     /// Como el test de arriba pero para `GOSUB` (llamada, no salto): debe
@@ -7386,12 +9236,12 @@ mod tests {
         let source = "\
 10 K$=\"\"\n\
 20 GOSUB \"*\"+K$\n\
-25 @(21701)=1\n\
+25 @(10201)=1\n\
 30 END\n\
-50 \"*9\"@(21700)=1:RETURN \n\
-55 \"*=\"@(21700)=2:RETURN \n\
-60 \"*\"@(21700)=3:RETURN \n\
-65 \"* \"@(21700)=4:RETURN \n\
+50 \"*9\"@(10200)=1:RETURN \n\
+55 \"*=\"@(10200)=2:RETURN \n\
+60 \"*\"@(10200)=3:RETURN \n\
+65 \"* \"@(10200)=4:RETURN \n\
 ";
         let code = compile_native(source);
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
@@ -7402,8 +9252,8 @@ mod tests {
             "S debe volver a stack_top tras el GOSUB calculado + RETURN: S={:#06X}",
             pc1500.cpu().s()
         );
-        assert_eq!(pc1500.read_byte(21700), 3, "K$=\"\" -> \"*\"+K$=\"*\" debe llamar a la etiqueta \"*\"");
-        assert_eq!(pc1500.read_byte(21701), 1, "tras el RETURN debe seguir ejecutando la línea 25, no perderse");
+        assert_eq!(pc1500.read_byte(10200), 3, "K$=\"\" -> \"*\"+K$=\"*\" debe llamar a la etiqueta \"*\"");
+        assert_eq!(pc1500.read_byte(10201), 1, "tras el RETURN debe seguir ejecutando la línea 25, no perderse");
     }
 
     /// `DIM A$(N)` SIN `*M` (ancho de elemento explícito) — patrón real
@@ -7428,7 +9278,7 @@ mod tests {
 
         let source = "10 DIM A$(3)\n20 A$(0)=\"AA\"\n30 A$(1)=\"BB\"\n40 A$(2)=\"CC\"\n50 A$(3)=\"DD\"\n60 END\n";
         let (code, addrs) = compile_native_with_addresses(source);
-        let base = *addrs.get("A$").expect("dirección de A$ no encontrada") as u32;
+        let base = *addrs.get("ARRAY:A$").expect("dirección de A$ no encontrada") as u32;
 
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 40_000);
 
@@ -7463,7 +9313,7 @@ mod tests {
         assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top tras 2 asignaciones reales: S={:#06X}", pc1500.cpu().s());
 
         let a_addr = *addrs.get("A").expect("A") as u32;
-        let scratch_addr = *addrs.get("__STATUS2_SCRATCH").expect("__STATUS2_SCRATCH") as u32;
+        let scratch_addr = *addrs.get("ARRAY:__STATUS2_SCRATCH").expect("__STATUS2_SCRATCH") as u32;
         let a_bytes: Vec<u8> = (0..8).map(|i| pc1500.read_byte(a_addr + i)).collect();
         let expected_bytes = f64_to_bcd8(scratch_addr as f64);
         assert_eq!(a_bytes, expected_bytes, "A=STATUS 2 debe ser exactamente la dirección de __STATUS2_SCRATCH");
@@ -7488,13 +9338,13 @@ mod tests {
     #[test]
     fn test_oracle_gosub_to_scientific_notation_line_number_on_real_rom() {
         use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
-        let source = "10 GOSUB 61E3:@(21700)=1:GOTO 20\n61000 @(21701)=1:RETURN \n20 END\n";
+        let source = "10 GOSUB 61E3:@(10200)=1:GOTO 20\n61000 @(10201)=1:RETURN \n20 END\n";
         let code = compile_native(source);
         let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20_000);
         assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
         assert_eq!(pc1500.cpu().s(), ORACLE_STACK_TOP, "S debe volver a stack_top tras el GOSUB+RETURN: S={:#06X}", pc1500.cpu().s());
-        assert_eq!(pc1500.read_byte(21700), 1, "el código tras el GOSUB debe ejecutarse");
-        assert_eq!(pc1500.read_byte(21701), 1, "GOSUB 61E3 debe llamar a la línea 61000 (61E3 = 61*10^3)");
+        assert_eq!(pc1500.read_byte(10200), 1, "el código tras el GOSUB debe ejecutarse");
+        assert_eq!(pc1500.read_byte(10201), 1, "GOSUB 61E3 debe llamar a la línea 61000 (61E3 = 61*10^3)");
     }
 
     /// Los últimos 4 programas reales del corpus de 39 que nunca se
@@ -7535,14 +9385,14 @@ mod tests {
 
             // No debe haber "explotado" en un salto salvaje: la pila
             // hardware no puede haberse desbordado por debajo de la
-            // región de usuario (0x3800) ni haber crecido más allá de
+            // región de usuario (0x0100) ni haber crecido más allá de
             // stack_top — cualquiera de los dos indicaría PSH/POP
             // desequilibrados acumulados durante 200 frames reales de
             // ejecución (bastante más exigente que un END limpio de un
             // programa corto).
             let s = pc1500.cpu().s();
             assert!(
-                (0x3800..=0x5FFF).contains(&s),
+                (0x0100..=0x47FF).contains(&s),
                 "{}: S se salió de la región de usuario tras 200 frames: S={:#06X}",
                 name,
                 s
@@ -7580,11 +9430,11 @@ mod tests {
 10 A=6:B=7:C=A*B\n\
 20 D=9:E=8:F=D*E\n\
 30 I$=\"HI\":J$=\"HI\":IF I$=J$ THEN 60\n\
-40 @(21700)=0:GOTO 70\n\
-60 @(21700)=1\n\
+40 @(10200)=0:GOTO 70\n\
+60 @(10200)=1\n\
 70 L$=\"HI\":M$=\"BYE\":IF L$<>M$ THEN 100\n\
-80 @(21701)=0:GOTO 110\n\
-100 @(21701)=1\n\
+80 @(10201)=0:GOTO 110\n\
+100 @(10201)=1\n\
 110 O$=\"AB\"+\"CD\"\n\
 120 P$=\"EF\"+\"GH\"\n\
 130 CLS :CURSOR 0:PRINT C:PRINT \"X\":PRINT F:PRINT \"Y\"\n\
@@ -7620,9 +9470,9 @@ mod tests {
         assert_eq!(pc1500.read_byte(c_addr), 42, "primera MulInt compartida: 6*7=42");
         assert_eq!(pc1500.read_byte(f_addr), 72, "segunda MulInt compartida: 9*8=72");
 
-        // 21700 = 0x54C4, 21701 = 0x54C5
-        assert_eq!(pc1500.read_byte(0x54C4), 1, "primera IgualCadena compartida: \"HI\"==\"HI\"");
-        assert_eq!(pc1500.read_byte(0x54C5), 1, "segunda (DistintoCadena, mismo STRCMP compartido invertido): \"HI\"<>\"BYE\"");
+        // 10200 = 0x27D8, 10201 = 0x27D9
+        assert_eq!(pc1500.read_byte(0x27D8), 1, "primera IgualCadena compartida: \"HI\"==\"HI\"");
+        assert_eq!(pc1500.read_byte(0x27D9), 1, "segunda (DistintoCadena, mismo STRCMP compartido invertido): \"HI\"<>\"BYE\"");
 
         let o_addr = *addrs.get("O$").unwrap() as u32;
         let p_addr = *addrs.get("P$").unwrap() as u32;

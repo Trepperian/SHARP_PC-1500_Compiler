@@ -102,6 +102,34 @@ pub struct StackCodeGenerator {
     /// limitación conocida, no un olvido).
     real_variables: std::collections::HashSet<String>,
 
+    /// Nombres de variables escalares enteras (sin `$`, y NO marcadas
+    /// `real_variables`) que, en algún `LET` del programa, reciben un
+    /// literal entero fuera de 0..=255, o el resultado de sumar una de
+    /// estas mismas variables — recogido por `collect_word_variables`
+    /// (mismo patrón de punto fijo que `collect_real_variables`, ver ese
+    /// comentario). Sin esto, TODA aritmética entera de este backend es
+    /// de 8 bits (`SumaInt`/`DesapilaInd`, 1 byte) — una variable que
+    /// necesita más rango (p.ej. `C=299` seguido de `C=C+3` en
+    /// invader-v2.bas, usada como número de línea en `RESTORE C+RND 3`)
+    /// se truncaba en silencio Y desincronizaba la pila (`ApilaInt`
+    /// empuja 2 bytes para un literal >255, pero `DesapilaInd`/`ApilaInd`
+    /// siempre asumen 1). Bug real: el terreno de invader-v2.bas siempre
+    /// mostraba el mismo tramo en vez de variado, porque `C` nunca
+    /// llegaba a valer realmente 299+ y `RESTORE` siempre apuntaba casi
+    /// al mismo sitio.
+    ///
+    /// Alcance deliberadamente acotado al patrón real observado: solo
+    /// `LET`/asignación, `+` (contagioso, como en `real_variables`),
+    /// `RESTORE`/`GOTO`/`GOSUB <expr>` calculado (ya tenían su propio
+    /// camino de 16 bits, ver `gen_dynamic_line_number`) y `PRINT`. Una
+    /// variable "de palabra" usada en resta/multiplicación/división/
+    /// comparación cae a `TruncateWordToInt` en `gen_binary_op` (pierde
+    /// precisión por encima de 255 en vez de desincronizar la pila) — no
+    /// hay ningún caso así en el corpus real hoy. También EXCLUYE
+    /// variables de control de `FOR` (mismo motivo que `real_variables`:
+    /// `gen_for`/`gen_next` no tienen ninguna noción de 16 bits).
+    word_variables: std::collections::HashSet<String>,
+
     /// Formato `USING` activo, o `None` si no hay ninguno (formato
     /// decimal simple). Se actualiza en tiempo de COMPILACIÓN al procesar
     /// cada sentencia `USING <patrón>` o `PRINT USING <patrón>;...`
@@ -244,6 +272,21 @@ struct ForContext {
     /// única vez en `gen_for` (STEP puede ser una expresión arbitraria, no
     /// solo un literal).
     step_addr: usize,
+    /// `true` en cuanto algún `NEXT` de esta variable ya se ha procesado
+    /// — ver el comentario largo en `gen_next` sobre por qué esto NO
+    /// puede simplemente sacarse (`pop`) de `for_stack` al primer
+    /// `NEXT`: un `FOR` puede cerrarse desde más de un `NEXT` distinto
+    /// en el código fuente (ramas de control de flujo distintas que
+    /// convergen en el mismo bucle), y todos deben poder reencontrar
+    /// este mismo contexto. Este flag es lo que permite distinguir, más
+    /// tarde, cuando un `NEXT` de un bucle EXTERIOR se encuentra este
+    /// contexto todavía en la pila: si ya está cerrado, no hay que
+    /// volver a emitir su etiqueta `loop_end` (sería una duplicada, el
+    /// bug real que esto arregla); si no lo está, es un bucle interior
+    /// genuinamente huérfano (nunca llegó a su propio `NEXT`) y sí hace
+    /// falta definir su etiqueta para que el salto de salida de ESE
+    /// bucle tenga dónde aterrizar.
+    closed: bool,
 }
 
 impl StackCodeGenerator {
@@ -267,6 +310,7 @@ impl StackCodeGenerator {
             data_line_index: HashMap::new(),
             data_base,
             real_variables: std::collections::HashSet::new(),
+            word_variables: std::collections::HashSet::new(),
             current_using_format: None,
             sqr_used: false,
             dynamic_array_heap_initialized: false,
@@ -298,6 +342,11 @@ impl StackCodeGenerator {
         // real, y `gen_acc_val`/`gen_binary_op` necesitan saberlo desde el
         // principio para elegir `ApilaIndReal` en vez de `ApilaInd`.
         self.collect_real_variables(program);
+        // Pre-pasada análoga para variables "de palabra" (ver el
+        // comentario de `word_variables`) — DESPUÉS de `collect_real_variables`,
+        // para que una variable ya marcada real (que subsume cualquier
+        // rango entero) nunca se marque también "de palabra".
+        self.collect_word_variables(program);
         if !self.data_pool.is_empty() {
             self.emit(StackInstruction::DataPool(self.data_pool.clone()));
             let mut table: Vec<(u16, usize)> = self.data_line_index.iter().map(|(&k, &v)| (k, v)).collect();
@@ -314,6 +363,33 @@ impl StackCodeGenerator {
         let mut line_numbers: Vec<u16> = program.lines().map(|l| l.number()).collect();
         line_numbers.sort_unstable();
         self.emit(StackInstruction::LineTable(line_numbers));
+
+        // `__RND_SEED` (el estado del LFSR mock de `RND`/`RANDOM`, ver
+        // `FunctionInner::Rnd`/`StatementInner::Random`) a un valor fijo
+        // (1) SIEMPRE, incondicionalmente, al arrancar el programa — no
+        // solo si CallRnd/Random lo detectan a 0. Motivo: `load_lh5_file`
+        // en el emulador solo sobrescribe los bytes del código al cargar
+        // un `.lh5`, nunca limpia la región de variables — así que cargar
+        // el MISMO programa dos veces seguidas dentro de la misma sesión
+        // del emulador (sin reiniciar la app) deja `__RND_SEED` con el
+        // valor donde lo dejó la partida anterior, y el mapa/la partida
+        // sale distinta cada vez. Encontrado con bathyscaph.bas (línea 19:
+        // `RESTORE 999+RND 16`, nunca llama a `RANDOM`): en la ROM real,
+        // el programa tokenizado original muestra SIEMPRE el mismo mapa
+        // en cada `RUN` — la propia ROM debe resetear su generador
+        // pseudoaleatorio interno como parte de arrancar la ejecución,
+        // no solo en un arranque en frío de la calculadora. Esto replica
+        // ese mismo comportamiento en vez de depender de que la memoria
+        // ya esté a cero. Se reserva la dirección siempre (no solo si el
+        // programa usa RND) porque detectar "¿se usa RND en algún punto
+        // del programa?" exigiría recorrer recursivamente cada tipo de
+        // sentencia/expresión — unos pocos bytes de coste fijo en todos
+        // los programas es más simple y más difícil de dejarse un caso
+        // por el camino que ese recorrido.
+        let rnd_seed_addr = self.get_or_create_variable_address("__RND_SEED");
+        self.emit(StackInstruction::ApilaInt(rnd_seed_addr as i64)); // dirección primero (modelo Tiny)
+        self.emit(StackInstruction::ApilaInt(1));
+        self.emit(StackInstruction::DesapilaInd);
 
         // Comentario inicial
         self.emit_comment("=== INICIO DEL PROGRAMA ===");
@@ -537,6 +613,64 @@ impl StackCodeGenerator {
         }
     }
 
+    /// Análogo a `collect_real_variables` para variables "de palabra"
+    /// (ver el comentario de `word_variables`) — mismo algoritmo de
+    /// punto fijo (una variable puede necesitar 16 bits por una
+    /// asignación que a su vez depende de OTRA variable ya marcada, p.ej.
+    /// `C=299` y luego `D=C` en otra línea), reutilizando el mismo
+    /// conjunto de variables de control de `FOR` ya recogido para reales
+    /// (misma exclusión, mismo motivo).
+    fn collect_word_variables(&mut self, program: &Program) {
+        let mut for_control_vars = std::collections::HashSet::new();
+        for line in program.lines() {
+            for stmt in line.statements() {
+                self.collect_for_control_vars(stmt, &mut for_control_vars);
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for line in program.lines() {
+                for stmt in line.statements() {
+                    self.collect_word_variables_from_stmt(stmt, &for_control_vars, &mut changed);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn collect_word_variables_from_stmt(
+        &mut self,
+        stmt: &Statement,
+        for_control_vars: &std::collections::HashSet<String>,
+        changed: &mut bool,
+    ) {
+        match &stmt.inner {
+            StatementInner::Let { inner, .. } => {
+                for assignment in inner.assignments() {
+                    if let LValueInner::Identifier(id) = &assignment.lvalue().inner {
+                        let name = id.to_string();
+                        if !id.has_dollar()
+                            && !for_control_vars.contains(&name)
+                            && !self.real_variables.contains(&name)
+                            && !self.word_variables.contains(&name)
+                            && self.is_word_expr(assignment.expr())
+                        {
+                            self.word_variables.insert(name);
+                            *changed = true;
+                        }
+                    }
+                }
+            }
+            StatementInner::If { then_stmt, .. } => {
+                self.collect_word_variables_from_stmt(then_stmt, for_control_vars, changed);
+            }
+            _ => {}
+        }
+    }
+
     /// Generar código para una línea de código
     /// Cada CodeLine tiene un número de línea y opcionalmente una etiqueta de usuario
     fn gen_code_line(&mut self, line: &CodeLine) {
@@ -688,6 +822,15 @@ impl StackCodeGenerator {
             // promoción de tipo en vez del formato de la operación).
             if self.is_real_lvalue(lvalue) && !self.is_real_expr(expr) {
                 self.emit(StackInstruction::Int2Real);
+            } else if self.is_word_lvalue(lvalue) && !self.is_word_expr(expr) {
+                // Mismo patrón que la promoción real de arriba, para una
+                // variable "de palabra" (ver `word_variables`): si el
+                // lado derecho no produce ya un valor de 16 bits (p.ej.
+                // `C=0` tras haberse marcado `C` "de palabra" por
+                // `C=299` en otra línea), extenderlo aquí antes de
+                // `gen_store_to_lvalue`, que emitirá `DesapilaIndWord`
+                // (2 bytes) para esta variable.
+                self.emit(StackInstruction::ExtendIntToWord);
             }
 
             // Almacenar: desapila valor, desapila dirección, guarda
@@ -700,6 +843,45 @@ impl StackCodeGenerator {
     ///   gen_acc_val(Exp)
     ///   emit systemout()
     fn gen_print(&mut self, print_inner: &PrintInner) {
+        // La ROM real comparte la MISMA rutina de bajo nivel entre `PRINT`
+        // y `PAUSE` (`BCMD_PRINT` hace `JMP BCMD_PAUSE_2` en su rama de
+        // salida a display, confirmado en el desensamblado) — así que un
+        // `PRINT` "plano" (sin `USING` activo) también limpia la pantalla
+        // entera antes de escribir, igual que ya se arregló para `PAUSE`
+        // (ver el comentario largo de `gen_pause`). Confirmado
+        // empíricamente comparando la pantalla final de `bombing.bas`
+        // (`PRINT "*** SCORE *** :";W`, línea 310) contra el programa
+        // original tokenizado: el original la muestra sobre fondo
+        // limpio, la nuestra (antes de este fix) dejaba visibles los
+        // restos de la ciudad y del marcador antiguo.
+        //
+        // Un `PRINT USING <patrón>;...` NO debe limpiar — confirmado por
+        // el propio comportamiento observado del juego: el marcador
+        // (`CURSOR 22:PRINT USING "####";W`, líneas 260/280) se actualiza
+        // repetidas veces DURANTE la partida y permanece visible sobre
+        // el resto de la pantalla (ciudad, avión) en todo momento; si
+        // este `PRINT USING` limpiase la pantalla cada vez, borraría el
+        // juego entero en cada acierto. `PRINT USING` es, de hecho, un
+        // token BASIC distinto de `PRINT` en la ROM real (con su propia
+        // rutina de formateo), así que no comparte la ruta de
+        // `BCMD_PRINT`/`BCMD_PAUSE` en absoluto — de ahí que el `Cls` de
+        // aquí deba omitirse tanto si ya hay un formato `USING` activo
+        // (heredado de una sentencia `USING "patrón"` suelta anterior)
+        // como si este propio `PRINT` trae su propia cláusula `USING`
+        // incrustada (`PRINT USING "####";W` en una sola sentencia).
+        let has_using = self.current_using_format.is_some()
+            || print_inner.exprs.iter().any(|(printable, _)| {
+                matches!(printable, crate::parse::statement::printable::Printable::UsingClause(_))
+            });
+        if !has_using {
+            // No es el `Cls` incondicional (LCD_CLR+INIT_CURS): la ROM
+            // real llama a `CLR_NO_CURSOR`, que respeta un `CURSOR n`
+            // que acabe de posicionar el cursor (bug real de
+            // invader-v2.bas — ver el comentario largo de
+            // `StackInstruction::ClsIfNoCursor`).
+            self.emit(StackInstruction::ClsIfNoCursor);
+        }
+
         for (printable, sep) in &print_inner.exprs {
             // Generar código para el elemento a imprimir
             match printable {
@@ -736,6 +918,13 @@ impl StackCodeGenerator {
                         // — ver PrintRealNatural en el backend.
                         let buf = self.get_or_create_array_address("__PRINT_REAL_BUF", 16);
                         self.emit(StackInstruction::PrintRealNatural(buf));
+                    } else if self.is_word_expr(expr) {
+                        // Variable "de palabra" (ver `word_variables`,
+                        // p.ej. `S` tras `S=S+5000` en invader-v2.bas):
+                        // `gen_acc_val` ya la cargó como 16 bits —
+                        // `SystemOutInt` (que solo desapila 1 byte)
+                        // desincronizaría la pila.
+                        self.emit(StackInstruction::SystemOutIntWord);
                     } else {
                         self.emit(StackInstruction::SystemOutInt);
                     }
@@ -774,6 +963,8 @@ impl StackCodeGenerator {
                 self.gen_acc_val(prompt_expr);
                 if self.is_string_expr(prompt_expr) {
                     self.emit(StackInstruction::SystemOutString);
+                } else if self.is_word_expr(prompt_expr) {
+                    self.emit(StackInstruction::SystemOutIntWord);
                 } else {
                     self.emit(StackInstruction::SystemOutInt);
                 }
@@ -966,16 +1157,25 @@ impl StackCodeGenerator {
     /// `GOSUB <expr>`, o `RESTORE <expr>` vía `gen_restore`). Reconoce
     /// `<constante>+<expresión>` (aritmética de 16 bits real, para bases
     /// de línea grandes con un desplazamiento pequeño, p.ej. `GOSUB
-    /// C+10`) y, si no encaja ese patrón, evalúa la expresión como
-    /// entero normal de 8 bits y lo extiende con ceros a 16 bits (cubre
-    /// el caso común de una variable con un número de línea pequeño,
-    /// ≤255, p.ej. `GOTO D`).
+    /// C+10`) y, si no encaja ese patrón pero SÍ es una expresión "de
+    /// palabra" (ver `word_variables` — p.ej. `RESTORE C+RND 3` en
+    /// invader-v2.bas, con `C` una VARIABLE marcada "de palabra", no una
+    /// constante: no encaja en el patrón de arriba, pero `gen_binary_op`
+    /// ya sabe generarla como una suma de 16 bits genuina gracias a ese
+    /// mismo mecanismo), la deja tal cual — `gen_expression` ya produce
+    /// 16 bits reales. Si no es ninguna de las dos cosas, evalúa la
+    /// expresión como entero normal de 8 bits y lo extiende con ceros a
+    /// 16 bits (cubre el caso común de una variable con un número de
+    /// línea pequeño, ≤255, p.ej. `GOTO D`).
     fn gen_dynamic_line_number(&mut self, expr: &Expr) {
         if let Some((base, dynamic_part)) = self.dynamic_line_number_base_and_offset(expr) {
             self.emit(StackInstruction::ApilaIntWord(base));
             self.gen_expression(dynamic_part);
             self.gen_acc_val(dynamic_part);
             self.emit(StackInstruction::SumaIntWord);
+        } else if self.is_word_expr(expr) {
+            self.gen_expression(expr);
+            self.gen_acc_val(expr);
         } else {
             self.gen_expression(expr);
             self.gen_acc_val(expr);
@@ -1031,6 +1231,7 @@ impl StackCodeGenerator {
             loop_start: loop_start.clone(),
             loop_end: loop_end.clone(),
             step_addr,
+            closed: false,
         });
 
         // Inicializar variable de control
@@ -1120,10 +1321,42 @@ impl StackCodeGenerator {
 
         let for_context = match position {
             Some(pos) => {
+                // Bug real encontrado testeando invader-v2.bas: los
+                // contextos por encima de `pos` que YA estaban cerrados
+                // (`closed`, marcados por su propio `NEXT` en una línea
+                // anterior) no deben volver a emitir su etiqueta
+                // `loop_end` aquí — eso produciría una etiqueta
+                // DUPLICADA en el flujo (una ya emitida por su propio
+                // `NEXT`, otra aquí), y la resolución de etiquetas del
+                // backend se queda con la ÚLTIMA definición: el salto de
+                // salida real de ESE bucle interior aterrizaría en la
+                // copia duplicada, saltándose todo el código entre su
+                // propio `NEXT` y este `NEXT` exterior (en
+                // invader-v2.bas, línea 130: `NEXT D:B=L,C=C+3:NEXT Z` —
+                // `B=L` nunca se ejecutaba a partir de la 2ª vuelta de
+                // `FOR Z`, dejando `B` congelado con el valor de la 1ª
+                // vuelta y acortando drásticamente el bucle que genera
+                // el terreno). Un contexto NO cerrado aquí sí es
+                // genuinamente huérfano (su `FOR` nunca llegó a su
+                // propio `NEXT` en el código fuente) y sí necesita esa
+                // etiqueta definida, para que el salto de salida de ese
+                // bucle tenga dónde aterrizar.
                 while self.for_stack.len() > pos + 1 {
                     let stale = self.for_stack.pop().expect("acabamos de comprobar que hay más de pos+1 elementos");
-                    self.emit(StackInstruction::Label(stale.loop_end));
+                    if !stale.closed {
+                        self.emit(StackInstruction::Label(stale.loop_end));
+                    }
                 }
+                // El contexto encontrado NO se saca de `for_stack`: un
+                // mismo `FOR` puede cerrarse desde más de un `NEXT`
+                // distinto en el código fuente (ramas de control de
+                // flujo que convergen en el mismo bucle — ver
+                // `test_oracle_for_next_multiple_next_statements_same_loop_on_real_rom`),
+                // y todos deben poder reencontrarlo. Solo se marca
+                // `closed` para que, si algún `NEXT` de un bucle
+                // exterior lo encuentra después como "huérfano", sepa
+                // que no debe volver a emitirle la etiqueta.
+                self.for_stack[pos].closed = true;
                 self.for_stack[pos].clone()
             }
             None => {
@@ -1477,9 +1710,97 @@ impl StackCodeGenerator {
         self.emit(StackInstruction::Stop);
     }
     
+    /// `CLEAR` real: pone a 0/"" todas las variables y arrays de usuario
+    /// de tamaño estático conocidos EN ESTE PUNTO de la compilación —
+    /// antes esto era un no-op completo (comentario histórico: el
+    /// `CLEAR`/`DEL_STD_VARS` real de la ROM limpia la tabla de
+    /// variables del INTÉRPRETE, que nunca usamos, así que "no hacía
+    /// falta" tocar nada). Bug real encontrado jugando bathyscaph.bas de
+    /// verdad (no en ningún test aislado): tras chocar, la subrutina
+    /// "CRASH" (línea 210) llama a `CLEAR` antes de reiniciar `P`/`G`/`H`
+    /// — pero como `CLEAR` no hacía nada, `S`/`R`/`Q` (la estela del
+    /// submarino) se quedaban con el valor de la posición exacta donde
+    /// chocó la partida anterior, y el primer par de fotogramas de la
+    /// nueva partida dibujaba esa estela vieja en la posición 0 (donde
+    /// reaparece el submarino) — un patrón con pinta de aleatorio, que
+    /// cambia en cada choque porque el punto de colisión también cambia.
+    ///
+    /// Limitación deliberada, documentada, no un descuido: NO incluye
+    /// (a) nombres que empiezan por `__` (variables internas del propio
+    /// compilador — el índice de DATA, el scratch de AND/OR, los
+    /// contadores de STEP de cada FOR, etc. — resetearlas rompería el
+    /// programa a mitad de ejecución, no es lo que `CLEAR` significa en
+    /// BASIC real); (b) arrays de tamaño DINÁMICO (`DIM B$(R)*1` con `R`
+    /// variable — `ArrayMeta::dynamic_base_descriptor`), cuya dirección
+    /// base real solo se conoce en tiempo de ejecución y necesitaría
+    /// código adicional para leerla primero; (c) cualquier variable que
+    /// el programa solo llegue a usar DESPUÉS de este `CLEAR` en el
+    /// código fuente (`variable_addresses` solo conoce lo ya visto hasta
+    /// aquí — una limitación real del recorrido de una sola pasada, ya
+    /// señalada antes de intentar este arreglo). Para el patrón real de
+    /// `bathyscaph.bas` (`CLEAR` casi al final del programa, después de
+    /// que todas las variables relevantes ya se han usado) esto cubre el
+    /// caso completo.
     fn gen_clear(&mut self) {
         self.emit_comment("CLEAR");
-        self.emit(StackInstruction::Clear);
+
+        let mut regions: Vec<(u16, u16)> = Vec::new();
+        let mut names: Vec<&String> = self.variable_addresses.keys().collect();
+        names.sort(); // orden determinista, no el de iteración del HashMap
+
+        for name in names {
+            // Las entradas de array viven bajo la clave namespaced
+            // `"ARRAY:<nombre>"` en `variable_addresses` (ver
+            // `get_or_create_array_address` — evita que un array y una
+            // variable escalar del mismo nombre, patrón real de
+            // invader-v2.bas, se aliasen). `array_metadata` sigue
+            // indexado por el nombre BASIC real sin prefijo, así que solo
+            // se consulta para entradas que SÍ llevan el prefijo — una
+            // entrada ESCALAR nunca debe mirar ahí, aunque exista un
+            // array real con el mismo nombre base (si no, la entrada
+            // escalar heredaría por error el tamaño del array al
+            // calcular cuánto limpiar, aunque su propia dirección sea
+            // distinta y correcta).
+            let array_basic_name = name.strip_prefix("ARRAY:");
+            let filter_name = array_basic_name.unwrap_or(name);
+            if filter_name.starts_with("__") {
+                continue;
+            }
+            let addr = self.variable_addresses[name];
+
+            if let Some(meta) = array_basic_name.and_then(|n| self.array_metadata.get(n)) {
+                if meta.dynamic_base_descriptor.is_some() {
+                    continue; // base real solo conocida en tiempo de ejecución
+                }
+                let elements = match meta.dims {
+                    ArrayDims::OneD { len } => len,
+                    ArrayDims::TwoD { rows, cols } => rows * cols,
+                };
+                let total = elements * meta.element_size;
+                if total > 0 && addr <= u16::MAX as usize {
+                    Self::push_region_chunked(&mut regions, addr as u16, total);
+                }
+            } else {
+                let size = if name.ends_with('$') { DEFAULT_STRING_MAX_LEN + 1 } else { 10 };
+                if addr <= u16::MAX as usize {
+                    Self::push_region_chunked(&mut regions, addr as u16, size);
+                }
+            }
+        }
+
+        self.emit(StackInstruction::Clear(regions));
+    }
+
+    /// Trocea una región `(addr, byte_count)` en fragmentos de como
+    /// mucho 255 bytes: el bucle de `StackInstruction::Clear` en el
+    /// backend usa un contador de 8 bits.
+    fn push_region_chunked(regions: &mut Vec<(u16, u16)>, addr: u16, byte_count: usize) {
+        let mut offset = 0usize;
+        while offset < byte_count {
+            let chunk = (byte_count - offset).min(255);
+            regions.push((addr + offset as u16, chunk as u16));
+            offset += chunk;
+        }
     }
     
     fn gen_cls(&mut self) {
@@ -1544,6 +1865,42 @@ impl StackCodeGenerator {
     
     fn gen_pause(&mut self, print_inner: &PrintInner) {
         self.emit_comment("PAUSE");
+        // La ROM real resetea el cursor de texto ANTES de imprimir el
+        // mensaje de PAUSE (`BCMD_PAUSE_4`, $E6C1: `SJP (INIT_CURS)`) —
+        // si no se replica esto, PAUSE hereda la posición de cursor que
+        // dejó la sentencia anterior (p.ej. un INPUT justo antes), y un
+        // mensaje que empieza cerca del borde derecho desborda a mitad
+        // de frase, envolviéndose a la columna 0 (bug real encontrado en
+        // bombing.bas: `INPUT "Explanations (Y/N) ? ";A$` seguido de
+        // `PAUSE "Destroying large blocs..."` mostraba "troying..." con
+        // "Des" desplazado al extremo derecho de la pantalla).
+        //
+        // Además, `BCMD_PAUSE` alcanza `CLR_NO_CURSOR` ($EC9C, "Clears
+        // LCD if cursor is not allowed") tras forzar `CURSOR_ENA` bit0 a
+        // 0 — esa rutina, con el bit forzado, llama a `LCD_CLR` (vector
+        // $F2 de la tabla $FF00) antes de resetear `CURSOR_PTR`, así que
+        // PAUSE no solo reposiciona el cursor: BORRA la pantalla entera
+        // antes de escribir su mensaje. Confirmado también de forma
+        // independiente jugando el programa original tokenizado en el
+        // emulador: cada `PAUSE` de la secuencia de explicaciones
+        // (líneas 340-380 de bombing.bas) limpia el display por
+        // completo antes de mostrar su propio texto — sin esto, un
+        // mensaje más corto que el anterior deja restos del más largo
+        // en las columnas que no llega a tocar (visible sobre todo en
+        // el extremo derecho). Usa el mismo mecanismo que `Cls`
+        // (`LCD_CLR` + `INIT_CURS`, en ese orden) en vez del `InitCursor`
+        // aislado (que solo cubriría el problema de posición, no el de
+        // restos visuales).
+        //
+        // Actualización: no es el `Cls` incondicional — es `CLR_NO_CURSOR`,
+        // que SOLO limpia si `CURSOR_ENA` bit0=0 (ver
+        // `StackInstruction::ClsIfNoCursor`). En los usos de bombing.bas
+        // que motivaron este fix no había ningún `CURSOR n` justo antes,
+        // así que el comportamiento observado (limpia siempre) no cambia
+        // para ese caso — pero si algún programa hace `CURSOR n:PAUSE
+        // ...`, debe preservar posición/contenido igual que `PRINT`,
+        // porque comparten literalmente el mismo código de ROM.
+        self.emit(StackInstruction::ClsIfNoCursor);
         // PAUSE es similar a PRINT pero pausa después
         for (printable, sep) in &print_inner.exprs {
             match printable {
@@ -1552,6 +1909,8 @@ impl StackCodeGenerator {
                     self.gen_acc_val(expr);
                     if self.is_string_expr(expr) {
                         self.emit(StackInstruction::SystemOutString);
+                    } else if self.is_word_expr(expr) {
+                        self.emit(StackInstruction::SystemOutIntWord);
                     } else {
                         self.emit(StackInstruction::SystemOutInt);
                     }
@@ -1652,6 +2011,8 @@ impl StackCodeGenerator {
         // LF imprime valor y luego line feed
         if self.is_string_expr(expr) {
             self.emit(StackInstruction::SystemOutString);
+        } else if self.is_word_expr(expr) {
+            self.emit(StackInstruction::SystemOutIntWord);
         } else {
             self.emit(StackInstruction::SystemOutInt);
         }
@@ -2118,16 +2479,43 @@ impl StackCodeGenerator {
                 | BinaryOp::Geq
         ) && (self.is_real_expr(left) || self.is_real_expr(right));
 
+        // Análogo a `is_real` para variables "de palabra" (ver el
+        // comentario de `word_variables`) — pero deliberadamente acotado
+        // a `Add`, el único caso real del corpus (`C=C+3`, `S=S+100`,
+        // `RESTORE C+RND 3`...). `gen_acc_val`, más abajo, ya carga
+        // CUALQUIER referencia a una variable "de palabra" como 16 bits
+        // sin mirar qué operador la está usando — así que si esta
+        // expresión resulta ser un operando de una operación que NO sea
+        // `Add` (resta/multiplicación/comparación/...), hace falta la
+        // salvaguarda de `TruncateWordToInt` de abajo para no
+        // desincronizar la pila con esa instrucción de 8 bits.
+        let is_word = !is_real && matches!(op, BinaryOp::Add)
+            && (self.is_word_expr(left) || self.is_word_expr(right));
+
         // Generar código para ambos operandos
         self.gen_expression(left);
         self.gen_acc_val(left);
         if is_real && !self.is_real_expr(left) {
+            if self.is_word_expr(left) {
+                self.emit(StackInstruction::TruncateWordToInt);
+            }
             self.emit(StackInstruction::Int2Real);
+        } else if is_word && !self.is_word_expr(left) {
+            self.emit(StackInstruction::ExtendIntToWord);
+        } else if !is_real && !is_word && self.is_word_expr(left) {
+            self.emit(StackInstruction::TruncateWordToInt);
         }
         self.gen_expression(right);
         self.gen_acc_val(right);
         if is_real && !self.is_real_expr(right) {
+            if self.is_word_expr(right) {
+                self.emit(StackInstruction::TruncateWordToInt);
+            }
             self.emit(StackInstruction::Int2Real);
+        } else if is_word && !self.is_word_expr(right) {
+            self.emit(StackInstruction::ExtendIntToWord);
+        } else if !is_real && !is_word && self.is_word_expr(right) {
+            self.emit(StackInstruction::TruncateWordToInt);
         }
 
         match op {
@@ -2146,6 +2534,8 @@ impl StackCodeGenerator {
                     self.emit(StackInstruction::ConcatString(DEFAULT_STRING_MAX_LEN, buf, right_scratch));
                 } else if is_real {
                     self.emit(StackInstruction::SumaReal);
+                } else if is_word {
+                    self.emit(StackInstruction::SumaWordWord);
                 } else {
                     self.emit(StackInstruction::SumaInt);
                 }
@@ -2578,6 +2968,9 @@ impl StackCodeGenerator {
             LValueInner::Identifier(id) if self.real_variables.contains(&id.to_string()) => {
                 StackInstruction::DesapilaIndReal
             }
+            LValueInner::Identifier(id) if self.word_variables.contains(&id.to_string()) => {
+                StackInstruction::DesapilaIndWord
+            }
             _ => StackInstruction::DesapilaInd,
         };
         self.emit(instr);
@@ -2623,7 +3016,28 @@ impl StackCodeGenerator {
                         self.emit(StackInstruction::ApilaIndWord);
                     }
                     None => {
-                        let base_addr = self.get_or_create_variable_address(&name);
+                        // Bug real de invader-v2.bas: esto llamaba a
+                        // `get_or_create_variable_address` (el namespace
+                        // de ESCALARES) en vez de usar el `base_addr` ya
+                        // calculado por `gen_dim` (namespace de ARRAYS,
+                        // ver `get_or_create_array_address`) — un array
+                        // `B(5)` y una variable escalar `B` del mismo
+                        // programa (patrón real y válido: la sintaxis ya
+                        // los distingue por los paréntesis) acababan
+                        // aliasados en la misma dirección, porque CADA
+                        // ACCESO al array (no solo el `DIM`) recreaba una
+                        // dirección de escalar para el mismo nombre. Si
+                        // hay metadatos (el `DIM` con tamaño constante ya
+                        // se procesó), usar su `base_addr` real; si no
+                        // (array usado sin `DIM` previo), reservar bajo
+                        // el namespace de arrays igualmente — nunca el
+                        // de escalares — con el mismo tamaño histórico
+                        // de reserva (10 bytes) que tenía antes por
+                        // accidente vía `get_or_create_variable_address`.
+                        let base_addr = match meta {
+                            Some(m) => m.base_addr,
+                            None => self.get_or_create_array_address(&name, 10),
+                        };
                         self.emit(StackInstruction::ApilaInt(base_addr as i64));
                     }
                 }
@@ -2654,12 +3068,15 @@ impl StackCodeGenerator {
                 // dimensiones reales del DIM si están registradas, si no
                 // cae a los valores históricos (10 columnas, 5 bytes/elem).
                 let name = identifier.to_string();
-                let base_addr = self.get_or_create_variable_address(&name);
-                let (col_count, element_size) = match self.array_metadata.get(&name) {
-                    Some(ArrayMeta { dims: ArrayDims::TwoD { cols, .. }, element_size, .. }) => {
-                        (*cols, *element_size)
+                // Mismo bug/arreglo que en Array1DAccess: usar el
+                // `base_addr` real de `array_metadata` (namespace de
+                // arrays) en vez de recrear una dirección de ESCALAR
+                // para el mismo nombre.
+                let (base_addr, col_count, element_size) = match self.array_metadata.get(&name) {
+                    Some(ArrayMeta { base_addr, dims: ArrayDims::TwoD { cols, .. }, element_size, .. }) => {
+                        (*base_addr, *cols, *element_size)
                     }
-                    _ => (10, 5),
+                    _ => (self.get_or_create_array_address(&name, 10 * 10 * 5), 10, 5),
                 };
                 self.emit(StackInstruction::ApilaInt(base_addr as i64));
 
@@ -2754,6 +3171,12 @@ impl StackCodeGenerator {
             // caso de cadena de arriba, aquí para el resultado de
             // aritmética real (`SumaReal`/`RestaReal`/...).
             self.emit(StackInstruction::ApilaIndReal);
+        } else if self.is_word_expr(expr) {
+            // Variable escalar marcada "de palabra" (ver
+            // `word_variables`): guarda 2 bytes, así que cargarla
+            // necesita `ApilaIndWord`, no `ApilaInd` (1 byte) — mismo
+            // motivo que los dos casos de arriba.
+            self.emit(StackInstruction::ApilaIndWord);
         } else {
             self.emit(StackInstruction::ApilaInd);
         }
@@ -2948,6 +3371,44 @@ impl StackCodeGenerator {
         }
     }
 
+    /// ¿Es `lvalue` una variable "de palabra" (ver `word_variables`)?
+    /// Mismo patrón que `is_real_lvalue`.
+    fn is_word_lvalue(&self, lvalue: &LValue) -> bool {
+        match &lvalue.inner {
+            LValueInner::Identifier(id) if !id.has_dollar() => {
+                self.word_variables.contains(&id.to_string())
+            }
+            _ => false,
+        }
+    }
+
+    /// ¿Es `expr` una expresión "de palabra" (entera de 16 bits, ver el
+    /// comentario de `word_variables`)? Real siempre gana (una variable
+    /// real ya cubre cualquier rango entero, nunca hace falta tratarla
+    /// además como "de palabra") — de ahí el corte al principio. Una
+    /// referencia a una variable ya marcada, un literal fuera de
+    /// 0..=255 (vía `const_eval_int`, el mismo criterio que usa
+    /// `ApilaInt` en `gen_expression` para elegir su propia rama de 16
+    /// bits) o una suma (`+`, contagiosa como en `is_real_expr`) donde
+    /// cualquiera de los dos lados ya lo sea. Deliberadamente NO incluye
+    /// resta/multiplicación/división/comparación — ver el comentario de
+    /// `word_variables` para el porqué (sin caso real en el corpus,
+    /// `gen_binary_op` las trata con `TruncateWordToInt` si hiciera
+    /// falta en vez de generar una rama de 16 bits para ellas).
+    fn is_word_expr(&self, expr: &Expr) -> bool {
+        if self.is_real_expr(expr) {
+            return false;
+        }
+        match expr.inner() {
+            ExprInner::Parentheses(inner) => self.is_word_expr(inner),
+            ExprInner::LValue(lvalue) => self.is_word_lvalue(lvalue),
+            ExprInner::Binary(left, BinaryOp::Add, right) => {
+                self.is_word_expr(left) || self.is_word_expr(right)
+            }
+            _ => matches!(self.const_eval_int(expr), Some(n) if !(0..=255).contains(&n)),
+        }
+    }
+
     // =========================================================================
     // HELPERS GENERALES
     // =========================================================================
@@ -2996,12 +3457,33 @@ impl StackCodeGenerator {
     /// Como `get_or_create_variable_address`, pero reserva exactamente
     /// `total_bytes` en vez del hueco fijo de 10 bytes por variable
     /// escalar — para arrays, cuyo tamaño real varía por declaración.
+    ///
+    /// Bug real encontrado testeando invader-v2.bas: un array `B(n)` y
+    /// una variable ESCALAR `B` (ambas nombradas igual, patrón real y
+    /// válido en BASIC — la sintaxis ya las distingue por los
+    /// paréntesis: `6 DIM ...,B(5)` y luego `95 ...,B=L-4,...` en el
+    /// mismo programa) compartían literalmente la misma dirección,
+    /// porque esta función y `get_or_create_variable_address` usaban el
+    /// MISMO `HashMap<String, usize>` indexado solo por el nombre
+    /// crudo — quien se registrara primero "ganaba" la dirección, y el
+    /// otro la reutilizaba como si fuera la misma variable. Cada
+    /// asignación a la `B` escalar (controla cuántas veces itera `FOR
+    /// D=1 TO B`, el bucle que genera/desplaza el terreno) corrompía en
+    /// silencio `B(0)`, y viceversa — confirmado con un test aislado
+    /// (`DIM B(5):B(0)=99:B=7:...` dejaba `B(0)` en 7, no en 99).
+    /// Arreglado con un namespace interno distinto (`"ARRAY:"` + nombre)
+    /// para la clave del `HashMap`, exclusivo de este método — los
+    /// nombres de los buffers de scratch internos (`__SQR_V`, etc.) ya
+    /// no podían colisionar con un nombre BASIC real de todos modos
+    /// (BASIC no permite identificadores que empiecen por `__`), así que
+    /// aplicar el namespace aquí de forma uniforme es seguro.
     fn get_or_create_array_address(&mut self, name: &str, total_bytes: usize) -> usize {
-        if let Some(&addr) = self.variable_addresses.get(name) {
+        let key = format!("ARRAY:{name}");
+        if let Some(&addr) = self.variable_addresses.get(&key) {
             addr
         } else {
             let addr = self.data_base + self.next_address;
-            self.variable_addresses.insert(name.to_string(), addr);
+            self.variable_addresses.insert(key, addr);
             self.next_address += total_bytes;
             addr
         }
@@ -3053,6 +3535,16 @@ impl StackCodeGenerator {
         &self.variable_addresses
     }
 
+    /// Tamaño total, en bytes, de la región de variables de usuario
+    /// asignada hasta ahora (offset desde `data_base` del siguiente hueco
+    /// libre) — solo tiene sentido consultarlo tras `generate()`. Usado
+    /// por [`compile_native_two_pass`] para que el prólogo del backend
+    /// pueda poner a 0 esa región entera de una vez (ver
+    /// `Lh5801Backend::set_variable_region`).
+    pub fn total_variable_region_size(&self) -> usize {
+        self.next_address
+    }
+
     /// Convertir las instrucciones generadas a texto
     pub fn to_string(&self) -> String {
         self.instructions
@@ -3093,6 +3585,21 @@ pub fn compile_native_two_pass(
     let mut first_pass_gen = StackCodeGenerator::new();
     let first_pass_instructions = first_pass_gen.generate(program);
     let mut first_pass_backend = Lh5801Backend::with_config(start_address, stack_top);
+    // La pasada 1 debe emitir el MISMO prólogo (mismo tamaño en bytes)
+    // que emitirá la pasada 2, o `first_pass_code.len()` mide el tamaño
+    // equivocado y `real_data_base` solapa con el propio código — mismo
+    // bug de solape de `DATA_BASE` ya arreglado una vez, reintroducido
+    // aquí al añadir el bucle de puesta a cero de variables SOLO en la
+    // pasada 2. La dirección real de la región (`real_data_base`, que
+    // esta misma pasada 1 todavía no conoce) es irrelevante para el
+    // TAMAÑO del código — todos los operandos de dirección son
+    // inmediatos de 16 bits de ancho fijo — así que basta con el mismo
+    // TAMAÑO, con cualquier dirección de relleno (0).
+    let first_pass_region_size = first_pass_gen.total_variable_region_size();
+    if first_pass_region_size > 0 {
+        let clamped = first_pass_region_size.min(u16::MAX as usize) as u16;
+        first_pass_backend.set_variable_region(0, clamped);
+    }
     let first_pass_code = first_pass_backend.generate(&first_pass_instructions);
 
     let real_data_base = start_address as usize + first_pass_code.len();
@@ -3100,6 +3607,16 @@ pub fn compile_native_two_pass(
     let mut second_pass_gen = StackCodeGenerator::with_data_base(real_data_base);
     let second_pass_instructions = second_pass_gen.generate(program);
     let mut second_pass_backend = Lh5801Backend::with_config(start_address, stack_top);
+    // Poner a 0 TODA la región de variables en el prólogo — ver el
+    // comentario en `Lh5801Backend::set_variable_region`/`emit_initialization`
+    // (bug real: la GUI reutiliza el mismo `Pc1500` al pulsar "Cargar",
+    // así que la región de variables de una ejecución anterior podía
+    // sobrevivir a la siguiente si el programa no la reseteaba él mismo).
+    let variable_region_size = second_pass_gen.total_variable_region_size();
+    if variable_region_size > 0 && real_data_base <= u16::MAX as usize {
+        let clamped_size = variable_region_size.min(u16::MAX as usize) as u16;
+        second_pass_backend.set_variable_region(real_data_base as u16, clamped_size);
+    }
     let second_pass_code = second_pass_backend.generate(&second_pass_instructions);
 
     (start_address, second_pass_code, second_pass_gen.variable_addresses().clone())

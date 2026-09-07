@@ -206,6 +206,16 @@ impl RomRoutines {
             verified: true,
         });
 
+        routines.insert("CLR_NO_CURSOR", RomRoutine {
+            name: "CLR_NO_CURSOR",
+            address: 0xEC9C,
+            description: "\"Clears LCD if cursor is not allowed and sets matrix pointer to 00\" — si CURSOR_ENA bit0=0, llama a LCD_CLR y resetea CURSOR_PTR a 0; si bit0=1 (un CURSOR n lo acaba de posicionar), no hace nada. Es lo que llaman de verdad BCMD_PRINT/BCMD_PAUSE (vía su código compartido) antes de imprimir, NO el INIT_CURS incondicional — así `CURSOR n:PRINT ...`/`CURSOR n:PAUSE ...` preservan la posición y el contenido de pantalla ya dibujado (p.ej. un GPRINT anterior), y un PRINT/PAUSE sin CURSOR previo sigue limpiando como siempre",
+            inputs: "CURSOR_ENA bit0",
+            outputs: "Si bit0=0: pantalla a 0, CURSOR_PTR=0. Si bit0=1: sin efecto",
+            preserved: "CURSOR_ENA (no lo modifica)",
+            verified: true,
+        });
+
         routines.insert("INIT_MTRX", RomRoutine {
             name: "INIT_MTRX",
             address: 0xECB2,
@@ -330,7 +340,7 @@ impl RomRoutines {
             ("Aritmética BCD", vec!["ADDIT", "SUBTR", "MULTIPLY", "DIVISION"]),
             ("Salida de texto", vec!["CHAR_OUT", "STR_2_OUTBUF", "BCD_2_ASCII_OUTBUF", "ARX_2_STRNG"]),
             ("Entrada de teclado", vec!["ISKEY", "KEY_2_ASCII"]),
-            ("Gráficos / pantalla", vec!["LCD_CLR", "INIT_CURS", "INIT_MTRX", "GPRINT_OUT", "MTRX_INC", "MTRX_IN_RANGE"]),
+            ("Gráficos / pantalla", vec!["LCD_CLR", "INIT_CURS", "INIT_MTRX", "CLR_NO_CURSOR", "GPRINT_OUT", "MTRX_INC", "MTRX_IN_RANGE"]),
             ("Sonido / temporización", vec!["BEEP", "TIME_DELAY"]),
             ("Variables / aleatorios", vec!["DEL_STD_VARS", "RAND_GEN"]),
         ];

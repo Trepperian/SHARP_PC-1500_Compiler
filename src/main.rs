@@ -283,14 +283,14 @@ fn main() {
         // de variables, como llegó a pasar con bathyscaph.bas.
         use crate::codegen::compile_native_two_pass;
         let (load_address, machine_code, _variable_addresses) =
-            compile_native_two_pass(&program, 0x3800, 0x5FFF);
+            compile_native_two_pass(&program, 0x0100, 0x47FF);
 
         println!("Generados {} bytes de código máquina LH5801", machine_code.len());
         println!("Dirección de carga: 0x{:04X}", load_address);
 
         // Aviso temprano si el código generado no cabe en la RAM de
-        // usuario REAL de una Sharp PC-1500 con expansión CE-155 (10240
-        // bytes, 0x3800-0x5FFF) — antes esto compilaba "con éxito" sin
+        // usuario REAL de una Sharp PC-1500 con expansión CE-161 (18176
+        // bytes, 0x0100-0x47FF) — antes esto compilaba "con éxito" sin
         // ningún aviso, y el problema solo se descubría al intentar
         // CARGAR el .lh5 en un emulador real (`CodeTooLarge`) o, peor,
         // ejecutando silenciosamente un archivo truncado por el límite de
@@ -300,10 +300,10 @@ fn main() {
         // archivo, útil para inspección/depuración): mismo caso ya
         // documentado y aceptado de invader.bas, un límite real de
         // hardware, no un bug de este programa en concreto.
-        let real_ram_budget = 0x5FFF - 0x3800 + 1usize;
+        let real_ram_budget = 0x47FF - 0x0100 + 1usize;
         if machine_code.len() > real_ram_budget {
             eprintln!(
-                "AVISO: el código generado ({} bytes) excede la RAM de usuario real de una Sharp PC-1500 con expansión CE-155 ({} bytes, 0x3800-0x5FFF) — este programa no cabría en hardware real ni en el emulador, aunque el archivo se escriba igualmente.",
+                "AVISO: el código generado ({} bytes) excede la RAM de usuario real de una Sharp PC-1500 con expansión CE-161 ({} bytes, 0x0100-0x47FF) — este programa no cabría en hardware real ni en el emulador, aunque el archivo se escriba igualmente.",
                 machine_code.len(),
                 real_ram_budget
             );
@@ -334,7 +334,7 @@ fn main() {
                  load_address, 
                  load_address as usize + machine_code.len() - 1,
                  machine_code.len());
-        println!("  Pila (registro S): crece hacia abajo desde 0x5FFF");
+        println!("  Pila (registro S): crece hacia abajo desde 0x47FF");
         
         // Show first bytes of machine code
         println!("\nPrimeros 32 bytes del código máquina (hex):");

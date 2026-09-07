@@ -565,14 +565,14 @@ impl StackMachineInterpreter {
             // INSTRUCCIONES DE SISTEMA
             // ================================================================
             
-            StackInstruction::Clear => {
+            StackInstruction::Clear(_) => {
                 // CLEAR - limpiar variables (excepto DATA)
                 self.memory.clear();
                 self.stack.clear();
                 self.call_stack.clear();
             }
             
-            StackInstruction::Cls => {
+            StackInstruction::Cls | StackInstruction::ClsIfNoCursor => {
                 // CLS - Limpiar pantalla (simular con newlines)
                 if !self.verbose {
                     print!("\x1B[2J\x1B[H"); // ANSI clear screen

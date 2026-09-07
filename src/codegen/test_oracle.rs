@@ -18,14 +18,16 @@ use crate::parse::Parser;
 
 /// Dirección de carga usada por los tests del oráculo — coincide con
 /// `Lh5801Backend::new()`'s `start_address` por defecto, dentro del rango
-/// `0x3800..=0x5FFF` que acepta `Pc1500::load_lh5_file` (escribe
-/// directamente en `standard_user_memory`, que con la expansión CE-155
-/// empieza en `0x3800`).
-pub const ORACLE_LOAD_ADDR: u16 = 0x3800;
+/// `0x0100..=0x47FF` que acepta `Pc1500::load_lh5_file` (escribe
+/// directamente en `standard_user_memory`, que con la expansión CE-161
+/// empieza en `0x0100`, justo tras el área reservada de 256 bytes del
+/// propio módulo — ver el comentario junto a `STANDARD_USER_MEMORY_BEGIN`
+/// en `memory.rs` del proyecto hermano).
+pub const ORACLE_LOAD_ADDR: u16 = 0x0100;
 
 /// Tope de pila usado por los tests del oráculo — coincide con
 /// `Lh5801Backend::new()`'s `stack_top` por defecto (registro `S`).
-pub const ORACLE_STACK_TOP: u16 = 0x5FFF;
+pub const ORACLE_STACK_TOP: u16 = 0x47FF;
 
 /// Carga `code` (empaquetado en formato `.lh5`) en una `Pc1500` nueva,
 /// dejándola lista justo antes de ejecutar la primera instrucción real del
@@ -71,7 +73,7 @@ pub fn load(load_addr: u16, code: &[u8]) -> Pc1500 {
     // leyendo bytes de ese fixture en vez de basura-cero real. Limpiar
     // toda la RAM de usuario antes de cargar deja el oráculo determinista
     // e independiente de ese fixture, sea cual sea el tamaño del programa.
-    for addr in 0x3800u32..=0x5FFF {
+    for addr in 0x0100u32..=0x47FF {
         pc1500.write_byte(addr, 0);
     }
 

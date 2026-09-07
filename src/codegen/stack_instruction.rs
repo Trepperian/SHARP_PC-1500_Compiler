@@ -110,11 +110,45 @@ pub enum StackInstruction {
     /// de 16 bits, p.ej. de `ApilaIntWord`), Push (base + offset) como
     /// entero de 16 bits (con acarreo del byte bajo al alto). Usado para
     /// `RESTORE <base constante> + <expresión>` (p.ej. `RESTORE
-    /// 999+RND 16` en bathyscaph.bas) — el único caso de aritmética de
-    /// 16 bits que necesita este backend hoy, así que no hay una familia
-    /// completa de operaciones de 16 bits (resta/multiplicación/...),
-    /// solo esta suma.
+    /// 999+RND 16` en bathyscaph.bas).
     SumaIntWord,
+
+    /// suma-word-word - Pop b (entero de 16 bits), Pop a (entero de 16
+    /// bits), Push (a + b) como entero de 16 bits (con acarreo). A
+    /// diferencia de `SumaIntWord` (offset siempre de 8 bits, pensada
+    /// solo para el patrón `<constante>+<expr>` de `RESTORE`/`GOTO`
+    /// calculado), esta suma AMBOS operandos como 16 bits — necesaria
+    /// para variables normales "de palabra" (marcadas por
+    /// `word_variables` en `mod.rs`: una variable escalar entera a la
+    /// que en algún punto del programa se le asigna un valor >255, p.ej.
+    /// `C=299` seguido de `C=C+3` en invader-v2.bas). Ver el comentario
+    /// largo de `word_variables` para el bug real que motivó esto: sin
+    /// aritmética de 16 bits genuina para estas variables, `RESTORE
+    /// C+RND 3` con `C` por encima de 255 se calculaba mal (el byte alto
+    /// se perdía), haciendo que el terreno generado fuera siempre el
+    /// mismo tramo en vez de variado.
+    SumaWordWord,
+
+    /// resta-word-word - Como `SumaWordWord`, pero resta: Pop b, Pop a,
+    /// Push (a - b), ambos de 16 bits. No tiene ningún uso real en el
+    /// corpus todavía (ninguna variable "de palabra" se resta hoy) —
+    /// añadida por completitud junto a `SumaWordWord`, con el mismo
+    /// patrón de acarreo/préstamo encadenado ya usado en `RestaInt`.
+    RestaWordWord,
+
+    /// trunca-word-a-int - Pop un valor de 16 bits, Push solo el byte
+    /// bajo como entero de 8 bits (el byte alto se descarta). Salvaguarda
+    /// de seguridad: cuando una variable "de palabra" (ver
+    /// `SumaWordWord`) se usa en una operación que este backend NO trata
+    /// como de 16 bits (resta/multiplicación/división/comparación —
+    /// fuera del alcance real observado, ver `word_variables` en
+    /// `mod.rs`), `gen_acc_val` ya la cargó como 16 bits; sin esto, la
+    /// instrucción de 8 bits que sigue (que espera un único byte)
+    /// leería/desapilaría el byte equivocado y desincronizaría la pila
+    /// para el resto del programa. Pérdida de precisión aceptada y
+    /// documentada en ese caso (valor por encima de 255 truncado a su
+    /// byte bajo) en vez de corromper la pila.
+    TruncateWordToInt,
 
     /// extiende-int-word - Pop entero de 8 bits, Push el mismo valor como
     /// entero de 16 bits (byte alto = 0). Usado para `GOTO`/`GOSUB
@@ -122,7 +156,9 @@ pub enum StackInstruction {
     /// (p.ej. `GOTO D`): cubre el caso común de una variable con un
     /// número de línea que cabe en 8 bits (0-255) — como toda la
     /// aritmética entera de este backend es de 8 bits, es lo único que
-    /// puede producir una variable normal.
+    /// puede producir una variable normal. También usado para promover a
+    /// 16 bits el lado de una operación con una variable "de palabra"
+    /// que todavía no lo es (ver `SumaWordWord`/`word_variables`).
     ExtendIntToWord,
 
     /// resta-int - Pop b, Pop a, Push (a - b) para enteros
@@ -332,13 +368,25 @@ pub enum StackInstruction {
     /// negativo) — NO el carácter cuyo código coincide con el valor.
     SystemOutInt,
 
+    /// systemout-int-word() - Como `SystemOutInt`, pero para una variable
+    /// "de palabra" (16 bits, ver `word_variables` en `mod.rs`): Pop
+    /// entero de 16 bits SIN SIGNO (0-65535 — las variables "de palabra"
+    /// de este backend nunca son negativas en el corpus real, todas son
+    /// contadores/líneas/puntuaciones que solo crecen), imprimir sus
+    /// dígitos decimales (hasta 5, sin ceros a la izquierda). Necesaria
+    /// para que `PRINT S` siga funcionando cuando `S` se promociona a
+    /// "de palabra" (p.ej. `S=S+5000` en invader-v2.bas) — sin esto,
+    /// `SystemOutInt` (que solo espera/desapila 1 byte) desincronizaría
+    /// la pila al recibir un valor de 2 bytes.
+    SystemOutIntWord,
+
     /// systemout-string() - Pop puntero de 16 bits, imprimir la cadena
     /// NUL-terminada a la que apunta, carácter a carácter.
     SystemOutString,
     
     /// newline() / nl() - Imprimir nueva línea
     Newline,
-    
+
     /// print-tab - Imprimir tabulador
     PrintTab,
     
@@ -427,8 +475,25 @@ pub enum StackInstruction {
     RestoreData(usize), // Pop número de línea (0 = principio), fijar el índice
     
     /// Instrucciones de sistema
-    Clear,       // CLEAR - Limpiar variables
+    /// CLEAR - pone a 0 cada región `(dirección, nº de bytes)` de la
+    /// lista: una por cada variable/array de tamaño estático conocido en
+    /// el punto del programa donde aparece este `CLEAR` (ver `gen_clear`
+    /// en `mod.rs` para qué se incluye y qué se excluye deliberadamente).
+    Clear(Vec<(u16, u16)>),
     Cls,         // CLS - Limpiar pantalla
+    /// `PRINT`/`PAUSE` reales (sin `USING`) NO llaman a `Cls` (LCD_CLR +
+    /// INIT_CURS) sin más: llaman a `CLR_NO_CURSOR` ($EC9C), que solo
+    /// limpia la pantalla y resetea `CURSOR_PTR` a 0 cuando `CURSOR_ENA`
+    /// bit0 está a 0 (ningún `CURSOR n` acaba de posicionar el cursor) —
+    /// si bit0 está a 1 (un `CURSOR n` justo antes, en la misma línea o
+    /// en una anterior), no toca ni la pantalla ni la posición. Bug real
+    /// encontrado en invader-v2.bas: `45 CURSOR 13:PRINT " LEVEL?
+    /// (1/2)"` con el `Cls` incondicional (heredado del fix de
+    /// bombing.bas) borraba el logo GPRINT dibujado justo antes Y
+    /// reseteaba `CURSOR_PTR`, así que "LEVEL? (1/2)" aparecía en la
+    /// columna 0 en vez de la 13*6=78 — confirmado contra el original
+    /// tokenizado, que sí conserva el logo y la posición.
+    ClsIfNoCursor,
     Stop,        // STOP/END - Detener ejecución
     
     /// Asignación de memoria
@@ -552,6 +617,9 @@ impl StackInstruction {
             StackInstruction::SumaInt => "suma-int".to_string(),
             StackInstruction::SumaReal => "suma-real".to_string(),
             StackInstruction::SumaIntWord => "suma-int-word".to_string(),
+            StackInstruction::SumaWordWord => "suma-word-word".to_string(),
+            StackInstruction::RestaWordWord => "resta-word-word".to_string(),
+            StackInstruction::TruncateWordToInt => "trunca-word-a-int".to_string(),
             StackInstruction::ExtendIntToWord => "extiende-int-word".to_string(),
             StackInstruction::RestaInt => "resta-int".to_string(),
             StackInstruction::RestaReal => "resta-real".to_string(),
@@ -616,6 +684,7 @@ impl StackInstruction {
             StackInstruction::SystemIn => "systemin".to_string(),
             StackInstruction::CallInkey(char_buf, ptr_slot) => format!("call INKEY$ (buf @{char_buf:#x}, ptr @{ptr_slot:#x})"),
             StackInstruction::SystemOutInt => "systemout-int".to_string(),
+            StackInstruction::SystemOutIntWord => "systemout-int-word".to_string(),
             StackInstruction::SystemOutString => "systemout-string".to_string(),
             StackInstruction::Newline => "newline".to_string(),
             StackInstruction::PrintTab => "print-tab".to_string(),
@@ -649,8 +718,9 @@ impl StackInstruction {
             StackInstruction::DataLineTable(table) => format!("data-line-table ({} entries)", table.len()),
             StackInstruction::ReadData(addr) => format!("read-data @{addr:#x}"),
             StackInstruction::RestoreData(addr) => format!("restore-data @{addr:#x}"),
-            StackInstruction::Clear => "clear".to_string(),
+            StackInstruction::Clear(regions) => format!("clear ({} regiones)", regions.len()),
             StackInstruction::Cls => "cls".to_string(),
+            StackInstruction::ClsIfNoCursor => "cls_if_no_cursor".to_string(),
             StackInstruction::Stop => "stop".to_string(),
             StackInstruction::Alloc(n) => format!("alloc {}", n),
             StackInstruction::Dealloc(n) => format!("dealloc {}", n),
