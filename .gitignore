@@ -24,3 +24,6 @@ target
 *.bin
 # Temporary files
 *.tmp
+
+# Cuaderno de trabajo personal, no forma parte del proyecto entregable
+Anotaciones.md

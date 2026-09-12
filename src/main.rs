@@ -1,436 +1,235 @@
-pub mod error;
-mod header;
-mod lex;
-mod parse;
-mod semantic_analysis;
-mod codegen;
+//! `dull`: el ejecutable principal del compilador — un menú de texto
+//! interactivo, sin banderas que recordar, pensado para poder repartirlo a
+//! quien no vaya a usar la línea de comandos habitualmente.
+//!
+//! Para la CLI clásica basada en banderas (`--native-code`, `-o`, `--parse`,
+//! ...), pensada para scripts y para quien ya conoce las opciones, ver el
+//! binario hermano `dull-cli` (`src/bin/dull-cli.rs`). Es también lo que
+//! ejecuta `cargo run` sin `--bin` durante el desarrollo (fijado como
+//! `default-run` en `Cargo.toml`), precisamente porque durante el
+//! desarrollo suele ser más rápido pasar los parámetros como argumentos que
+//! contestar un menú cada vez.
+//!
+//! Ambos binarios comparten exactamente la misma lógica de compilación,
+//! implementada una sola vez en `dull::actions` — este archivo solo
+//! pregunta, muestra el menú, y llama a esas mismas funciones.
+//!
+//! La primera opción del menú es, deliberadamente, la más simple de las
+//! seis: compilar a código máquina nativo (`.lh5`) pidiendo solo el archivo
+//! de entrada y, opcionalmente, el de salida. El resto de opciones exponen
+//! el resto de modos que ya existían (tokenizado clásico, código intermedio
+//! de pila, solo lexer, solo parser, análisis semántico), con las mismas
+//! preguntas que sus banderas equivalentes en `dull-cli`.
 
-use crate::error::{CompileError, print_error};
-use crate::header::Header;
-use crate::lex::{Lexer, RemarkLexOption, SpannedToken};
-use crate::parse::Parser;
-use crate::semantic_analysis::analyze_program;
-use crate::codegen::StackCodeGenerator;
-use crate::codegen::interpreter::StackMachineInterpreter;
-use clap::Parser as ClapParser;
-use std::{fs, path::PathBuf};
+use dull::actions;
+use dull::lex::RemarkLexOption;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
-#[derive(clap::ValueEnum, Clone, Debug)]
-enum RemarkMode {
-    TrimWhitespace,
-    KeepWhole,
-}
-
-impl From<RemarkMode> for RemarkLexOption {
-    fn from(mode: RemarkMode) -> Self {
-        match mode {
-            RemarkMode::TrimWhitespace => RemarkLexOption::TrimWhitespace,
-            RemarkMode::KeepWhole => RemarkLexOption::KeepWhole,
-        }
-    }
-}
-
-/// A BASIC lexer and parser
-#[derive(ClapParser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Input BASIC file to process
-    #[arg(value_name = "FILE")]
-    input: Option<PathBuf>,
-
-    /// Just tokenize the input (output tokens only)
-    #[arg(short, long)]
-    lex: bool,
-
-    /// Parse the input into an AST instead of compiling
-    #[arg(short, long)]
-    parse: bool,
-
-    /// Run semantic analysis on the parsed AST (implies --parse)
-    #[arg(short, long)]
-    analyze: bool,
-
-    /// Generate stack-based intermediate code (código intermedio de pila)
-    #[arg(short = 'g', long, conflicts_with = "native_code")]
-    stack_code: bool,
-
-    /// Execute the generated stack code (requires --stack-code)
-    #[arg(short = 'e', long, requires = "stack_code")]
-    execute: bool,
-
-    /// Show verbose execution trace
-    #[arg(short = 'v', long, requires = "execute")]
-    verbose: bool,
-
-    /// Generate native LH5801 machine code from stack instructions
-    #[arg(long, conflicts_with = "stack_code")]
-    native_code: bool,
-
-    /// (Solo con --native-code) Inserta una espera calibrada tras cada
-    /// sentencia compilada, para acercar el ritmo de ejecución al del
-    /// BASIC tokenizado interpretado en la ROM real — el código nativo,
-    /// sin esto, ejecuta la misma lógica en una fracción del tiempo real
-    /// (el intérprete despacha cada sentencia mediante llamadas
-    /// vectorizadas y busca cada variable por nombre en tiempo de
-    /// ejecución; el código nativo resuelve todo eso en compilación).
-    /// Desactivado por defecto: sin esta bandera, el .lh5 generado es
-    /// exactamente igual que sin este mecanismo.
-    #[arg(long, requires = "native_code")]
-    authentic_timing: bool,
-
-    /// Compile without header (only program bytes)
-    #[arg(long)]
-    no_header: bool,
-
-    /// Output file for compiled bytes (defaults to a.bin)
-    #[arg(short, long, value_name = "FILE")]
-    output: Option<PathBuf>,
-
-    /// Preserve source parentheses in output
-    #[arg(short = 'w', long)]
-    preserve_source_wording: bool,
-
-    /// Program name to use in header (defaults to input filename with extension)
-    #[arg(short = 'n', long, value_name = "NAME")]
-    program_name: Option<String>,
-
-    /// Remark handling mode: trim-whitespace or keep-whole
-    #[arg(long, value_enum, default_value_t = RemarkMode::TrimWhitespace)]
-    remark_mode: RemarkMode,
-}
+/// Modo de tratamiento de comentarios `REM` que usa todo este binario. La
+/// CLI clásica (`dull-cli --remark-mode`) permite elegirlo por si algún
+/// fuente concreto lo necesita, pero es una opción rara — para mantener el
+/// menú simple, `dull` siempre usa el valor por defecto de la CLI
+/// (`TrimWhitespace`) sin preguntar por él en ninguna de las seis opciones.
+const REMARK_MODE: RemarkLexOption = RemarkLexOption::TrimWhitespace;
 
 fn main() {
-    let args = Args::parse();
+    println!("========================================");
+    println!(" dull — Compilador BASIC Sharp PC-1500");
+    println!("========================================");
 
-    // Get the input source
-    let (input, filename, program_name) = match args.input {
-        Some(file_path) => {
-            // Read from file
-            match fs::read_to_string(&file_path) {
-                Ok(content) => {
-                    let default_prog_name = file_path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("PROGRAM")
-                        .to_string();
-                    let prog_name = args.program_name.unwrap_or(default_prog_name);
-                    (content, file_path.display().to_string(), prog_name)
-                }
-                Err(e) => {
-                    eprintln!("Error reading file {}: {}", file_path.display(), e);
-                    std::process::exit(1);
-                }
+    loop {
+        print_menu();
+        // `None` significa que `stdin` se agotó (EOF: Ctrl+D, o una entrada
+        // canalizada que llegó a su fin) — se trata igual que elegir "0", no
+        // como una respuesta vacía repetida: sin esta distinción, cada
+        // lectura tras EOF devuelve "" sin bloquear y el `match` de abajo la
+        // trataría como "opción no reconocida" para siempre, consumiendo CPU
+        // sin parar en vez de terminar (bug real encontrado probando este
+        // mismo menú con la entrada canalizada desde un script).
+        let Some(choice) = prompt("Elige una opción") else {
+            println!("Hasta luego.");
+            break;
+        };
+        match choice.as_str() {
+            "1" => native_code_menu(),
+            "2" => tokenize_menu(),
+            "3" => stack_code_menu(),
+            "4" => lex_menu(),
+            "5" => parse_menu(),
+            "6" => analyze_menu(),
+            "0" | "q" | "salir" => {
+                println!("Hasta luego.");
+                break;
             }
-        }
-        None => {
-            eprintln!("Error: Must specify input file");
-            std::process::exit(1);
-        }
-    };
-
-    // Create lexer and tokenize
-    let lexer = Lexer::new(&input, args.remark_mode.into());
-    let mut tokens: Vec<SpannedToken> = Vec::new();
-
-    for token_result in lexer {
-        match token_result {
-            Ok(spanned_token) => tokens.push(spanned_token),
-            Err(lex_error) => {
-                let compile_error = CompileError::from(lex_error);
-                print_error(&compile_error, &filename, &input);
-                std::process::exit(1);
+            other => {
+                println!("Opción no reconocida: \"{other}\". Elige un número del menú.\n");
             }
         }
     }
+}
 
-    if args.analyze {
-        // Parse the tokens into an AST and run semantic analysis
-        let mut parser = Parser::new(tokens.into_iter());
+fn print_menu() {
+    println!();
+    println!("¿Qué quieres hacer?");
+    println!();
+    println!("  1) Compilar a código máquina nativo LH5801 (.lh5)");
+    println!("  2) Compilar a BASIC tokenizado clásico (.bin)");
+    println!("  3) Generar código intermedio de pila (.p)");
+    println!("  4) Solo tokenizar (mostrar los tokens del lexer)");
+    println!("  5) Solo parsear (mostrar el código reconstruido)");
+    println!("  6) Analizar semánticamente (comprobación de tipos)");
+    println!("  0) Salir");
+    println!();
+}
 
-        let (program, parse_errors) = parser.parse_with_error_recovery();
+// =============================================================================
+// UNA OPCIÓN DE MENÚ POR CADA MODO DE dull::actions
+// =============================================================================
 
-        // Report any parse errors but continue if we got some lines
-        for parse_error in &parse_errors {
-            let compile_error = CompileError::from(parse_error.clone());
-            print_error(&compile_error, &filename, &input);
-        }
+/// Opción 1 — la más sencilla a propósito: solo entrada y salida.
+fn native_code_menu() {
+    let Some(input) = prompt_input_path() else { return };
+    let output = prompt_output_path(&default_output_for(&input, "lh5"));
+    let authentic_timing = prompt_yes_no(
+        "¿Activar el ritmo de ejecución auténtico (--authentic-timing)?",
+        false,
+    );
+    println!();
+    let _ = actions::run_native_code(&input, REMARK_MODE, Some(output), authentic_timing);
+    pause();
+}
 
-        if !parse_errors.is_empty() {
-            eprintln!(
-                "\nWarning: {} parse error(s) occurred. Continuing with {} successfully parsed line(s).",
-                parse_errors.len(),
-                program.num_lines()
-            );
-            std::process::exit(1);
-        }
-
-        match analyze_program(&program) {
-            Ok(symbol_table) => {
-                println!("Semantic analysis completed successfully!");
-                println!("Symbol table: {symbol_table:#?}");
-            }
-            Err(semantic_error) => {
-                let compile_error = CompileError::from(semantic_error);
-                print_error(&compile_error, &filename, &input);
-                std::process::exit(1);
-            }
-        }
-    } else if args.parse {
-        // Parse the tokens into an AST
-        let mut parser = Parser::new(tokens.into_iter());
-
-        let (program, parse_errors) = parser.parse_with_error_recovery();
-
-        // Report any parse errors but continue if we got some lines
-        for parse_error in &parse_errors {
-            let compile_error = CompileError::from(parse_error.clone());
-            print_error(&compile_error, &filename, &input);
-        }
-
-        if !parse_errors.is_empty() {
-            eprintln!(
-                "\nWarning: {} parse error(s) occurred. Continuing with {} successfully parsed line(s).",
-                parse_errors.len(),
-                program.num_lines()
-            );
-            std::process::exit(1);
-        }
-
-        println!("{}", program.show(args.preserve_source_wording));
-    } else if args.lex {
-        // Just output the tokens
-        for (i, token) in tokens.iter().enumerate() {
-            print!("{token} ");
-            if i < tokens.len() - 1 {
-                print!(" ");
-            }
-        }
-        println!();
-    } else if args.stack_code {
-        // Generate stack-based intermediate code
-        let mut parser = Parser::new(tokens.into_iter());
-
-        let (program, parse_errors) = parser.parse_with_error_recovery();
-
-        // Report any parse errors but continue if we got some lines
-        for parse_error in &parse_errors {
-            let compile_error = CompileError::from(parse_error.clone());
-            print_error(&compile_error, &filename, &input);
-        }
-
-        if !parse_errors.is_empty() {
-            eprintln!(
-                "\nWarning: {} parse error(s) occurred. Continuing with {} successfully parsed line(s).",
-                parse_errors.len(),
-                program.num_lines()
-            );
-            std::process::exit(1);
-        }
-
-        // Generate stack code
-        let mut codegen = StackCodeGenerator::new();
-        let instructions = codegen.generate(&program);
-
-        // Convert to text
-        let stack_code = codegen.to_string();
-
-        // Write to output file
-        let output_path = args.output.unwrap_or_else(|| PathBuf::from("a.p"));
-        if let Err(e) = fs::write(&output_path, &stack_code) {
-            eprintln!("Error writing output file {}: {}", output_path.display(), e);
-            std::process::exit(1);
-        }
-
-        println!("Código intermedio de pila generado: {}", output_path.display());
-        println!("\nTotal de instrucciones: {}", instructions.len());
-        
-        if !args.execute {
-            println!("\nPrimeras 30 instrucciones:");
-            for (i, instr) in instructions.iter().take(30).enumerate() {
-                println!("{:4}: {}", i + 1, instr.to_string());
-            }
-        }
-        
-        // Ejecutar el código si se especifica --execute
-        if args.execute {
-            println!("\n{}", "=".repeat(60));
-            println!("EJECUTANDO EL CÓDIGO GENERADO");
-            println!("{}", "=".repeat(60));
-            
-            let mut interpreter = StackMachineInterpreter::new(instructions);
-            interpreter.set_verbose(args.verbose);
-            interpreter.ejecuta();
-            
-            println!("\n{}", "=".repeat(60));
-            println!("Para ejecutar nuevamente use: cargo run {} --stack-code --execute", filename);
-        } else {
-            println!("\nPara ejecutar el código use: cargo run {} --stack-code --execute", filename);
-        }
-    } else if args.native_code {
-        // Generate native LH5801 machine code as binary file (.lh5)
-        use crate::codegen::lh5_format;
-        
-        let mut parser = Parser::new(tokens.into_iter());
-        let (program, parse_errors) = parser.parse_with_error_recovery();
-
-        // Report any parse errors but continue if we got some lines
-        for parse_error in &parse_errors {
-            let compile_error = CompileError::from(parse_error.clone());
-            print_error(&compile_error, &filename, &input);
-        }
-
-        if !parse_errors.is_empty() {
-            eprintln!(
-                "\nWarning: {} parse error(s) occurred. Continuing with {} successfully parsed line(s).",
-                parse_errors.len(),
-                program.num_lines()
-            );
-            std::process::exit(1);
-        }
-
-        // Compilar a código máquina LH5801 en dos pasadas: la primera mide
-        // el tamaño real del código, la segunda ya coloca el área de
-        // variables justo después (ver `compile_native_two_pass`) — evita
-        // que un programa grande corrompa su propio código con escrituras
-        // de variables, como llegó a pasar con bathyscaph.bas.
-        use crate::codegen::compile_native_two_pass_with_timing;
-        let (load_address, machine_code, _variable_addresses) =
-            compile_native_two_pass_with_timing(&program, 0x0100, 0x47FF, args.authentic_timing);
-
-        println!("Generados {} bytes de código máquina LH5801", machine_code.len());
-        println!("Dirección de carga: 0x{:04X}", load_address);
-        if args.authentic_timing {
-            println!("Ritmo de ejecución: espera calibrada activada (--authentic-timing)");
-        }
-
-        // Aviso temprano si el código generado no cabe en la RAM de
-        // usuario REAL de una Sharp PC-1500 con expansión CE-161 (18176
-        // bytes, 0x0100-0x47FF) — antes esto compilaba "con éxito" sin
-        // ningún aviso, y el problema solo se descubría al intentar
-        // CARGAR el .lh5 en un emulador real (`CodeTooLarge`) o, peor,
-        // ejecutando silenciosamente un archivo truncado por el límite de
-        // 16 bits del propio formato .lh5 (ver el comentario de
-        // `write_lh5_file`) — un salto a memoria nunca cargada, en vez de
-        // un mensaje claro. No es un error duro (se sigue escribiendo el
-        // archivo, útil para inspección/depuración): mismo caso ya
-        // documentado y aceptado de invader.bas, un límite real de
-        // hardware, no un bug de este programa en concreto.
-        let real_ram_budget = 0x47FF - 0x0100 + 1usize;
-        if machine_code.len() > real_ram_budget {
-            eprintln!(
-                "AVISO: el código generado ({} bytes) excede la RAM de usuario real de una Sharp PC-1500 con expansión CE-161 ({} bytes, 0x0100-0x47FF) — este programa no cabría en hardware real ni en el emulador, aunque el archivo se escriba igualmente.",
-                machine_code.len(),
-                real_ram_budget
-            );
-        }
-
-        // Write binary LH5 file (load address + machine code)
-        let output_path = args.output.unwrap_or_else(|| PathBuf::from("a.lh5"));
-        
-        if let Err(e) = lh5_format::write_lh5_file(&output_path, load_address, &machine_code) {
-            eprintln!("Error writing output file {}: {}", output_path.display(), e);
-            std::process::exit(1);
-        }
-
-        let file_size = 4 + machine_code.len(); // header (4 bytes) + code
-        println!("\nArchivo binario LH5 generado:");
-        println!("  Archivo: {}", output_path.display());
-        println!("  Tamaño total: {} bytes", file_size);
-        println!("    - Encabezado: 4 bytes");
-        println!("    - Código máquina: {} bytes", machine_code.len());
-        
-        println!("\nEstructura del archivo:");
-        println!("  Offset 0x0000-0x0001: Dirección de carga = 0x{:04X} (little-endian)", load_address);
-        println!("  Offset 0x0002-0x0003: Longitud código = {} bytes (little-endian)", machine_code.len());
-        println!("  Offset 0x0004-0x{:04X}: Código máquina LH5801", file_size - 1);
-        
-        println!("\nMemoria requerida:");
-        println!("  Código: 0x{:04X}-0x{:04X} ({} bytes)", 
-                 load_address, 
-                 load_address as usize + machine_code.len() - 1,
-                 machine_code.len());
-        println!("  Pila (registro S): crece hacia abajo desde 0x47FF");
-        
-        // Show first bytes of machine code
-        println!("\nPrimeros 32 bytes del código máquina (hex):");
-        for (i, &byte) in machine_code.iter().take(32).enumerate() {
-            if i % 16 == 0 && i > 0 {
-                println!();
-            }
-            print!("{:02X} ", byte);
-        }
-        println!();
-        
-        println!("\n{}", "=".repeat(70));
-        println!("INSTRUCCIONES PARA EL EMULADOR:");
-        println!("{}", "=".repeat(70));
-        println!("Este archivo debe cargarse con el siguiente código en el emulador:");
-        println!();
-        println!("fn load_lh5_file(&mut self, path: &Path) -> Result<(), Error> {{");
-        println!("    let (load_address, machine_code) = lh5_format::read_lh5_file(path)?;");
-        println!("    ");
-        println!("    // Cargar código en memoria");
-        println!("    let start = load_address as usize;");
-        println!("    let end = start + machine_code.len();");
-        println!("    self.memory[start..end].copy_from_slice(&machine_code);");
-        println!("    ");
-        println!("    // Configurar PC para ejecutar");
-        println!("    self.cpu.pc = load_address;");
-        println!("    ");
-        println!("    Ok(())");
-        println!("}}");
-        println!("{}", "=".repeat(70));
+fn tokenize_menu() {
+    let Some(input) = prompt_input_path() else { return };
+    let output = prompt_output_path(&default_output_for(&input, "bin"));
+    let with_header = prompt_yes_no("¿Incluir cabecera de programa?", true);
+    let program_name = if with_header {
+        let raw = prompt("Nombre del programa (vacío = nombre del archivo)").unwrap_or_default();
+        if raw.is_empty() { None } else { Some(raw) }
     } else {
-        // Default: compile the tokens into an AST and compile to bytes
-        let mut parser = Parser::new(tokens.into_iter());
+        None
+    };
+    let preserve = prompt_yes_no(
+        "¿Preservar los paréntesis tal como están en el fuente?",
+        false,
+    );
+    println!();
+    let _ = actions::run_tokenize(&input, REMARK_MODE, Some(output), !with_header, preserve, program_name);
+    pause();
+}
 
-        let (program, parse_errors) = parser.parse_with_error_recovery();
+fn stack_code_menu() {
+    let Some(input) = prompt_input_path() else { return };
+    let output = prompt_output_path(&default_output_for(&input, "p"));
+    let execute = prompt_yes_no("¿Ejecutar el código generado con el intérprete?", false);
+    let verbose = execute && prompt_yes_no("¿Traza detallada de la ejecución (verbose)?", false);
+    println!();
+    let _ = actions::run_stack_code(&input, REMARK_MODE, Some(output), execute, verbose);
+    pause();
+}
 
-        // Report any parse errors but continue if we got some lines
-        for parse_error in &parse_errors {
-            let compile_error = CompileError::from(parse_error.clone());
-            print_error(&compile_error, &filename, &input);
-        }
+fn lex_menu() {
+    let Some(input) = prompt_input_path() else { return };
+    println!();
+    let _ = actions::run_lex(&input, REMARK_MODE);
+    pause();
+}
 
-        if !parse_errors.is_empty() {
-            eprintln!(
-                "\nWarning: {} parse error(s) occurred. Continuing with {} successfully parsed line(s).",
-                parse_errors.len(),
-                program.num_lines()
-            );
-            std::process::exit(1);
-        }
-        // Generate program bytes
-        let mut program_bytes = Vec::new();
-        program.write_bytes(&mut program_bytes, args.preserve_source_wording);
+fn parse_menu() {
+    let Some(input) = prompt_input_path() else { return };
+    let preserve = prompt_yes_no(
+        "¿Preservar los paréntesis tal como están en el fuente?",
+        false,
+    );
+    println!();
+    let _ = actions::run_parse(&input, REMARK_MODE, preserve);
+    pause();
+}
 
-        // Create output bytes - with or without header
-        let output_bytes = if args.no_header {
-            // Just the program bytes without header
-            program_bytes
-        } else {
-            // Create header with program length and prepend it
-            let header = Header::new(&program_name, program_bytes.len() as u16);
-            let mut output_bytes = header.to_bytes();
-            output_bytes.extend(program_bytes);
-            output_bytes
-        };
+fn analyze_menu() {
+    let Some(input) = prompt_input_path() else { return };
+    println!();
+    let _ = actions::run_analyze(&input, REMARK_MODE);
+    pause();
+}
 
-        // Write to output file or default a.bin
-        let output_path = args.output.unwrap_or_else(|| PathBuf::from("a.bin"));
-        if let Err(e) = fs::write(&output_path, &output_bytes) {
-            eprintln!("Error writing output file {}: {}", output_path.display(), e);
-            std::process::exit(1);
-        }
-        let header_info = if args.no_header {
-            " (no header)"
-        } else {
-            " (with header)"
-        };
-        println!(
-            "Compiled program written to {}{}",
-            output_path.display(),
-            header_info
-        );
+// =============================================================================
+// HELPERS DE ENTRADA POR TERMINAL
+// =============================================================================
+
+/// Pide una línea de texto, mostrando `message` como indicación.
+///
+/// Devuelve `None` únicamente cuando `stdin` se ha agotado de verdad (EOF —
+/// Ctrl+D en un terminal interactivo, o el final de una entrada canalizada),
+/// nunca para una línea en blanco: `Ok(0)` bytes leídos es la señal de EOF
+/// del propio `read_line`, distinta de leer una línea vacía (`Ok(n>0)` con
+/// solo el salto de línea). Confundir ambos casos fue un bug real de la
+/// primera versión de este archivo: una vez agotada la entrada, cada
+/// llamada devolvía cadena vacía sin bloquear, y el menú principal la
+/// interpretaba como "opción no reconocida" indefinidamente, en un bucle
+/// que consumía CPU sin parar en vez de terminar.
+fn prompt(message: &str) -> Option<String> {
+    print!("{message}: ");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line.trim().to_string()),
+        Err(_) => None,
     }
+}
+
+/// Pide una ruta de archivo de entrada, repitiendo hasta que exista. Una
+/// línea vacía o el fin de la entrada (`prompt` devolviendo `None`)
+/// cancelan la operación y vuelven al menú.
+fn prompt_input_path() -> Option<PathBuf> {
+    loop {
+        let raw = prompt("Archivo BASIC de entrada (vacío para cancelar)")?;
+        if raw.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(&raw);
+        if path.is_file() {
+            return Some(path);
+        }
+        println!("No se encontró el archivo \"{raw}\". Inténtalo de nuevo.\n");
+    }
+}
+
+/// Ruta de salida: una línea vacía (o el fin de la entrada) usa `default`
+/// tal cual.
+fn prompt_output_path(default: &str) -> PathBuf {
+    let raw = prompt(&format!("Archivo de salida [{default}]")).unwrap_or_default();
+    if raw.is_empty() {
+        PathBuf::from(default)
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
+/// Pregunta de sí/no con valor por defecto si se pulsa Enter sin escribir
+/// nada, si la respuesta no se reconoce, o si la entrada terminó — para no
+/// bloquear el menú ni exigir una respuesta exacta.
+fn prompt_yes_no(message: &str, default_yes: bool) -> bool {
+    let hint = if default_yes { "S/n" } else { "s/N" };
+    let raw = prompt(&format!("{message} ({hint})"))
+        .unwrap_or_default()
+        .to_lowercase();
+    match raw.as_str() {
+        "" => default_yes,
+        "s" | "si" | "sí" | "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default_yes,
+    }
+}
+
+fn pause() {
+    let _ = prompt("\nPulsa Enter para volver al menú");
+}
+
+/// Ruta de salida por defecto sugerida para el archivo de entrada `input`,
+/// cambiando su extensión por `extension` (p.ej. "programa.bas" → "programa.lh5").
+fn default_output_for(input: &Path, extension: &str) -> String {
+    input.with_extension(extension).to_string_lossy().into_owned()
 }

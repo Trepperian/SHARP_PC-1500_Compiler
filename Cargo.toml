@@ -2,6 +2,13 @@
 name = "dull"
 version = "0.1.0"
 edition = "2021"
+# El paquete tiene dos binarios: `dull` (src/main.rs, el menú interactivo —
+# el ejecutable pensado para repartir) y `dull-cli` (src/bin/dull-cli.rs, la
+# CLI clásica de banderas). Sin `default-run`, `cargo run` sin `--bin` no
+# sabe cuál de los dos lanzar y falla pidiendo que se especifique uno — se
+# fija aquí a `dull-cli` porque durante el desarrollo es más rápido pasar
+# los parámetros como argumentos que contestar un menú cada vez.
+default-run = "dull-cli"
 
 [dependencies]
 clap = { version = "*", features = ["derive"] }
@@ -13,3 +20,17 @@ rand = "0.8"
 walkdir = "2"
 tempfile = "3"
 ceres-core = { path = "../PC-1500-Emulator/ceres-core" }
+
+# Perfil de los binarios que se distribuyen (`dull`, `dull-menu` de antes de
+# renombrar, `dull-cli`) — ver Anotaciones.md §16. `strip`/`lto`/
+# `codegen-units=1` reducen tamaño sin cambiar comportamiento; `panic =
+# "unwind"` se deja explícito (el valor por defecto) a propósito, no
+# "abort": el código usa `panic!` con mensajes descriptivos (p.ej.
+# "Undefined label: X") que conviene que se vean en el mensaje de error del
+# proceso, no solo como un cierre abrupto.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
