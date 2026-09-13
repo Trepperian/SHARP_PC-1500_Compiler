@@ -547,6 +547,19 @@ pub enum StackInstruction {
     /// ROM real imprime cada byte de la cadena como una columna, no el
     /// texto legible.
     GPrintString(usize),
+
+    /// gprint-string-dynamic - Pop puntero (16 bits) a un buffer
+    /// NUL-terminado de longitud NO conocida en tiempo de compilación
+    /// (variable de cadena escalar, o cualquier expresión de cadena cuya
+    /// longitud `gprint_string_length` no pueda determinar estáticamente)
+    /// — mismo par-de-dígitos-hex-por-columna que `GPrintString`, pero
+    /// el bucle se detiene al encontrar un byte NUL en vez de tras un
+    /// contador fijo. Bug real encontrado con `jackpot.bas`: `GPRINT A$`
+    /// (A$ escalar) y `GPRINT B$` (B$ releído de `DATA` en cada vuelta
+    /// del giro de los rodillos) antes caían en el caso "longitud no
+    /// determinable" de `gen_gprint`, que simplemente DESCARTABA el
+    /// puntero sin dibujar nada — los rodillos nunca se veían.
+    GPrintStringDynamic,
     GCursor,      // GCURSOR - Posicionar cursor gráfico
     Cursor,       // CURSOR - Posicionar cursor de texto
     LCursor,      // LCURSOR - Cursor de impresora
@@ -776,6 +789,7 @@ impl StackInstruction {
             // Gráficos
             StackInstruction::GPrint => "gprint".to_string(),
             StackInstruction::GPrintString(len) => format!("gprint-string({len})"),
+            StackInstruction::GPrintStringDynamic => "gprint-string-dynamic".to_string(),
             StackInstruction::GCursor => "gcursor".to_string(),
             StackInstruction::Cursor => "cursor".to_string(),
             StackInstruction::LCursor => "lcursor".to_string(),

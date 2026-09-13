@@ -946,6 +946,33 @@ impl Lh5801Backend {
         // 2. Activar la pantalla.
         self.emit_byte(0xFD); self.emit_byte(0xC1); // DON
 
+        // 2b. Limpiar la memoria REAL del matrix LCD (LCD_CLR) — no solo
+        // los 13 indicadores de estado (paso 4 más abajo). `MemoryBus::new()`
+        // rellena TODA `standard_user_system_memory` (donde vive el buffer
+        // de pantalla) con `INITIAL_VALUE=0xFF` — sin este paso, cualquier
+        // columna que el programa de usuario nunca toque explícitamente
+        // (ni con `CLS`, ni con `PRINT`/`CHAR_OUT`, ni con `GPRINT`) se
+        // queda mostrando esa basura de arranque como tinta permanente,
+        // en vez de la pantalla en blanco que la ROM real ya deja lista
+        // antes de que cualquier programa BASIC del usuario ejecute nada
+        // (su propia secuencia de arranque/RESET limpia la pantalla, algo
+        // que `load_lh5_file` se salta por completo al saltar directo al
+        // código de usuario). Encontrado con `jackpot.bas`: como el
+        // programa nunca llama a `CLS` (confía en que la pantalla ya
+        // empieza en blanco, y sus dos `PRINT` van precedidos de `CURSOR`
+        // explícito, lo que hace que `cls_if_no_cursor` — ver
+        // `StackInstruction::Cls`/`ClsIfNoCursor` — se salte el borrado a
+        // propósito, replicando el comportamiento real de la ROM), la
+        // mitad de la pantalla donde se dibujan los rodillos (vía
+        // `GCURSOR`/`GPRINT`) se quedaba con esa basura de fondo
+        // permanentemente, mientras que el lado del marcador de texto
+        // parecía correcto solo por coincidencia de qué columnas toca.
+        if let Some(addr) = self.rom_routines.address("LCD_CLR") {
+            self.emit_call_rom(addr);
+        } else {
+            eprintln!("WARNING: Rutina ROM LCD_CLR no encontrada");
+        }
+
         // 3. Estado de sistema limpio para texto/cursor.
         self.emit_byte(0xB5); // LDI A,#0
         self.emit_byte(0x00);
@@ -3991,6 +4018,68 @@ impl Lh5801Backend {
                 self.define_label(loop_done);
             }
 
+            StackInstruction::GPrintStringDynamic => {
+                // Como `GPrintString(len)`, pero para un puntero cuya
+                // longitud NO se conoce en tiempo de compilación (ver el
+                // comentario largo de `StackInstruction::GPrintStringDynamic`
+                // en stack_instruction.rs) — el bucle se detiene al leer
+                // un byte NUL en vez de tras un contador fijo.
+                //
+                // `LIN Y` (0x55) YA deja en el flag Z si el carácter
+                // leído es 0 (`lin()` en ceres-core llama a `check_z`
+                // sobre el valor cargado) — no hace falta ningún `CPI`
+                // aparte, mismo idioma de "leer y comprobar a la vez" ya
+                // usado en el resto de bucles de este backend.
+                self.emit_pop_a();
+                self.emit_byte(0x1A); // YL
+                self.emit_pop_a();
+                self.emit_byte(0x18); // YH
+
+                let gprint_out = self.rom_routines.address("GPRINT_OUT");
+                let mtrx_inc = self.rom_routines.address("MTRX_INC");
+
+                let loop_start = self.new_local_label("GPRINTSTRDYN_LOOP");
+                let loop_done = self.new_local_label("GPRINTSTRDYN_DONE");
+                self.define_label(loop_start.clone());
+
+                // Carácter alto: si es NUL (fin de cadena), terminar sin
+                // dibujar más columnas.
+                self.emit_byte(0x55); // LIN Y (LDA (Y); Y++; Z = (carácter==0))
+                self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si Z==0, carácter!=0: saltar el JMP y seguir)
+                self.emit_byte(0xBA); // JMP loop_done (si Z==1, carácter==0)
+                self.add_label_ref(loop_done.clone(), RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+
+                // Carácter alto (ya en A) -> nibble alto, guardado en ARX.
+                self.emit_hex_digit_to_nibble();
+                self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); self.emit_byte(0xD9); // SHL x4
+                self.emit_byte(0xAE); // STA addr (nibble alto)
+                self.emit_word(system_memory::ARX);
+
+                // Carácter bajo (se asume presente: todo el corpus usa
+                // cadenas hex de longitud par para GPRINT).
+                self.emit_byte(0x55); // LIN Y (LDA (Y); Y++)
+                self.emit_hex_digit_to_nibble();
+                self.emit_byte(0xAB); // OR addr (combinar con el nibble alto)
+                self.emit_word(system_memory::ARX);
+
+                if let Some(addr) = gprint_out {
+                    self.emit_call_rom(addr);
+                } else {
+                    eprintln!("WARNING: Rutina ROM GPRINT_OUT no encontrada");
+                }
+                if let Some(addr) = mtrx_inc {
+                    self.emit_call_rom(addr);
+                } else {
+                    eprintln!("WARNING: Rutina ROM MTRX_INC no encontrada");
+                }
+
+                self.emit_byte(0xBA); // JMP loop_start
+                self.add_label_ref(loop_start, RefType::Absolute16);
+                self.emit_label_placeholder(RefType::Absolute16);
+                self.define_label(loop_done);
+            }
+
             StackInstruction::GCursor => {
                 // GCURSOR n: posiciona el cursor GRÁFICO — en esta ROM es
                 // literalmente el mismo CURSOR_PTR/CURSOR_ENA que el
@@ -5464,12 +5553,17 @@ mod tests {
         let mut backend = Lh5801Backend::with_config(ORACLE_LOAD_ADDR, 0x47FF);
         let code = backend.generate(&[]);
 
-        // El prólogo de inicialización son exactamente 15 instrucciones
-        // (LDI S,#imm; DON [activar pantalla]; LDI A,#0; 7x STA addr;
-        // LDI A,#0x60; STA addr; LDI A,#0xFF; 2x STA addr [indicadores
-        // del LCD]) antes de tocar nada más (incluida la RTN final, cuyo
-        // destino no está garantizado aquí).
-        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 15);
+        // El prólogo de inicialización ya no es un puñado fijo de
+        // instrucciones sencillas: desde el fix de "jackpot.bas: mitad
+        // de pantalla sin limpiar" (ver `test_oracle_prologue_clears_lcd_matrix_memory_on_real_rom`),
+        // incluye una llamada real a `LCD_CLR` — un bucle ROM real sobre
+        // ~154 bytes de las dos páginas de pantalla, igual de caro que
+        // el resto de usos de `LCD_CLR` en este backend (`Cls`/`PRINT`
+        // ya necesitaron subir su presupuesto de 5.000 a 40.000
+        // instrucciones por el mismo motivo). Presupuesto generoso para
+        // dejar tiempo de sobra a que el prólogo completo (incluida esa
+        // llamada) termine antes de comprobar el estado final.
+        let pc1500 = run_lh5(ORACLE_LOAD_ADDR, &code, 40_000);
 
         assert_eq!(pc1500.cpu().s(), 0x47FF, "S debe inicializarse a stack_top");
         assert!(pc1500.cpu().display_enabled(), "la pantalla debe quedar activada (DON) — si no, update_display_buffer() nunca pinta nada");
@@ -6553,10 +6647,13 @@ mod tests {
         // arreglo — confirma que ya no se dibuja el doble de columnas
         // de las que corresponden.
         assert_eq!(recon(0x7700), 0xAB, "GPRINT \"AB\" columna 39: 1 columna, valor decodificado 0xAB");
-        // 0xFF, no 0x00: este test nunca llama a CLS, así que la memoria
-        // de vídeo está en su valor por defecto sin inicializar (ver
-        // `INITIAL_VALUE` en memory.rs), no a cero.
-        assert_eq!(recon(0x7702), 0xFF, "columna 40 no debe tocarse: \"AB\" es 1 sola columna, no 2");
+        // 0x00, no 0xFF: aunque este test nunca llama a CLS explícito, el
+        // PRÓLOGO del programa ya limpia la memoria de vídeo real (LCD_CLR,
+        // ver `test_oracle_prologue_clears_lcd_matrix_memory_on_real_rom`)
+        // antes de que el programa ejecute nada — así que cualquier
+        // columna nunca tocada por GPRINT queda a 0, no en su antiguo
+        // valor sin inicializar (ver `INITIAL_VALUE` en memory.rs).
+        assert_eq!(recon(0x7702), 0x00, "columna 40 no debe tocarse: \"AB\" es 1 sola columna, no 2");
         // A$(0)="3C" (array de ancho fijo, 2 caracteres = 1 par hex):
         // igual, 1 sola columna con el valor decodificado 0x3C.
         assert_eq!(recon_high(0x7600), 0x3C, "GPRINT A$(0)=\"3C\" columna 78: 1 columna, valor decodificado 0x3C");
@@ -6598,8 +6695,11 @@ mod tests {
         assert_eq!(recon(0x7604), 0x56, "columna 2: tercer par \"56\"");
         assert_eq!(recon(0x7606), 0x78, "columna 3: cuarto par \"78\"");
         assert_eq!(recon(0x7608), 0xAB, "columna 4: quinto par \"AB\", última vuelta del bucle");
-        // Ninguna columna más allá de la 4ª debe tocarse.
-        assert_eq!(recon(0x760A), 0xFF, "columna 5 no debe tocarse (0xFF = memoria de vídeo sin inicializar, sin CLS)");
+        // Ninguna columna más allá de la 4ª debe tocarse: 0x00 (no 0xFF)
+        // porque el PRÓLOGO ya limpia la memoria de vídeo real (LCD_CLR,
+        // ver `test_oracle_prologue_clears_lcd_matrix_memory_on_real_rom`),
+        // aunque este programa nunca llame a CLS explícito.
+        assert_eq!(recon(0x760A), 0x00, "columna 5 no debe tocarse");
     }
 
     /// `POINT(x)` debe leer exactamente lo que `GPRINT` escribió — el
@@ -7846,10 +7946,24 @@ mod tests {
         let code = backend.generate(&instructions);
 
         // CALL debe emitir 0xBE seguido de la dirección (high, low) de la
-        // etiqueta "sub", justo después de esta instrucción de 3 bytes. Se
-        // busca la posición en vez de asumir un tamaño de prólogo fijo.
-        let pos = code.iter().position(|&b| b == 0xBE).expect("No se encontró SJP (0xBE)");
-        let target = backend.get_start_address() + pos as u16 + 3;
+        // etiqueta "sub", justo después de esta instrucción de 3 bytes.
+        // El prólogo (`emit_initialization`) también emite sus propios
+        // `SJP` (p.ej. a `LCD_CLR`, ver el fix de "jackpot.bas: mitad de
+        // pantalla sin limpiar") — buscar el PRIMER 0xBE del código ya no
+        // basta, así que se recorren TODAS las apariciones y se elige la
+        // que apunta DENTRO de nuestro propio código generado (el target
+        // de las llamadas ROM del prólogo cae en `0xC000+`, fuera de este
+        // rango).
+        let start = backend.get_start_address();
+        let end = start + code.len() as u16;
+        let pos = (0..code.len())
+            .filter(|&i| code[i] == 0xBE && i + 2 < code.len())
+            .find(|&i| {
+                let target = u16::from_be_bytes([code[i + 1], code[i + 2]]);
+                target >= start && target < end
+            })
+            .expect("No se encontró ningún SJP (0xBE) cuyo destino caiga dentro del código generado");
+        let target = start + pos as u16 + 3;
         assert_eq!(code[pos + 1], (target >> 8) as u8);
         assert_eq!(code[pos + 2], (target & 0xFF) as u8);
     }
@@ -9717,5 +9831,185 @@ mod tests {
         let p_addr = *addrs.get("P$").unwrap() as u32;
         assert_eq!(read_str(o_addr), "ABCD", "primera ConcatString compartida");
         assert_eq!(read_str(p_addr), "EFGH", "segunda ConcatString compartida");
+    }
+
+    /// Bug real encontrado jugando `jackpot.bas`: la mitad de la
+    /// pantalla donde se dibujan los rodillos (vía `GCURSOR`/`GPRINT`)
+    /// se quedaba mostrando basura permanente ("como lo que ya había
+    /// antes"), mientras que el lado del marcador de texto salía bien.
+    /// Causa raíz: `MemoryBus::new()` rellena TODA
+    /// `standard_user_system_memory` (donde vive el buffer real del
+    /// matrix LCD) con `INITIAL_VALUE=0xFF` ("todo encendido"), y el
+    /// prólogo del backend (`emit_initialization`) nunca limpiaba esa
+    /// memoria — solo los 13 indicadores de estado (`DISPLAY_SYMBOLS`).
+    /// `jackpot.bas` nunca llama a `CLS` (confía en que la pantalla ya
+    /// empieza en blanco, como garantiza la propia secuencia de
+    /// arranque de la ROM real, que `load_lh5_file` se salta), y sus
+    /// dos únicos `PRINT` van precedidos de `CURSOR` explícito — lo que
+    /// hace que `ClsIfNoCursor` (réplica fiel de `CLR_NO_CURSOR` de la
+    /// ROM real) se salte el borrado a propósito, igual que en la ROM
+    /// real. Sin una limpieza incondicional en el prólogo, cualquier
+    /// columna nunca tocada explícitamente por el programa se queda
+    /// con esa basura de arranque para siempre. Arreglado añadiendo una
+    /// llamada a `LCD_CLR` en el prólogo (paso "2b" de
+    /// `emit_initialization`), incondicional para cualquier programa.
+    #[test]
+    fn test_oracle_prologue_clears_lcd_matrix_memory_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, load, ORACLE_LOAD_ADDR};
+
+        // Un programa mínimo que, como jackpot.bas, nunca llama a CLS y
+        // nunca dibuja nada — si el prólogo no limpiara la memoria real
+        // del matrix LCD (que `MemoryBus::new()` deja en 0xFF, "todo
+        // encendido"), la pantalla se vería completamente llena de tinta
+        // basura desde la primerísima instrucción, sin que el programa
+        // haya hecho nada todavía.
+        let source = "10 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = load(ORACLE_LOAD_ADDR, &code);
+
+        let display = pc1500.display();
+        let buf = display.rgba_buffer();
+        let mut lit_cols = Vec::new();
+        for x in 0..ceres_core::display::DISPLAY_WIDTH {
+            let mut any = false;
+            for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                let idx = (y * ceres_core::display::DISPLAY_WIDTH + x) * 4;
+                if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                lit_cols.push(x);
+            }
+        }
+
+        assert!(
+            lit_cols.is_empty(),
+            "el prólogo debería dejar la pantalla completamente en blanco (LCD_CLR), \
+             pero hay tinta en las columnas {lit_cols:?} — la memoria real del matrix LCD \
+             (inicializada a 0xFF, 'todo encendido', por MemoryBus::new()) no se está limpiando"
+        );
+    }
+
+    /// Segundo bug real encontrado jugando `jackpot.bas`, distinto del
+    /// de `LCD_CLR`: tras arreglar ese, la mitad izquierda pasó de
+    /// "basura permanente" a "completamente en blanco" — los rodillos
+    /// (dibujados vía `GCURSOR`/`GPRINT A$`/`GPRINT C$`/`GPRINT B$`, con
+    /// A$/C$/B$ siempre variables de cadena ESCALARES, nunca literales
+    /// ni elementos de array) nunca llegaban a dibujarse en absoluto.
+    ///
+    /// Causa raíz: `gprint_string_length` (mod.rs) no sabe calcular la
+    /// longitud en tiempo de compilación de una variable de cadena
+    /// escalar (a diferencia de un literal o de un elemento de array de
+    /// ancho fijo) — antes de este fix, `gen_gprint` simplemente
+    /// DESCARTABA el puntero de 16 bits ya empujado en ese caso (para no
+    /// desbalancear la pila software), sin dibujar ninguna columna.
+    /// Arreglado con una nueva instrucción, `GPrintStringDynamic`, que
+    /// recorre el buffer NUL-terminado en tiempo de EJECUCIÓN (mismo
+    /// principio que `SYSTEMOUTSTRING`, ya usada por `PRINT`) en vez de
+    /// necesitar una longitud fija de compilación.
+    #[test]
+    fn test_oracle_gprint_scalar_string_variable_draws_columns_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Mismo patrón exacto que jackpot.bas (líneas 110/130/140):
+        // GCURSOR con una expresión calculada (no un literal) + GPRINT
+        // sobre una variable de cadena escalar asignada antes.
+        let source = "\
+10 X=0:A=0:A$=\"7F2A7F2A41\"\n\
+20 GCURSOR X+A\n\
+30 GPRINT A$\n\
+40 END\n";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 20000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+
+        // "7F2A7F2A41" son 5 pares hex = 5 columnas, en 0x7600-0x7604
+        // (columnas 0-4, mismo layout que el resto de tests de GPRINT).
+        let recon = |adr: u32| -> u8 {
+            (pc1500.read_byte(adr) & 0x0F) | ((pc1500.read_byte(adr + 1) & 0x0F) << 4)
+        };
+        assert_eq!(recon(0x7600), 0x7F, "columna 0: primer par \"7F\"");
+        assert_eq!(recon(0x7602), 0x2A, "columna 1: segundo par \"2A\"");
+        assert_eq!(recon(0x7604), 0x7F, "columna 2: tercer par \"7F\"");
+        assert_eq!(recon(0x7606), 0x2A, "columna 3: cuarto par \"2A\"");
+        assert_eq!(recon(0x7608), 0x41, "columna 4: quinto y último par \"41\"");
+        // La columna 5 no debe tocarse — confirma que el bucle se
+        // detuvo al llegar al NUL, no que siguió leyendo memoria de
+        // más allá del buffer.
+        assert_eq!(recon(0x760A), 0x00, "columna 5 no debe tocarse (fin de cadena)");
+
+        assert_eq!(
+            pc1500.cpu().s(), ORACLE_STACK_TOP,
+            "S debe volver a stack_top: S={:#06X}", pc1500.cpu().s()
+        );
+    }
+
+    /// Bug real (regresión) encontrado jugando `bombing.bas` de nuevo
+    /// tras los fixes de `jackpot.bas` de esta misma sesión: la pantalla
+    /// final de "SCORE" (tras estrellarse) había dejado de limpiarse por
+    /// completo — mismo síntoma visual (restos de la ciudad y del
+    /// marcador antiguo a la derecha del texto) que ya se había
+    /// investigado y cerrado el 2026-09-01, pero por una causa DISTINTA
+    /// esta vez.
+    ///
+    /// Causa raíz: `CLR_NO_CURSOR` (la rutina ROM real detrás de
+    /// `ClsIfNoCursor`) tiene documentado `preserved: "CURSOR_ENA (no lo
+    /// modifica)"` — una vez que un `CURSOR`/`GCURSOR` pone `CURSOR_ENA`
+    /// a 1, se queda así indefinidamente hasta un `CLS`/`INIT_CURS`
+    /// explícito, sin importar cuántas sentencias NO relacionadas se
+    /// ejecuten entre medias. `gen_print`/`gen_pause` emitían
+    /// `ClsIfNoCursor` INCONDICIONALMENTE (confiando siempre en ese flag
+    /// de ejecución) — el patrón real de bombing.bas: `GCURSOR P-2:PRINT
+    /// "*"` (pone CURSOR_ENA=1, correctamente preservado por ESE PRINT)
+    /// seguido, varias sentencias después y sin relación alguna, de
+    /// `WAIT :USING :PRINT "*** SCORE..."` — este último heredaba el
+    /// `CURSOR_ENA=1` obsoleto y también se saltaba el borrado.
+    ///
+    /// Arreglado con `StackCodeGenerator::last_stmt_was_cursor_positioning`
+    /// (ver su comentario largo en mod.rs): `gen_print`/`gen_pause` solo
+    /// confían en el flag de ejecución cuando la sentencia
+    /// INMEDIATAMENTE anterior (conocida con certeza en tiempo de
+    /// compilación) fue de verdad `CURSOR`/`GCURSOR`; cualquier otro caso
+    /// fuerza `Cls` incondicional.
+    #[test]
+    fn test_oracle_print_clears_screen_even_after_stale_cursor_enable_from_earlier_statement_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Mismo patrón exacto que bombing.bas: GCURSOR+PRINT (debe
+        // preservar, es el caso adyacente ya cubierto por otro test),
+        // luego una sentencia NO relacionada (FOR/NEXT), luego un PRINT
+        // que SÍ debe limpiar pese al CURSOR_ENA obsoleto.
+        let source = "\
+10 GCURSOR 150:GPRINT 255\n\
+20 GCURSOR 0:PRINT \"*\"\n\
+30 FOR I=1 TO 3:NEXT I\n\
+40 PRINT \"SCORE\"\n\
+50 END\n";
+        let code = compile_native(source);
+        let mut pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 100_000);
+
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+
+        // La marca dejada por el GCURSOR/GPRINT de la línea 10 (columna
+        // 150) NO debe sobrevivir al PRINT de la línea 40 — si el borrado
+        // se saltó (bug), seguiría encendida.
+        let display = pc1500.display();
+        let buf = display.rgba_buffer();
+        let mut any_ink_col_150 = false;
+        for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+            let idx = (y * ceres_core::display::DISPLAY_WIDTH + 150) * 4;
+            if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                any_ink_col_150 = true;
+            }
+        }
+        assert!(
+            !any_ink_col_150,
+            "la columna 150 (marca de la línea 10) debería haberse borrado por el PRINT \
+             de la línea 40 (precedido por FOR/NEXT, no por CURSOR/GCURSOR) — CURSOR_ENA \
+             obsoleto del GCURSOR de la línea 20 no debería seguir suprimiendo el borrado"
+        );
     }
 }

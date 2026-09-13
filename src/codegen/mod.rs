@@ -156,6 +156,44 @@ pub struct StackCodeGenerator {
     /// riesgo de acabar en callejón sin salida, como pasó con `RND`).
     current_using_format: Option<UsingFormat>,
 
+    /// `true` si la ÚLTIMA sentencia generada (a nivel de `gen_statement`,
+    /// no de línea completa) fue `CURSOR`/`GCURSOR` — decide, en
+    /// `gen_print`/`gen_pause`, si el borrado de pantalla debe consultar
+    /// el flag de tiempo de ejecución `CURSOR_ENA` (`ClsIfNoCursor`,
+    /// réplica de `CLR_NO_CURSOR`) o borrar siempre de forma incondicional
+    /// (`Cls`).
+    ///
+    /// Bug real encontrado con `bombing.bas` (línea 310, tras arreglar
+    /// `LCD_CLR`/`GPrintStringDynamic` con jackpot.bas): la pantalla final
+    /// de "SCORE" dejaba de limpiarse por completo, con restos de la
+    /// ciudad y del marcador antiguo visibles — un bug regresivo respecto
+    /// a un fix ya confirmado y cerrado el 2026-09-01. Causa raíz
+    /// confirmada leyendo `rom_routines.rs`: `CLR_NO_CURSOR` tiene
+    /// documentado `preserved: "CURSOR_ENA (no lo modifica)"` — una vez
+    /// que CUALQUIER `CURSOR`/`GCURSOR` pone `CURSOR_ENA` a 1, se queda
+    /// así indefinidamente hasta la práctica de un `CLS`/`INIT_CURS`
+    /// explícito, SIN IMPORTAR cuántas sentencias NO relacionadas se
+    /// ejecuten entre medias. Patrón real de bombing.bas: línea 290
+    /// (`GCURSOR P-2:PRINT "*"`) pone `CURSOR_ENA=1` (correctamente
+    /// preservado por el `PRINT "*"` adyacente, que no debe limpiar);
+    /// pero la línea 310 (`WAIT :USING :PRINT "*** SCORE...`), varias
+    /// sentencias NO relacionadas después, hereda ese `CURSOR_ENA=1`
+    /// obsoleto y también se salta el borrado — confirmado empíricamente
+    /// con el oráculo (`CURSOR_ENA` seguía en `0x01` justo antes del
+    /// `PRINT` final). El mecanismo `ClsIfNoCursor` en sí es correcto
+    /// para el patrón ADYACENTE (`CURSOR n:PRINT`/`GCURSOR n:PRINT`, el
+    /// caso real de invader-v2.bas que motivó su creación) — el gap es
+    /// que antes se usaba SIEMPRE, sin importar qué sentencia viniera
+    /// justo antes. Con este campo, solo se confía en el flag de
+    /// ejecución cuando la sentencia INMEDIATAMENTE anterior (en tiempo
+    /// de COMPILACIÓN, se conoce con certeza) fue de verdad
+    /// `CURSOR`/`GCURSOR` — cualquier otro caso fuerza el borrado
+    /// incondicional, sin depender de un estado de ROM cuyo mecanismo
+    /// exacto de "consumo" (qué lo resetea a 0 en la ROM real entre
+    /// sentencias no relacionadas) no se ha podido confirmar sin
+    /// arriesgarse a más desensamblado especulativo.
+    last_stmt_was_cursor_positioning: bool,
+
     /// `true` si el programa usa `SQR` alguna vez — controla si
     /// `generate()` emite la subrutina compartida `__SQR_ROUTINE` (ver el
     /// comentario de `FunctionInner::Sqr`). Emitirla siempre, la use el
@@ -334,6 +372,7 @@ impl StackCodeGenerator {
             word_variables: std::collections::HashSet::new(),
             authentic_timing,
             current_using_format: None,
+            last_stmt_was_cursor_positioning: false,
             sqr_used: false,
             dynamic_array_heap_initialized: false,
             all_string_labels: Vec::new(),
@@ -737,6 +776,17 @@ impl StackCodeGenerator {
     /// Generar código para una sentencia
     /// Dispatcher principal para todas las sentencias del lenguaje
     fn gen_statement(&mut self, stmt: &Statement) {
+        // Ver el comentario largo de `last_stmt_was_cursor_positioning`:
+        // se calcula ANTES de generar esta sentencia (para no interferir
+        // con su propio efecto) y se aplica DESPUÉS de despacharla, así
+        // que `gen_print`/`gen_pause` (llamadas desde dentro del `match`
+        // de abajo) siguen viendo el valor dejado por la sentencia
+        // ANTERIOR mientras generan su propio código.
+        let this_stmt_is_cursor_positioning = matches!(
+            &stmt.inner,
+            StatementInner::Cursor { .. } | StatementInner::GCursor { .. }
+        );
+
         match &stmt.inner {
             // === ASIGNACIÓN ===
             StatementInner::Let { inner, .. } => self.gen_let(inner),
@@ -829,6 +879,19 @@ impl StackCodeGenerator {
                 }
             }
         }
+
+        // `Multi` no es en sí mismo una sentencia CURSOR/GCURSOR, pero ya
+        // ha actualizado el flag correctamente a través de la recursión
+        // de arriba (cada sub-sentencia lo actualiza según SU propio
+        // tipo) — sobreescribirlo aquí con `false` porque `Multi` no es
+        // "cursor" lo dejaría mal para el caso real
+        // `GCURSOR X:PRINT A$` (ambas dentro de un único `Multi`, p.ej.
+        // como consecuente de un `IF`): el `PRINT` interior ya consultó
+        // el flag correcto durante la recursión, así que solo hace falta
+        // NO tocarlo de nuevo para `Multi` en sí.
+        if !matches!(&stmt.inner, StatementInner::Multi(_)) {
+            self.last_stmt_was_cursor_positioning = this_stmt_is_cursor_positioning;
+        }
     }
     
     // =========================================================================
@@ -920,12 +983,21 @@ impl StackCodeGenerator {
                 matches!(printable, crate::parse::statement::printable::Printable::UsingClause(_))
             });
         if !has_using {
-            // No es el `Cls` incondicional (LCD_CLR+INIT_CURS): la ROM
-            // real llama a `CLR_NO_CURSOR`, que respeta un `CURSOR n`
-            // que acabe de posicionar el cursor (bug real de
-            // invader-v2.bas — ver el comentario largo de
-            // `StackInstruction::ClsIfNoCursor`).
-            self.emit(StackInstruction::ClsIfNoCursor);
+            // `ClsIfNoCursor` (CLR_NO_CURSOR real) SOLO si la sentencia
+            // INMEDIATAMENTE anterior fue `CURSOR`/`GCURSOR` — ver el
+            // comentario largo de `last_stmt_was_cursor_positioning`
+            // (bug real de bombing.bas: `CURSOR_ENA` se queda a 1
+            // indefinidamente hasta un CLS/INIT_CURS explícito, así que
+            // usar el flag de ejecución SIEMPRE hacía que un `PRINT`
+            // varias sentencias después de un `CURSOR`/`GCURSOR` no
+            // relacionado también se saltara el borrado). Cualquier otro
+            // caso (nada antes, o cualquier sentencia que no sea
+            // CURSOR/GCURSOR) borra siempre, sin depender de ese flag.
+            if self.last_stmt_was_cursor_positioning {
+                self.emit(StackInstruction::ClsIfNoCursor);
+            } else {
+                self.emit(StackInstruction::Cls);
+            }
         }
 
         for (printable, sep) in &print_inner.exprs {
@@ -1952,13 +2024,21 @@ impl StackCodeGenerator {
         //
         // Actualización: no es el `Cls` incondicional — es `CLR_NO_CURSOR`,
         // que SOLO limpia si `CURSOR_ENA` bit0=0 (ver
-        // `StackInstruction::ClsIfNoCursor`). En los usos de bombing.bas
-        // que motivaron este fix no había ningún `CURSOR n` justo antes,
-        // así que el comportamiento observado (limpia siempre) no cambia
-        // para ese caso — pero si algún programa hace `CURSOR n:PAUSE
-        // ...`, debe preservar posición/contenido igual que `PRINT`,
-        // porque comparten literalmente el mismo código de ROM.
-        self.emit(StackInstruction::ClsIfNoCursor);
+        // `StackInstruction::ClsIfNoCursor`), y SOLO cuando la sentencia
+        // INMEDIATAMENTE anterior fue `CURSOR`/`GCURSOR` (ver el
+        // comentario largo de `last_stmt_was_cursor_positioning` — mismo
+        // bug de `CURSOR_ENA` obsoleto ya corregido para `PRINT`, PAUSE
+        // comparte literalmente el mismo mecanismo de la ROM real). En
+        // los usos de bombing.bas que motivaron el fix original no había
+        // ningún `CURSOR n` justo antes, así que el comportamiento
+        // observado (limpia siempre) no cambia para ese caso — pero si
+        // algún programa hace `CURSOR n:PAUSE ...`, debe preservar
+        // posición/contenido igual que `PRINT`.
+        if self.last_stmt_was_cursor_positioning {
+            self.emit(StackInstruction::ClsIfNoCursor);
+        } else {
+            self.emit(StackInstruction::Cls);
+        }
         // PAUSE es similar a PRINT pero pausa después
         for (printable, sep) in &print_inner.exprs {
             match printable {
@@ -2092,29 +2172,25 @@ impl StackCodeGenerator {
                     Some(len) => self.emit(StackInstruction::GPrintString(len)),
                     None => {
                         // `gen_expression`+`gen_acc_val` ya empujaron el
-                        // puntero (16 bits) de la cadena — si no sabemos
-                        // su longitud en tiempo de compilación, no
-                        // dejarlo ahí sin más: eso filtra 2 bytes en la
-                        // pila software por cada llamada. Bug real
-                        // encontrado compilando bombing.bas: `GPRINT
-                        // MID$ (A$,RND 5*2-1,2)` (perfil de ciudad, 100
-                        // veces por partida) caía justo aquí — la
-                        // ciudad nunca se dibujaba (ningún GPRINT real
-                        // se emitía) Y además desincronizaba la pila
-                        // para el resto del programa. Arreglado en dos
-                        // frentes: `gprint_string_length` ahora sí
-                        // reconoce `MID$`/`LEFT$`/`RIGHT$` cuando su
-                        // longitud es una constante (el caso real de
-                        // bombing.bas), y este `None` — que debería ser
-                        // un caso ya raro tras ese fix — al menos
-                        // descarta el puntero en vez de dejarlo fugado.
-                        self.emit_comment(
-                            "GPRINT de cadena con longitud no determinable en tiempo de \
-                             compilación (p.ej. variable escalar): no soportado todavía — \
-                             descartando el puntero ya empujado para no desbalancear la pila",
-                        );
-                        self.emit(StackInstruction::Desapila);
-                        self.emit(StackInstruction::Desapila);
+                        // puntero (16 bits) de la cadena. Cuando no
+                        // conocemos su longitud en tiempo de compilación
+                        // (variable de cadena escalar, o cualquier otra
+                        // expresión de cadena no cubierta por
+                        // `gprint_string_length`), usamos la versión
+                        // dinámica: recorre el buffer NUL-terminado en
+                        // tiempo de EJECUCIÓN (mismo principio que
+                        // `SYSTEMOUTSTRING`, usada por `PRINT`), en vez
+                        // de descartar el puntero sin dibujar nada. Bug
+                        // real encontrado con `jackpot.bas`: `GPRINT A$`/
+                        // `GPRINT C$` (escalares) y `GPRINT B$` (releído
+                        // de `DATA` en cada vuelta del giro de los
+                        // rodillos) caían aquí y los rodillos nunca se
+                        // veían — antes de este fix, este caso solo
+                        // descartaba el puntero (necesario únicamente
+                        // para no desbalancear la pila, ver el bug
+                        // histórico de bombing.bas con `MID$` documentado
+                        // en el commit que introdujo ese descarte).
+                        self.emit(StackInstruction::GPrintStringDynamic);
                     }
                 }
             } else {
