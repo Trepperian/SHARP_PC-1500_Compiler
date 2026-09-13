@@ -131,7 +131,15 @@ fn main() {
     } else if args.stack_code {
         actions::run_stack_code(&input_path, remark_opt, args.output, args.execute, args.verbose)
     } else if args.native_code {
-        actions::run_native_code(&input_path, remark_opt, args.output, args.authentic_timing)
+        // `run_native_code` distingue "cuántas vueltas de espera" de "activado
+        // o no" (ver su comentario) — la bandera de esta CLI sigue siendo un
+        // simple interruptor, así que activada equivale al valor "auténtico"
+        // por defecto (AUTHENTIC_TIMING_DELAY_ITERATIONS); quien quiera un
+        // ritmo intermedio tiene el menú interactivo (`dull`) para elegirlo.
+        let authentic_timing = args.authentic_timing.then_some(
+            dull::codegen::lh5801_backend::AUTHENTIC_TIMING_DELAY_ITERATIONS,
+        );
+        actions::run_native_code(&input_path, remark_opt, args.output, authentic_timing)
     } else {
         actions::run_tokenize(
             &input_path,

@@ -22,6 +22,7 @@
 //! preguntas que sus banderas equivalentes en `dull-cli`.
 
 use dull::actions;
+use dull::codegen::lh5801_backend::AUTHENTIC_TIMING_DELAY_ITERATIONS;
 use dull::lex::RemarkLexOption;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -87,14 +88,12 @@ fn print_menu() {
 // UNA OPCIÓN DE MENÚ POR CADA MODO DE dull::actions
 // =============================================================================
 
-/// Opción 1 — la más sencilla a propósito: solo entrada y salida.
+/// Opción 1 — la más sencilla a propósito: solo entrada y salida (más el
+/// ritmo de ejecución, ver `prompt_timing`).
 fn native_code_menu() {
     let Some(input) = prompt_input_path() else { return };
     let output = prompt_output_path(&default_output_for(&input, "lh5"));
-    let authentic_timing = prompt_yes_no(
-        "¿Activar el ritmo de ejecución auténtico (--authentic-timing)?",
-        false,
-    );
+    let authentic_timing = prompt_timing();
     println!();
     let _ = actions::run_native_code(&input, REMARK_MODE, Some(output), authentic_timing);
     pause();
@@ -205,6 +204,39 @@ fn prompt_output_path(default: &str) -> PathBuf {
         PathBuf::from(default)
     } else {
         PathBuf::from(raw)
+    }
+}
+
+/// Ritmo de ejecución del código nativo generado: cuántas vueltas de
+/// espera calibrada insertar tras cada sentencia (ver
+/// `StackInstruction::AuthenticTimingDelay`). Enter sin escribir nada usa
+/// el valor "auténtico" (`AUTHENTIC_TIMING_DELAY_ITERATIONS`, calibrado a
+/// mano contra la ROM real) — es la opción por defecto, no la velocidad
+/// nativa sin más: un compilado sin ningún ritmo ejecuta la misma lógica
+/// en una fracción de segundo respecto al BASIC interpretado original (ver
+/// el comentario largo de esa instrucción). Un número menor acelera la
+/// ejecución; "0" desactiva el mecanismo del todo, dando el código
+/// byte-idéntico al que se generaría sin él.
+fn prompt_timing() -> Option<u8> {
+    let raw = prompt(&format!(
+        "Vueltas de espera por sentencia (ritmo de ejecución) \
+         [{AUTHENTIC_TIMING_DELAY_ITERATIONS} = auténtico, menos = más rápido, \
+         0 = velocidad nativa sin espera, Enter = {AUTHENTIC_TIMING_DELAY_ITERATIONS}]"
+    ))
+    .unwrap_or_default();
+
+    if raw.is_empty() {
+        return Some(AUTHENTIC_TIMING_DELAY_ITERATIONS);
+    }
+    match raw.parse::<u8>() {
+        Ok(0) => None,
+        Ok(n) => Some(n),
+        Err(_) => {
+            println!(
+                "Valor no reconocido, se usará el ritmo auténtico ({AUTHENTIC_TIMING_DELAY_ITERATIONS})."
+            );
+            Some(AUTHENTIC_TIMING_DELAY_ITERATIONS)
+        }
     }
 }
 

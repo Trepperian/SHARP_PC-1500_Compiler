@@ -86,7 +86,16 @@ const WAIT_MIN_TICKS: u8 = 3;
 /// usuario (mismo proceso ya usado para `WAIT_MIN_TICKS` y las copias
 /// `_demo.bas`, aquí de una sola vez en vez de por programa) — subir
 /// este valor para ir más lento, bajarlo para ir más rápido.
-const AUTHENTIC_TIMING_DELAY_ITERATIONS: u8 = 3;
+///
+/// Es solo el valor POR DEFECTO ("auténtico") que usan `Lh5801Backend::new`/
+/// `with_config` si nadie llama a `set_authentic_timing_iterations` — desde
+/// que el menú interactivo (`dull`, `src/main.rs`) permite elegir el ritmo
+/// de ejecución, el valor que de verdad se hornea en la subrutina
+/// compartida es el campo de instancia `authentic_timing_iterations`, no
+/// esta constante directamente (ver su uso más abajo, dentro de
+/// `emit_shared_subroutines`). `pub` para que el menú pueda mostrar este
+/// mismo valor como "el auténtico" sin duplicar el número mágico.
+pub const AUTHENTIC_TIMING_DELAY_ITERATIONS: u8 = 3;
 
 /// Generador de código LH5801
 pub struct Lh5801Backend {
@@ -162,6 +171,19 @@ pub struct Lh5801Backend {
     /// Ver el comentario de esa función y el de `emit_initialization` para
     /// por qué el prólogo la pone a 0 de forma incondicional.
     variable_region: Option<(u16, u16)>,
+
+    /// Vueltas de espera por sentencia que hornea la subrutina compartida
+    /// `AUTHENTIC_TIMING_DELAY` (ver `StackInstruction::AuthenticTimingDelay`
+    /// y el comentario de `AUTHENTIC_TIMING_DELAY_ITERATIONS` más arriba en
+    /// este archivo) — solo importa si el programa realmente emite esa
+    /// instrucción (`StackCodeGenerator::authentic_timing == true`); si no,
+    /// este campo nunca se lee. Se inicializa al valor "auténtico" por
+    /// defecto en `new()`/`with_config()`, y `set_authentic_timing_iterations`
+    /// permite sobreescribirlo — usado por `compile_native_two_pass_with_timing`
+    /// para que el menú interactivo (`dull`) pueda ofrecer un ritmo más
+    /// rápido que el auténtico, en vez de solo activar/desactivar el
+    /// mecanismo.
+    authentic_timing_iterations: u8,
 }
 
 /// Tipo de referencia a etiqueta
@@ -237,6 +259,7 @@ impl Lh5801Backend {
             used_shared_routines: std::collections::HashSet::new(),
             concat_string_params: None,
             variable_region: None,
+            authentic_timing_iterations: AUTHENTIC_TIMING_DELAY_ITERATIONS,
         }
     }
 
@@ -257,6 +280,7 @@ impl Lh5801Backend {
             used_shared_routines: std::collections::HashSet::new(),
             concat_string_params: None,
             variable_region: None,
+            authentic_timing_iterations: AUTHENTIC_TIMING_DELAY_ITERATIONS,
         }
     }
 
@@ -268,6 +292,18 @@ impl Lh5801Backend {
     /// su propio recorrido) y se la pasa al backend antes de generar.
     pub fn set_variable_region(&mut self, data_base: u16, size: u16) {
         self.variable_region = Some((data_base, size));
+    }
+
+    /// Sobreescribe las vueltas de espera por sentencia del mecanismo de
+    /// ritmo auténtico (ver el comentario del campo
+    /// `authentic_timing_iterations`) — por defecto ya vale
+    /// `AUTHENTIC_TIMING_DELAY_ITERATIONS` sin llamar a esto. Debe llamarse
+    /// ANTES de `generate()`, igual que `set_variable_region`. Sin efecto
+    /// alguno si el programa no activa `--authentic-timing`/la opción
+    /// correspondiente del menú: el valor solo se hornea en la subrutina
+    /// compartida si esta llega a emitirse.
+    pub fn set_authentic_timing_iterations(&mut self, iterations: u8) {
+        self.authentic_timing_iterations = iterations;
     }
 
     /// Marca la subrutina compartida `name` como usada (para que
@@ -646,7 +682,7 @@ impl Lh5801Backend {
             // hacen).
             self.define_label("__SHARED_AUTHENTIC_TIMING_DELAY".to_string());
 
-            self.emit_byte(0x4A); self.emit_byte(AUTHENTIC_TIMING_DELAY_ITERATIONS); // LDI XL,#N
+            self.emit_byte(0x4A); self.emit_byte(self.authentic_timing_iterations); // LDI XL,#N
 
             let outer_label = self.new_local_label("TIMING_DELAY_OUTER");
             let inner_label = self.new_local_label("TIMING_DELAY_INNER");
@@ -8619,14 +8655,14 @@ mod tests {
 
     /// Garantía de riesgo cero para el mecanismo genérico de ritmo
     /// (`--authentic-timing`, ver `StackInstruction::AuthenticTimingDelay`):
-    /// sin la bandera, `compile_native_two_pass_with_timing(...,false)`
-    /// (a la que `compile_native_two_pass` — y por tanto TODO el código y
-    /// los 130+ tests ya existentes antes de este mecanismo — delega)
-    /// debe producir exactamente los mismos bytes que antes de que este
-    /// mecanismo existiera. Comparado aquí contra `compile_native` (el
-    /// camino "de siempre") en vez de solo confiar en la lectura del
-    /// código: si algún día alguien mueve el `if self.authentic_timing`
-    /// de sitio por error, este test lo detecta.
+    /// sin él, `compile_native_two_pass_with_timing(...,None)` (a la que
+    /// `compile_native_two_pass` — y por tanto TODO el código y los 130+
+    /// tests ya existentes antes de este mecanismo — delega) debe producir
+    /// exactamente los mismos bytes que antes de que este mecanismo
+    /// existiera. Comparado aquí contra `compile_native` (el camino "de
+    /// siempre") en vez de solo confiar en la lectura del código: si algún
+    /// día alguien mueve el `if self.authentic_timing` de sitio por error,
+    /// este test lo detecta.
     #[test]
     fn test_oracle_authentic_timing_off_produces_byte_identical_code_to_before_the_mechanism_existed() {
         use crate::codegen::test_oracle::compile_native;
@@ -8646,7 +8682,7 @@ mod tests {
         let (program, errors) = parser.parse_with_error_recovery();
         assert!(errors.is_empty());
         let (_, via_timing_off, _) =
-            compile_native_two_pass_with_timing(&program, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP, false);
+            compile_native_two_pass_with_timing(&program, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP, None);
 
         assert_eq!(
             via_compile_native, via_timing_off,

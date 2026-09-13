@@ -215,17 +215,20 @@ pub fn run_stack_code(
 /// máquina LH5801 nativo (`compile_native_two_pass_with_timing`) y lo
 /// empaqueta en el formato binario `.lh5` (ver `codegen::lh5_format`).
 ///
-/// `authentic_timing` activa `--authentic-timing`: inserta una espera
-/// calibrada tras cada sentencia compilada para acercar el ritmo de
-/// ejecución al del BASIC tokenizado interpretado en la ROM real (ver el
-/// comentario de esa bandera en `main.rs`/`StackCodeGenerator::authentic_timing`).
-/// Desactivado por defecto — con `false` el `.lh5` generado es exactamente
-/// igual que sin este mecanismo.
+/// `authentic_timing`: `None` desactiva el mecanismo de ritmo de ejecución
+/// (el `.lh5` generado es exactamente igual que sin él). `Some(n)` lo
+/// activa insertando una espera calibrada de `n` vueltas tras cada
+/// sentencia compilada, para acercar el ritmo de ejecución al del BASIC
+/// tokenizado interpretado en la ROM real — `n =
+/// codegen::lh5801_backend::AUTHENTIC_TIMING_DELAY_ITERATIONS` es el valor
+/// "auténtico" calibrado a mano; un `n` menor acelera la ejecución sin
+/// desactivar el mecanismo del todo (ver el comentario largo de
+/// `StackInstruction::AuthenticTimingDelay`).
 pub fn run_native_code(
     path: &Path,
     remark_opt: RemarkLexOption,
     output: Option<PathBuf>,
-    authentic_timing: bool,
+    authentic_timing: Option<u8>,
 ) -> Result<(), ()> {
     let (source, filename, tokens) = read_and_lex(path, remark_opt)?;
     let program = parse_with_report(tokens, &filename, &source)?;
@@ -237,8 +240,11 @@ pub fn run_native_code(
 
     println!("Generados {} bytes de código máquina LH5801", machine_code.len());
     println!("Dirección de carga: 0x{:04X}", load_address);
-    if authentic_timing {
-        println!("Ritmo de ejecución: espera calibrada activada (--authentic-timing)");
+    if let Some(iterations) = authentic_timing {
+        let vueltas = if iterations == 1 { "vuelta" } else { "vueltas" };
+        println!(
+            "Ritmo de ejecución: espera calibrada activada ({iterations} {vueltas} por sentencia)"
+        );
     }
 
     // Aviso temprano si el código generado no cabe en la RAM de usuario REAL

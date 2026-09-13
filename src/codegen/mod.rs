@@ -3775,30 +3775,44 @@ pub fn compile_native_two_pass(
     start_address: u16,
     stack_top: u16,
 ) -> (u16, Vec<u8>, HashMap<String, usize>) {
-    compile_native_two_pass_with_timing(program, start_address, stack_top, false)
+    compile_native_two_pass_with_timing(program, start_address, stack_top, None)
 }
 
 /// Como [`compile_native_two_pass`], pero además controla el mecanismo
 /// genérico de ritmo de ejecución (ver el comentario de
 /// `StackCodeGenerator::authentic_timing`) — `compile_native_two_pass`
 /// sigue existiendo, sin cambiar su firma, y llama aquí con
-/// `authentic_timing=false`, así que cualquier llamador existente (todo
+/// `authentic_timing=None`, así que cualquier llamador existente (todo
 /// el código y los tests ya escritos antes de este mecanismo) sigue
 /// produciendo exactamente el mismo `.lh5`, byte a byte.
+///
+/// `authentic_timing`: `None` desactiva el mecanismo por completo (ninguna
+/// instrucción `AuthenticTimingDelay` se emite, código byte-idéntico a
+/// como si no existiera). `Some(n)` lo activa con `n` vueltas de espera
+/// por sentencia — `n = lh5801_backend::AUTHENTIC_TIMING_DELAY_ITERATIONS`
+/// es el valor "auténtico" calibrado a mano contra la ROM real; un `n`
+/// menor acerca la ejecución a la velocidad nativa sin desactivar el
+/// mecanismo del todo (ver el menú interactivo, `dull`/`src/main.rs`, que
+/// deja elegir este número en vez de solo activar/desactivar).
 pub fn compile_native_two_pass_with_timing(
     program: &Program,
     start_address: u16,
     stack_top: u16,
-    authentic_timing: bool,
+    authentic_timing: Option<u8>,
 ) -> (u16, Vec<u8>, HashMap<String, usize>) {
     use lh5801_backend::Lh5801Backend;
 
+    let timing_enabled = authentic_timing.is_some();
+    let timing_iterations =
+        authentic_timing.unwrap_or(lh5801_backend::AUTHENTIC_TIMING_DELAY_ITERATIONS);
+
     let mut first_pass_gen = StackCodeGenerator::with_data_base_and_timing(
         DEFAULT_DATA_BASE_PLACEHOLDER,
-        authentic_timing,
+        timing_enabled,
     );
     let first_pass_instructions = first_pass_gen.generate(program);
     let mut first_pass_backend = Lh5801Backend::with_config(start_address, stack_top);
+    first_pass_backend.set_authentic_timing_iterations(timing_iterations);
     // La pasada 1 debe emitir el MISMO prólogo (mismo tamaño en bytes)
     // que emitirá la pasada 2, o `first_pass_code.len()` mide el tamaño
     // equivocado y `real_data_base` solapa con el propio código — mismo
@@ -3819,9 +3833,10 @@ pub fn compile_native_two_pass_with_timing(
     let real_data_base = start_address as usize + first_pass_code.len();
 
     let mut second_pass_gen =
-        StackCodeGenerator::with_data_base_and_timing(real_data_base, authentic_timing);
+        StackCodeGenerator::with_data_base_and_timing(real_data_base, timing_enabled);
     let second_pass_instructions = second_pass_gen.generate(program);
     let mut second_pass_backend = Lh5801Backend::with_config(start_address, stack_top);
+    second_pass_backend.set_authentic_timing_iterations(timing_iterations);
     // Poner a 0 TODA la región de variables en el prólogo — ver el
     // comentario en `Lh5801Backend::set_variable_region`/`emit_initialization`
     // (bug real: la GUI reutiliza el mismo `Pc1500` al pulsar "Cargar",

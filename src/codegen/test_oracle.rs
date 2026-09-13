@@ -184,7 +184,11 @@ pub fn compile_native_with_timing(source: &str) -> Vec<u8> {
     let (program, parse_errors) = parser.parse_with_error_recovery();
     assert!(parse_errors.is_empty(), "errores de parseo en fuente de test: {parse_errors:?}");
 
-    let (_, machine_code, _) =
-        compile_native_two_pass_with_timing(&program, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP, true);
+    let (_, machine_code, _) = compile_native_two_pass_with_timing(
+        &program,
+        ORACLE_LOAD_ADDR,
+        ORACLE_STACK_TOP,
+        Some(crate::codegen::lh5801_backend::AUTHENTIC_TIMING_DELAY_ITERATIONS),
+    );
     machine_code
 }
