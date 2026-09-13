@@ -787,6 +787,33 @@ impl StackCodeGenerator {
             StatementInner::Cursor { .. } | StatementInner::GCursor { .. }
         );
 
+        // `IF` es "transparente" para este flag: en tiempo de COMPILACIÓN
+        // no sabemos si la condición será verdadera en tiempo de
+        // ejecución, así que el código de la rama `THEN` se genera de
+        // todas formas (ocupa espacio en el binario) pero puede no
+        // llegar a ejecutarse nunca. Si dejáramos que la recursión normal
+        // de más abajo actualizase el flag según el contenido de esa
+        // rama, un `IF cond GOTO etiqueta` con `cond` falsa en tiempo de
+        // ejecución (que no ejecuta NADA de verdad) dejaría el flag como
+        // si SÍ se hubiera ejecutado una sentencia no-cursor — bug real
+        // encontrado con `jackpot.bas`: `CURSOR 14` (línea 505) seguido
+        // de `IF X(0)=X(1) AND X(1)=X(2) GOTO 540` (línea 510, condición
+        // falsa en la partida perdedora) seguido de `PRINT "* PERDU !!"`
+        // (línea 520) — el original tokenizado SÍ preserva pantalla ahí
+        // (confirmado jugando en vivo), pero tratar el `GOTO` de la rama
+        // `IF` como "última sentencia real" hacía que el `PRINT` forzase
+        // el borrado incondicional. Restaurar el flag a su valor de
+        // ANTES del `IF` (en vez de dejar que la rama lo sobreescriba)
+        // modela correctamente la ruta de "condición falsa, no pasó
+        // nada" sin necesitar un análisis de flujo de control completo —
+        // simplificación deliberada: si la condición SÍ es verdadera y la
+        // rama `THEN` incluye una `CURSOR`/`GCURSOR` real, el `PRINT` que
+        // venga justo después en la MISMA rama (dentro del propio
+        // `Multi`) sigue viendo el flag correcto por la recursión normal;
+        // solo se restaura para lo que venga DESPUÉS del `IF` completo.
+        let flag_before_if = self.last_stmt_was_cursor_positioning;
+        let is_if_statement = matches!(&stmt.inner, StatementInner::If { .. });
+
         match &stmt.inner {
             // === ASIGNACIÓN ===
             StatementInner::Let { inner, .. } => self.gen_let(inner),
@@ -889,7 +916,12 @@ impl StackCodeGenerator {
         // como consecuente de un `IF`): el `PRINT` interior ya consultó
         // el flag correcto durante la recursión, así que solo hace falta
         // NO tocarlo de nuevo para `Multi` en sí.
-        if !matches!(&stmt.inner, StatementInner::Multi(_)) {
+        if is_if_statement {
+            // Restaurar al valor de ANTES del `IF` — ver el comentario
+            // largo de más arriba (`flag_before_if`): modela "condición
+            // falsa, no pasó nada" sin necesitar flujo de control real.
+            self.last_stmt_was_cursor_positioning = flag_before_if;
+        } else if !matches!(&stmt.inner, StatementInner::Multi(_)) {
             self.last_stmt_was_cursor_positioning = this_stmt_is_cursor_positioning;
         }
     }
@@ -3180,20 +3212,33 @@ impl StackCodeGenerator {
                 self.gen_expression(index);
                 self.gen_acc_val(index);
 
+                // `MulIntWord`, no `MulInt`: el propio PRODUCTO
+                // `índice*tamaño` puede superar 255 (p.ej. `DIM
+                // T$(11)*68` de labyrinthe.bas: 68*4=272) — `MulInt`
+                // trunca a 8 bits, dando una dirección de elemento
+                // incorrecta para índices que ni siquiera son grandes.
+                // Bug real encontrado jugando labyrinthe.bas: el
+                // laberinto generado era irresoluble porque varios
+                // elementos de `T$` (los que superaban el desbordamiento)
+                // se leían de memoria equivocada.
                 self.emit(StackInstruction::ApilaInt(element_size as i64));
-                self.emit(StackInstruction::MulInt);
+                self.emit(StackInstruction::MulIntWord);
 
-                // Dirección = base + índice * tamaño. `SumaIntWord`, no
-                // `SumaInt`: la base es una dirección de 16 bits (siempre
-                // > 255 en la práctica, cae en la rama de 2 bytes de
-                // `ApilaInt`/`ApilaIndWord`) y `SumaInt` solo suma el byte
-                // bajo, sin propagar el acarreo al alto — invisible
-                // mientras `índice*tamaño` no cruce un límite de página de
-                // 256 bytes dentro del propio array, pero real: confirmado
-                // contra la ROM real con `DIM A$(3)` sin ancho fijo (element
-                // ahora de 41 bytes, ver `array_element_size`) — A$(2)/A$(3)
-                // escribían 256 bytes por debajo de su dirección real.
-                self.emit(StackInstruction::SumaIntWord);
+                // Dirección = base + índice*tamaño. `SumaWordWord`, no
+                // `SumaIntWord`: `MulIntWord` ya deja un resultado de 16
+                // BITS en la pila (alto, luego bajo) — `SumaIntWord`
+                // espera un offset de 8 bits nada más (su diseño
+                // original, de cuando el offset siempre era `SumaInt`/
+                // `MulInt` de 8 bits) y solo desapila 1 byte para él,
+                // interpretando el byte alto del producto como si fuera
+                // parte de la base. Bug real encontrado con este mismo
+                // fix (arreglando el desbordamiento de `MulInt` con
+                // `MulIntWord` pero dejando `SumaIntWord`, la suma
+                // consumía mal la pila y el elemento del array quedaba
+                // sin escribir en absoluto, ni siquiera para índices que
+                // no desbordaban). `SumaWordWord` (16+16 bits) es la
+                // combinación correcta con un multiplicando de 16 bits.
+                self.emit(StackInstruction::SumaWordWord);
             }
 
             // Array 2D
@@ -3215,6 +3260,22 @@ impl StackCodeGenerator {
                 self.emit(StackInstruction::ApilaInt(base_addr as i64));
 
                 // Calcular offset: (i * num_cols + j) * tam_elemento
+                //
+                // NOTA (gap conocido, NO arreglado aquí): tanto este
+                // `MulInt` (fila*columnas) como el `SumaInt` de abajo
+                // (+columna) tienen el mismo riesgo de desbordamiento de
+                // 8 bits ya confirmado y arreglado en `Array1DAccess`
+                // (ver el comentario de `MulIntWord` más abajo) — para un
+                // array 2D con muchas columnas o elementos anchos,
+                // `fila*columnas` o `+columna` podrían superar 255 igual
+                // que pasaba con `índice*tamaño` en labyrinthe.bas. No se
+                // ha arreglado aquí porque ningún programa del corpus ya
+                // probado lo manifiesta todavía, y arreglarlo bien
+                // necesitaría además una multiplicación de 16×8 bits
+                // (el resultado de la primera multiplicación ya podría
+                // ser de 16 bits antes de la segunda), no solo
+                // `MulIntWord` (8×8→16). Candidato a revisar si aparece
+                // un array 2D real que lo manifieste.
                 self.gen_expression(row_index);
                 self.gen_acc_val(row_index);
 

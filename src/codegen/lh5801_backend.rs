@@ -356,6 +356,56 @@ impl Lh5801Backend {
             self.emit_byte(0x9A); // RTN
         }
 
+        if self.used_shared_routines.contains("MULINTWORD") {
+            // Como MULINT (suma repetida: a=UH, b=UL), pero acumulando en
+            // 16 bits (XH:XL) en vez de 8 — ver el comentario largo de
+            // `StackInstruction::MulIntWord` en stack_instruction.rs.
+            // Idioma de salto seguro (branch corto de offset fijo +3 que
+            // salta un `JMP` con etiqueta) en vez de offsets calculados a
+            // mano como en MULINT — más bytes, pero sin el riesgo de
+            // desajuste ya documentado en el historial de esa rutina.
+            self.define_label("__SHARED_MULINTWORD".to_string());
+
+            self.emit_byte(0xB5); self.emit_byte(0x00); // LDI A,#0
+            self.emit_byte(0x0A); // STA XL
+            self.emit_byte(0x08); // STA XH
+
+            let loop_start = self.new_local_label("MULINTWORD_LOOP");
+            let done = self.new_local_label("MULINTWORD_DONE");
+
+            // Comprobación de entrada: si UL (b) ya es 0, saltar el
+            // cuerpo por completo (resultado 0, ya inicializado).
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x89); self.emit_byte(0x03); // BZR +3 (si UL!=0, saltar el JMP y entrar al bucle)
+            self.emit_byte(0xBA); // JMP done (si UL==0)
+            self.add_label_ref(done.clone(), RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(loop_start.clone());
+            // XH:XL += UH (extendido a 16 bits, acarreo del byte bajo al alto)
+            self.emit_byte(0x04); // LDA XL
+            self.emit_byte(0xF9); // REC
+            self.emit_byte(0xA2); // ADC UH
+            self.emit_byte(0x0A); // STA XL
+            self.emit_byte(0x84); // LDA XH (no toca Carry)
+            self.emit_byte(0xB3); self.emit_byte(0x00); // ADC A,#0 (propaga el acarreo)
+            self.emit_byte(0x08); // STA XH
+
+            // b--; si b!=0, volver a loop_start.
+            self.emit_byte(0x24); // LDA UL
+            self.emit_byte(0xDF); // DEC A
+            self.emit_byte(0x2A); // STA UL
+            self.emit_byte(0xB7); self.emit_byte(0x00); // CPI A,#0
+            self.emit_byte(0x8B); self.emit_byte(0x03); // BZS +3 (si UL==0, saltar el JMP)
+            self.emit_byte(0xBA); // JMP loop_start (si UL!=0)
+            self.add_label_ref(loop_start, RefType::Absolute16);
+            self.emit_label_placeholder(RefType::Absolute16);
+
+            self.define_label(done);
+            self.emit_byte(0x9A); // RTN (resultado en XH:XL, el punto de llamada lo empuja)
+        }
+
         if self.used_shared_routines.contains("SYSTEMOUTINT") {
             // PRINT de un entero de 8 bits CON SIGNO: imprime sus
             // dígitos decimales ('-' primero si es negativo). Cuerpo
@@ -3043,7 +3093,25 @@ impl Lh5801Backend {
                 self.emit_call_shared("MULINT");
                 self.emit_push_a();
             }
-            
+
+            StackInstruction::MulIntWord => {
+                // Como `MulInt`, pero el resultado es una PALABRA de 16
+                // bits (ver el comentario largo de
+                // `StackInstruction::MulIntWord` en stack_instruction.rs)
+                // — mismo convenio de pop/push en el PUNTO DE LLAMADA,
+                // nunca dentro de la rutina compartida (la rutina deja el
+                // resultado en XH:XL, registros, no en la pila hardware).
+                self.emit_pop_a();
+                self.emit_byte(0x2A); // UL = A (b)
+                self.emit_pop_a();
+                self.emit_byte(0x28); // UH = A (a)
+                self.emit_call_shared("MULINTWORD");
+                self.emit_byte(0x84); // LDA XH
+                self.emit_push_a();
+                self.emit_byte(0x04); // LDA XL
+                self.emit_push_a();
+            }
+
             StackInstruction::PowInt => {
                 // a^b mediante multiplicación repetida (bucle anidado:
                 // exponente veces, multiplicar resultado por la base).
@@ -10012,4 +10080,108 @@ mod tests {
              obsoleto del GCURSOR de la línea 20 no debería seguir suprimiendo el borrado"
         );
     }
+
+    /// Regresión encontrada jugando `jackpot.bas` justo después del fix
+    /// de `bombing.bas` de esta misma sesión (`last_stmt_was_cursor_positioning`):
+    /// el patrón `CURSOR 14` (línea 505) seguido de `IF ... GOTO 540`
+    /// (línea 510, condición falsa en la partida perdedora) seguido de
+    /// `PRINT "* PERDU !!"` (línea 520) pasó de preservar la pantalla
+    /// (comportamiento correcto, confirmado contra el original) a
+    /// borrarla — el fix de bombing trataba CUALQUIER sentencia que no
+    /// fuera `CURSOR`/`GCURSOR` como "resetea el flag", incluyendo un
+    /// `IF` cuya condición resulta falsa en tiempo de ejecución (que no
+    /// ejecuta nada de verdad).
+    ///
+    /// Arreglado haciendo que `IF` sea "transparente" para el flag: se
+    /// restaura al valor de ANTES del `IF` tras generar su código,
+    /// modelando "condición falsa, no pasó nada" sin necesitar un
+    /// análisis de flujo de control completo. `FOR`/`NEXT` y el resto de
+    /// sentencias (que SÍ representan trabajo real e incondicional)
+    /// siguen reseteando el flag como antes — por eso este test cubre
+    /// AMBOS patrones reales a la vez, para que un fix futuro no rompa
+    /// uno arreglando el otro.
+    #[test]
+    fn test_oracle_if_statement_is_transparent_to_cursor_positioning_flag_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        let lit_cols_at_150 = |pc1500: &mut ceres_core::Pc1500| -> bool {
+            let display = pc1500.display();
+            let buf = display.rgba_buffer();
+            for y in 0..ceres_core::display::DISPLAY_HEIGHT {
+                let idx = (y * ceres_core::display::DISPLAY_WIDTH + 150) * 4;
+                if buf[idx] == 0 && buf[idx + 1] == 0 && buf[idx + 2] == 0 {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // Patrón de jackpot.bas: CURSOR + IF con condición FALSA (no
+        // ejecuta nada) + PRINT — debe PRESERVAR (no limpiar) la marca
+        // dejada por un GPRINT anterior.
+        let source_if = "\
+10 GCURSOR 150:GPRINT 255\n\
+20 CURSOR 14\n\
+30 IF 1=2 THEN GOTO 100\n\
+40 PRINT \"* PERDU !!\"\n\
+50 END\n\
+100 END\n";
+        let code_if = compile_native(source_if);
+        let mut pc1500_if = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code_if, ORACLE_STACK_TOP, 100_000);
+        assert!(pc1500_if.cpu().is_halted());
+        assert!(
+            lit_cols_at_150(&mut pc1500_if),
+            "CURSOR + IF (condición falsa) + PRINT debe PRESERVAR la marca de la columna 150 \
+             (patrón real de jackpot.bas, línea 505/510/520)"
+        );
+
+        // Patrón de bombing.bas: CURSOR/GCURSOR + FOR/NEXT (trabajo real,
+        // incondicional) + PRINT — debe LIMPIAR la marca.
+        let source_for = "\
+10 GCURSOR 150:GPRINT 255\n\
+20 GCURSOR 0:PRINT \"*\"\n\
+30 FOR I=1 TO 3:NEXT I\n\
+40 PRINT \"SCORE\"\n\
+50 END\n";
+        let code_for = compile_native(source_for);
+        let mut pc1500_for = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code_for, ORACLE_STACK_TOP, 100_000);
+        assert!(pc1500_for.cpu().is_halted());
+        assert!(
+            !lit_cols_at_150(&mut pc1500_for),
+            "CURSOR/GCURSOR + FOR/NEXT (trabajo real) + PRINT debe LIMPIAR la marca de la \
+             columna 150 (patrón real de bombing.bas, línea 290/300/310)"
+        );
+    }
+
+    /// Bug real encontrado jugando `labyrinthe.bas`: el laberinto
+    /// generado era irresoluble porque `Array1DAccess` calculaba
+    /// `índice*tamaño_elemento` con `MulInt` (trunca a 8 bits) — con
+    /// `DIM T$(11)*68`, el producto para índices ya pequeños (4, 7...)
+    /// supera 255 y la dirección resultante apunta a memoria ajena al
+    /// array. Arreglado con `MulIntWord` (resultado de 16 bits, nunca
+    /// desborda para operandos de 8 bits). Verifica el caso exacto que
+    /// disparaba el bug (elemento de 68 bytes, índices que cruzan 256).
+    #[test]
+    fn test_oracle_array_1d_wide_element_index_multiplication_does_not_overflow_8_bits_on_real_rom() {
+        use crate::codegen::test_oracle::{compile_native, run_lh5_until_exit, ORACLE_LOAD_ADDR, ORACLE_STACK_TOP};
+
+        // Ancho REAL de labyrinthe.bas (68 bytes/elemento) para forzar
+        // el desbordamiento de 8 bits de verdad (68*4=272, 68*7=476).
+        let source = "\
+10 DIM T$(11)*68\n\
+15 T$(0)=\"ABCD\"\n\
+20 T$(4)=\"WXYZ\"\n\
+30 T$(7)=\"1234\"\n\
+40 @(10200)=ASC T$(4)\n\
+50 @(10201)=ASC T$(7)\n\
+55 @(10202)=ASC T$(0)\n\
+60 END\n";
+        let code = compile_native(source);
+        let pc1500 = run_lh5_until_exit(ORACLE_LOAD_ADDR, &code, ORACLE_STACK_TOP, 5_000_000);
+        assert!(pc1500.cpu().is_halted(), "debe llegar a END/HALT limpiamente");
+        assert_eq!(pc1500.read_byte(10202), b'A', "T$(0) (sin desbordamiento, control de que el fix no rompe el caso normal)");
+        assert_eq!(pc1500.read_byte(10200), b'W', "T$(4) con element_size=68 (68*4=272>255): sin el fix, MulInt truncaría a 16 y leería memoria equivocada");
+        assert_eq!(pc1500.read_byte(10201), b'1', "T$(7) con element_size=68 (68*7=476>255)");
+    }
 }
+

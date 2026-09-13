@@ -169,7 +169,21 @@ pub enum StackInstruction {
     
     /// mul-int - Pop b, Pop a, Push (a * b) para enteros
     MulInt,
-    
+
+    /// mul-int-word - Pop b (8 bits), Pop a (8 bits), Push (a*b) como
+    /// PALABRA de 16 bits (high, luego low — mismo orden que
+    /// `ApilaIntWord`/`SumaIntWord`). A diferencia de `MulInt`, cuyo
+    /// resultado se trunca a 8 bits (invisible mientras `a*b<256`), este
+    /// nunca desborda para operandos de 8 bits (máximo 255*255=65025,
+    /// cabe en 16 bits). Usado por `Array1DAccess` para
+    /// `índice*tamaño_elemento`: con arrays de elemento ancho (p.ej.
+    /// `DIM T$(11)*68` en labyrinthe.bas) el producto supera 255 para
+    /// índices pequeños (68*4=272) — bug real encontrado jugando ese
+    /// programa: el laberinto salía irresoluble porque varios elementos
+    /// de `T$` se leían de direcciones incorrectas (el producto
+    /// truncado por `MulInt` apuntaba a otra parte de memoria).
+    MulIntWord,
+
     /// mul-real - Pop b, Pop a, Push (a * b) para reales
     MulReal,
     
@@ -669,6 +683,7 @@ impl StackInstruction {
             StackInstruction::RestaInt => "resta-int".to_string(),
             StackInstruction::RestaReal => "resta-real".to_string(),
             StackInstruction::MulInt => "mul-int".to_string(),
+            StackInstruction::MulIntWord => "mul-int-word".to_string(),
             StackInstruction::MulReal => "mul-real".to_string(),
             StackInstruction::DivInt => "div-int".to_string(),
             StackInstruction::DivReal => "div-real".to_string(),
