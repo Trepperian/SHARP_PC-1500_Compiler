@@ -1432,8 +1432,76 @@ where
                     full_span,
                 )))
             } else {
+                // `IF <cond>` sin NINGUNA sentencia detrás: el consecuente
+                // está vacío porque la línea se acaba aquí (o solo queda un
+                // ':' suelto). Patrón real de tempter.bas, línea 80:
+                // `80 "G"IF POINT 8<127 OR ... :` — la línea termina en ':'
+                // sin nada detrás.
+                //
+                // En BASIC real esto es legal y no hace nada: la condición
+                // se evalúa (importa, porque puede tener efectos
+                // secundarios) y no se ejecuta ningún consecuente. Antes
+                // esto abortaba el parseo con `ExpectedThenClause`,
+                // impidiendo compilar el programa entero.
+                //
+                // Se representa con `Multi` vacío, que ya es seguro en todo
+                // el pipeline sin ningún cambio extra: `gen_statement`
+                // itera sobre una lista vacía (no emite nada, y `gen_if`
+                // sigue evaluando la condición y emitiendo su salto), y los
+                // bucles de `write_bytes`/`show` que hacen `len() - 1`
+                // nunca llegan a ejecutarse con el vector vacío.
+                //
+                // La comprobación va ANTES del caso de `THEN <línea>`
+                // (GOTO implícito) a propósito: `IF cond THEN` al final de
+                // la línea también es consecuente vacío, no un GOTO al que
+                // le falta el destino.
+                let consequent_is_empty = matches!(
+                    self.peek_token(),
+                    Token::Symbol(Symbol::Colon)
+                        | Token::Symbol(Symbol::Newline)
+                        | Token::Symbol(Symbol::Eof)
+                );
+
+                if consequent_is_empty {
+                    // Se consume el resto de la línea igual que en el caso
+                    // normal de arriba: si tras el ':' hubiera más
+                    // sentencias, siguen siendo condicionales (regla del
+                    // IF de línea completa). Con la línea ya terminada
+                    // —el caso real de tempter.bas— esto no consume nada
+                    // y el consecuente queda vacío.
+                    let mut then_statements = vec![];
+                    while self.next_if_token_eq(&Token::Symbol(Symbol::Colon)).is_some() {
+                        match self.parse_statement(false)? {
+                            Some(next_stmt) => then_statements.push(next_stmt),
+                            None => break,
+                        }
+                    }
+
+                    let full_span = start_span.merge(self.current_span());
+                    let then_stmt = if then_statements.len() == 1 {
+                        then_statements.into_iter().next().expect("comprobado len == 1")
+                    } else {
+                        Statement::new(StatementInner::Multi(then_statements), full_span)
+                    };
+
+                    return Ok(Some(Statement::new(
+                        StatementInner::If {
+                            condition,
+                            then_stmt: Box::new(then_stmt),
+                            is_then_kw_present_in_source: then_kw.is_some(),
+                            is_goto_kw_present_in_source: false,
+                        },
+                        full_span,
+                    )));
+                }
+
                 if then_kw.is_none() {
-                    return Err(ParseError::ExpectedThenClause { span: start_span });
+                    // `current_span()` en vez de `start_span`: el error está
+                    // en lo que hay DONDE debería empezar el consecuente, no
+                    // al principio de la condición (antes el diagnóstico
+                    // subrayaba el primer token de la condición, despistando
+                    // sobre dónde estaba el problema real).
+                    return Err(ParseError::ExpectedThenClause { span: self.current_span() });
                 }
 
                 let goto_expr = self.expect_expression()?;

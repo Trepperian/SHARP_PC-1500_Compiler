@@ -461,6 +461,39 @@ impl StackCodeGenerator {
             self.gen_code_line(line);
         }
 
+        // Cerrar los `FOR` que nunca llegaron a recibir un `NEXT` en el
+        // código fuente (p.ej. dames.bas: 15 `FOR` frente a 14 `NEXT`).
+        // `gen_for` ya emitió los saltos de salida que referencian
+        // `loop_end`, pero esa etiqueta solo se define dentro de
+        // `gen_next` — sin este barrido final quedaría sin definir y la
+        // resolución de etiquetas del backend abortaría con
+        // "Undefined label: FOR_FIN_n", tirando abajo la compilación de un
+        // programa que por lo demás es perfectamente compilable.
+        //
+        // Se reutiliza exactamente el mismo criterio que `gen_next` aplica
+        // a los contextos obsoletos que encuentra por encima del suyo: solo
+        // se emite la etiqueta de los NO cerrados (`closed == false`). Un
+        // contexto ya cerrado por su propio `NEXT` tiene su `loop_end`
+        // definido en el sitio correcto, y volver a emitirlo aquí crearía
+        // una etiqueta DUPLICADA — la resolución del backend se queda con
+        // la última definición, así que el salto de salida real de ese
+        // bucle acabaría aterrizando al final del programa en vez de justo
+        // después del bucle (ver el comentario largo de `gen_next` sobre
+        // este mismo bug con invader-v2.bas).
+        //
+        // Se emite ANTES del `Stop`: salir de un bucle que nunca tuvo
+        // `NEXT` equivale a caer al final del programa, que es la
+        // aproximación razonable a lo que haría el intérprete real.
+        while let Some(stale) = self.for_stack.pop() {
+            if !stale.closed {
+                self.emit_comment(&format!(
+                    "FOR {} sin NEXT: se cierra al final del programa",
+                    stale.variable_name
+                ));
+                self.emit(StackInstruction::Label(stale.loop_end));
+            }
+        }
+
         // Fin del programa
         self.emit(StackInstruction::Stop);
 

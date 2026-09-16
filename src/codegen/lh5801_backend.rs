@@ -974,7 +974,13 @@ impl Lh5801Backend {
             self.emit_instruction(instr);
         }
         
-        // Epílogo: halt
+        // Epílogo: halt.
+        //
+        // Se define aquí una etiqueta con nombre fijo para que
+        // `resolve_labels` tenga un destino seguro al que redirigir un
+        // `GOTO`/`GOSUB`/`THEN` a un número de línea que NO existe en el
+        // programa (ver el caso de repliegue en `resolve_labels`).
+        self.define_label("__PROGRAM_END".to_string());
         self.emit_halt();
 
         // Subrutinas compartidas (solo las que este programa usó de
@@ -1268,15 +1274,55 @@ impl Lh5801Backend {
     
     /// Resolver todas las referencias a etiquetas
     fn resolve_labels(&mut self) {
+        // Destino de repliegue para saltos a líneas BASIC inexistentes
+        // (ver el caso de abajo). Definida por `generate()` justo antes
+        // del `HALT` del epílogo.
+        let program_end = self.labels.get("__PROGRAM_END").copied();
+
         for (pos, label_name, ref_type) in &self.label_refs {
-            if let Some(&target_addr) = self.labels.get(label_name) {
-                let RefType::Absolute16 = ref_type;
-                // Escribir dirección absoluta de 16 bits (big-endian)
-                let addr = target_addr as u16;
-                self.code[*pos] = (addr >> 8) as u8;
-                self.code[*pos + 1] = (addr & 0xFF) as u8;
-            } else {
-                panic!("Undefined label: {}", label_name);
+            let resolved = match self.labels.get(label_name) {
+                Some(&addr) => Some(addr),
+                // `LINE_n` sin definir = el programa BASIC salta a un
+                // número de línea que no existe en el fuente (p.ej.
+                // ghosthouse.bas: `IF HF=2THEN 195`, sin línea 195;
+                // scrabble.bas: `IF JE>7THEN 4112`). Es un error DEL
+                // PROGRAMA, no del compilador: el intérprete real lo
+                // detectaría en tiempo de ejecución al intentar el salto,
+                // y solo si llegaba a ejecutar esa línea. Abortar aquí la
+                // compilación entera con un `panic` impedía compilar
+                // programas por lo demás correctos y perfectamente
+                // jugables, por una línea que quizá nunca se ejecute.
+                //
+                // Se redirige al final del programa (`HALT` limpio) y se
+                // avisa por stderr. No es exactamente el error de
+                // ejecución del intérprete real, pero es la aproximación
+                // segura: detiene la ejecución en vez de saltar a una
+                // dirección arbitraria.
+                None if label_name.starts_with("LINE_") => {
+                    eprintln!(
+                        "AVISO: salto a la línea BASIC {}, que no existe en el programa: \
+                         se redirige al final del programa (el intérprete real daría un \
+                         error de ejecución al llegar a ese salto).",
+                        label_name.trim_start_matches("LINE_")
+                    );
+                    program_end
+                }
+                None => None,
+            };
+
+            match resolved {
+                Some(target_addr) => {
+                    let RefType::Absolute16 = ref_type;
+                    // Escribir dirección absoluta de 16 bits (big-endian)
+                    let addr = target_addr as u16;
+                    self.code[*pos] = (addr >> 8) as u8;
+                    self.code[*pos + 1] = (addr & 0xFF) as u8;
+                }
+                // Cualquier otra etiqueta sin definir (interna del propio
+                // compilador: `FOR_FIN_n`, `__SHARED_*`, ...) SÍ es un bug
+                // del compilador, no del programa de entrada, y debe
+                // seguir siendo ruidosa en vez de degradarse en silencio.
+                None => panic!("Undefined label: {}", label_name),
             }
         }
     }
